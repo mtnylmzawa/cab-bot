@@ -15,12 +15,15 @@ TEST_MODE = True
 # Binance API bağlantısı
 client = UMFutures(
     key=os.environ.get("BINANCE_API_KEY"),
-    secret=os.environ.get("BINANCE_SECRET_KEY")
+    secret=os.environ.get("BINANCE_SECRET_KEY"),
+    base_url="https://fapi.binance.com"
 )
 
 MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "3"))
 
 def get_open_positions():
+    if TEST_MODE:
+        return []  # Test modunda Binance'e bağlanma
     positions = client.get_position_risk()
     return [p for p in positions if float(p['positionAmt']) != 0]
 
@@ -70,7 +73,7 @@ def get_symbol(ticker):
 @app.get("/")
 def health():
     mode = "TEST MODU" if TEST_MODE else "CANLI"
-    return {"status": f"CAB Bot çalışıyor — {mode}"}
+    return {"status": f"CAB Bot calisiyor — {mode}"}
 
 @app.get("/ip")
 async def get_ip():
@@ -93,33 +96,37 @@ async def webhook(request: Request):
             print(f"[ATLA] Max pozisyon doldu ({MAX_POSITIONS})")
             return {"status": "ATLANDI", "sebep": f"Max {MAX_POSITIONS} pozisyon doldu"}
 
-        ticker  = parsed["ticker"]
-        symbol  = get_symbol(ticker)
-        marj    = parsed["marj"]
-        lev     = parsed["lev"]
-        giris   = parsed["giris"]
-        stop    = parsed["stop"]
-        tp1     = parsed["tp1"]
-        tp2     = parsed["tp2"]
+        ticker   = parsed["ticker"]
+        symbol   = get_symbol(ticker)
+        marj     = parsed["marj"]
+        lev      = parsed["lev"]
+        giris    = parsed["giris"]
+        stop     = parsed["stop"]
+        tp1      = parsed["tp1"]
+        tp2      = parsed["tp2"]
         pos_size = round((marj * lev) / giris, 3)
 
         if TEST_MODE:
-            print(f"[TEST] GIRIS: {symbol} | Fiyat:{giris} | Stop:{stop} | TP1:{tp1} | TP2:{tp2} | Lot:{pos_size} | Kaldıraç:{lev}x")
-            return {"status": "TEST", "symbol": symbol, "lot": pos_size, "giris": giris, "stop": stop, "tp1": tp1, "tp2": tp2}
+            print(f"[TEST] GIRIS: {symbol} | Fiyat:{giris} | Stop:{stop} | TP1:{tp1} | TP2:{tp2} | Lot:{pos_size} | Kaldırac:{lev}x")
+            return {"status": "TEST", "symbol": symbol, "lot": pos_size,
+                    "giris": giris, "stop": stop, "tp1": tp1, "tp2": tp2}
 
         # CANLI MOD
         client.change_leverage(symbol=symbol, leverage=lev)
         try:
             client.change_margin_type(symbol=symbol, marginType="ISOLATED")
         except:
-            pass  # Zaten isolated ise hata verir, geç
+            pass
 
         order = client.new_order(symbol=symbol, side="BUY", type="MARKET", quantity=pos_size)
-        client.new_order(symbol=symbol, side="SELL", type="STOP_MARKET", stopPrice=round(stop, 6), closePosition=True)
+        client.new_order(symbol=symbol, side="SELL", type="STOP_MARKET",
+                        stopPrice=round(stop, 6), closePosition=True)
         tp1_qty = round(pos_size * 0.60, 3)
-        client.new_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET", stopPrice=round(tp1, 6), quantity=tp1_qty)
+        client.new_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
+                        stopPrice=round(tp1, 6), quantity=tp1_qty)
         tp2_qty = round(pos_size * 0.25, 3)
-        client.new_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET", stopPrice=round(tp2, 6), quantity=tp2_qty)
+        client.new_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
+                        stopPrice=round(tp2, 6), quantity=tp2_qty)
 
         return {"status": "OK", "symbol": symbol, "order": order["orderId"]}
 
@@ -127,14 +134,15 @@ async def webhook(request: Request):
         symbol = get_symbol(parsed["ticker"])
 
         if TEST_MODE:
-            print(f"[TEST] TP1: {symbol} | Stop BE ye çekiliyor: {parsed['stop']}")
+            print(f"[TEST] TP1: {symbol} | Stop BE ye cekiliyor: {parsed['stop']}")
             return {"status": "TEST", "islem": "TP1 stop BE guncellendi", "symbol": symbol}
 
         orders = client.get_orders(symbol=symbol)
         for o in orders:
             if o["type"] == "STOP_MARKET":
                 client.cancel_order(symbol=symbol, orderId=o["orderId"])
-        client.new_order(symbol=symbol, side="SELL", type="STOP_MARKET", stopPrice=round(parsed["stop"], 6), closePosition=True)
+        client.new_order(symbol=symbol, side="SELL", type="STOP_MARKET",
+                        stopPrice=round(parsed["stop"], 6), closePosition=True)
         return {"status": "TP1 stop guncellendi"}
 
     elif parsed["type"] in ["TRAIL", "STOP"]:
