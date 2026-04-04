@@ -70,12 +70,21 @@ def get_symbol(ticker):
     return ticker + "USDT" if not ticker.endswith("USDT") else ticker
 
 async def get_price(symbol):
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}", timeout=3)
-            return float(r.json()["price"])
-    except:
-        return None
+    urls = [
+        f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}",
+        f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
+    ]
+    for url in urls:
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.get(url)
+                data = r.json()
+                if "price" in data:
+                    print(f"[PRICE] {symbol}: {data['price']} from {url}")
+                    return float(data["price"])
+        except Exception as e:
+            print(f"[PRICE ERR] {symbol} {url}: {e}")
+    return None
 
 @app.get("/")
 def health():
