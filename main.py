@@ -117,15 +117,20 @@ async def dashboard():
         tp2   = pos["tp2"]
         durum = pos.get("durum", "Aktif")
 
+        lev     = pos.get('lev', 10)
+        risk    = pos.get('risk', 0)
+        pos_sz  = pos['marj'] * lev
+        tp1_kar = round(pos_sz * 0.60 * (tp1 - giris) / giris, 1) if giris > 0 else 0
+        tp2_kar = round(pos_sz * 0.25 * (tp2 - giris) / giris, 1) if giris > 0 else 0
         acik_rows += f"""
         <tr>
             <td><b>{ticker}</b></td>
-            <td>{pos['marj']:.0f}$</td>
+            <td>{pos['marj']:.0f}$ <span style="color:#94a3b8;font-size:10px">({lev}x)</span></td>
             <td>{giris:.6f}</td>
             <td id="price-{symbol}" style="color:#94a3b8">...</td>
-            <td>{stop:.6f}</td>
-            <td style="color:#4ade80">{tp1:.6f}</td>
-            <td style="color:#2dd4bf">{tp2:.6f}</td>
+            <td>{stop:.6f} <span style="color:#f87171;font-size:10px">(-{risk:.1f}$)</span></td>
+            <td style="color:#4ade80">{tp1:.6f} <span style="color:#4ade80;font-size:10px">(+{tp1_kar:.1f}$)</span></td>
+            <td style="color:#2dd4bf">{tp2:.6f} <span style="color:#2dd4bf;font-size:10px">(+{tp2_kar:.1f}$)</span></td>
             <td id="status-{symbol}" style="color:#94a3b8">{durum}</td>
             <td style="color:#94a3b8;font-size:11px">{pos.get('zaman','')}</td>
         </tr>"""
@@ -179,6 +184,7 @@ async def dashboard():
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CAB Bot Dashboard</title>
+<meta http-equiv="refresh" content="30">
 <style>
   body {{ background:#0f0f1a; color:#eee; font-family:monospace; padding:16px; margin:0; }}
   h2 {{ color:#a78bfa; margin-bottom:4px; font-size:16px; }}
