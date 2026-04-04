@@ -69,22 +69,7 @@ def parse_alert(message: str):
 def get_symbol(ticker):
     return ticker + "USDT" if not ticker.endswith("USDT") else ticker
 
-async def get_price(symbol):
-    urls = [
-        f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}",
-        f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
-    ]
-    for url in urls:
-        try:
-            async with httpx.AsyncClient(timeout=5) as c:
-                r = await c.get(url)
-                data = r.json()
-                if "price" in data:
-                    print(f"[PRICE] {symbol}: {data['price']} from {url}")
-                    return float(data["price"])
-        except Exception as e:
-            print(f"[PRICE ERR] {symbol} {url}: {e}")
-    return None
+# Fiyat artık JavaScript ile tarayıcıda çekiliyor
 
 @app.get("/")
 def health():
@@ -97,113 +82,138 @@ async def get_ip():
         r = await c.get("https://api.ipify.org?format=json")
         return r.json()
 
+@app.get("/positions")
+async def get_positions():
+    """JS için pozisyon verisi"""
+    return open_positions
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     mode_badge = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI"
-    
+
     rows = ""
     for ticker, pos in sorted(open_positions.items()):
         symbol = get_symbol(ticker)
-        price = await get_price(symbol)
-        
         giris = pos["giris"]
         stop  = pos["stop"]
         tp1   = pos["tp1"]
         tp2   = pos["tp2"]
         durum = pos.get("durum", "Aktif")
-        
-        if price:
-            pnl_pct = (price - giris) / giris * 100
-            tp1_uzak = (tp1 - price) / price * 100
-            stop_uzak = (price - stop) / price * 100
-            
-            if price >= tp1:
-                renk = "#4ade80"
-                durum_txt = "✓ TP1 Üstünde"
-            elif price >= giris:
-                renk = "#86efac"
-                durum_txt = f"▲ +{pnl_pct:.2f}%"
-            elif price > stop:
-                renk = "#fbbf24"
-                durum_txt = f"▼ {pnl_pct:.2f}%"
-            else:
-                renk = "#f87171"
-                durum_txt = "⚠ STOP ALTI"
-            
-            price_str = f"{price:.6f}"
-            tp1_str = f"%{tp1_uzak:.2f} uzak"
-            stop_str = f"%{stop_uzak:.2f} tampon"
-        else:
-            renk = "#94a3b8"
-            durum_txt = "?"
-            price_str = "—"
-            tp1_str = "—"
-            stop_str = "—"
 
         rows += f"""
-        <tr>
+        <tr id="row-{ticker}">
             <td><b>{ticker}</b></td>
             <td>{pos['marj']:.0f}$</td>
             <td>{giris:.6f}</td>
-            <td style="color:{renk};font-weight:bold">{price_str}</td>
+            <td id="price-{symbol}" style="color:#94a3b8">Yükleniyor...</td>
             <td>{stop:.6f}</td>
             <td style="color:#4ade80">{tp1:.6f}</td>
             <td style="color:#2dd4bf">{tp2:.6f}</td>
-            <td style="color:{renk};font-weight:bold">{durum_txt}</td>
+            <td id="status-{symbol}" style="color:#94a3b8">{durum}</td>
             <td style="color:#94a3b8;font-size:11px">{pos.get('zaman','')}</td>
         </tr>"""
 
     if not rows:
-        rows = '<tr><td colspan="9" style="text-align:center;color:#94a3b8;padding:20px">Açık pozisyon yok</td></tr>'
+        rows = '<tr><td colspan="9" style="text-align:center;color:#94a3b8;padding:20px">Açık pozisyon yok — sinyal bekleniyor</td></tr>'
+
+    symbols_json = str([get_symbol(t) for t in open_positions.keys()])
+    positions_json = str({get_symbol(t): {"giris": p["giris"], "stop": p["stop"], "tp1": p["tp1"]} 
+                         for t, p in open_positions.items()}).replace("'", '"')
 
     html = f"""<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="30">
 <title>CAB Bot Dashboard</title>
 <style>
   body {{ background:#0f0f1a; color:#eee; font-family:monospace; padding:16px; margin:0; }}
   h2 {{ color:#a78bfa; margin-bottom:4px; font-size:16px; }}
-  .badge {{ display:inline-block; padding:3px 10px; border-radius:12px; font-size:12px; 
-            background:#1e1b4b; margin-bottom:12px; }}
+  .badge {{ display:inline-block; padding:3px 10px; border-radius:12px; font-size:12px; background:#1e1b4b; margin-bottom:8px; }}
   .info {{ color:#94a3b8; font-size:11px; margin-bottom:12px; }}
   table {{ border-collapse:collapse; width:100%; font-size:12px; }}
-  th {{ background:#1e1b4b; color:#a78bfa; padding:8px 6px; text-align:left; 
-        border-bottom:1px solid #3730a3; white-space:nowrap; }}
+  th {{ background:#1e1b4b; color:#a78bfa; padding:8px 6px; text-align:left; border-bottom:1px solid #3730a3; white-space:nowrap; }}
   td {{ padding:7px 6px; border-bottom:1px solid #1e1e2e; white-space:nowrap; }}
   tr:hover {{ background:#1a1a2e; }}
-  .stat {{ display:inline-block; background:#1e1b4b; border-radius:8px; 
-           padding:8px 14px; margin:4px; font-size:12px; }}
+  .stat {{ display:inline-block; background:#1e1b4b; border-radius:8px; padding:8px 14px; margin:4px; font-size:12px; }}
   .stat b {{ color:#a78bfa; font-size:16px; display:block; }}
 </style>
 </head>
 <body>
 <h2>🤖 CAB Bot Dashboard</h2>
 <div class="badge">{mode_badge}</div>
-<div class="info">⟳ 30 saniyede bir otomatik yenilenir | {datetime.utcnow().strftime('%H:%M:%S')} UTC</div>
-
+<div class="info" id="timer">⟳ Fiyatlar yükleniyor...</div>
 <div style="margin-bottom:14px">
   <div class="stat"><b>{len(open_positions)}</b>Açık Pozisyon</div>
   <div class="stat"><b>{MAX_POSITIONS}</b>Max Pozisyon</div>
-  <div class="stat"><b>{'TEST' if TEST_MODE else 'CANLI'}</b>Mod</div>
+  <div class="stat"><b>{"TEST" if TEST_MODE else "CANLI"}</b>Mod</div>
 </div>
-
 <table>
   <tr>
-    <th>Coin</th>
-    <th>Marjin</th>
-    <th>Giriş</th>
-    <th>Şu An</th>
-    <th>Stop</th>
-    <th>TP1</th>
-    <th>TP2</th>
-    <th>Durum</th>
-    <th>Zaman</th>
+    <th>Coin</th><th>Marjin</th><th>Giriş</th><th>Şu An</th>
+    <th>Stop</th><th>TP1</th><th>TP2</th><th>Durum</th><th>Zaman</th>
   </tr>
   {rows}
 </table>
+<script>
+var symbols = {symbols_json};
+var positions = {positions_json};
+
+async function fetchPrice(symbol) {{
+  try {{
+    var r = await fetch("https://fapi.binance.com/fapi/v1/ticker/price?symbol=" + symbol);
+    var d = await r.json();
+    return parseFloat(d.price);
+  }} catch(e) {{
+    try {{
+      var r2 = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=" + symbol);
+      var d2 = await r2.json();
+      return parseFloat(d2.price);
+    }} catch(e2) {{ return null; }}
+  }}
+}}
+
+async function updatePrices() {{
+  for (var i = 0; i < symbols.length; i++) {{
+    var sym = symbols[i];
+    var price = await fetchPrice(sym);
+    var priceEl = document.getElementById("price-" + sym);
+    var statusEl = document.getElementById("status-" + sym);
+    if (!priceEl) continue;
+    if (!price) {{ priceEl.textContent = "—"; continue; }}
+    
+    var pos = positions[sym];
+    var giris = pos.giris;
+    var stop = pos.stop;
+    var tp1 = pos.tp1;
+    var pnl = ((price - giris) / giris * 100).toFixed(2);
+    
+    priceEl.textContent = price.toFixed(6);
+    
+    if (price >= tp1) {{
+      priceEl.style.color = "#4ade80";
+      statusEl.textContent = "✓ TP1 Üstünde";
+      statusEl.style.color = "#4ade80";
+    }} else if (price >= giris) {{
+      priceEl.style.color = "#86efac";
+      statusEl.textContent = "▲ +" + pnl + "%";
+      statusEl.style.color = "#86efac";
+    }} else if (price > stop) {{
+      priceEl.style.color = "#fbbf24";
+      statusEl.textContent = "▼ " + pnl + "%";
+      statusEl.style.color = "#fbbf24";
+    }} else {{
+      priceEl.style.color = "#f87171";
+      statusEl.textContent = "⚠ STOP ALTI";
+      statusEl.style.color = "#f87171";
+    }}
+  }}
+  document.getElementById("timer").textContent = "⟳ Son güncelleme: " + new Date().toLocaleTimeString();
+  setTimeout(updatePrices, 15000);
+}}
+
+updatePrices();
+</script>
 </body>
 </html>"""
     return html
