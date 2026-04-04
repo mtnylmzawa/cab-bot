@@ -1,3 +1,5 @@
+import httpx
+
 from fastapi import FastAPI, Request
 from binance.um_futures import UMFutures
 import os
@@ -174,3 +176,9 @@ async def webhook(request: Request):
         return {"status": "Pozisyon kapatıldı"}
 
     return {"status": "İşlem yapılmadı", "parsed": parsed}
+
+@app.get("/ip")
+async def get_ip():
+    async with httpx.AsyncClient() as c:
+        r = await c.get("https://api.ipify.org?format=json")
+        return r.json()
