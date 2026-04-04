@@ -22,8 +22,11 @@ client = UMFutures(
 
 MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "3"))
 
-# Açık pozisyonları hafızada tut
-open_positions = {}  # ticker -> {giris, stop, tp1, tp2, marj, lev, risk, zaman, durum}
+# Açık pozisyonlar
+open_positions = {}
+
+# Kapanan pozisyonlar (tarihçe)
+closed_positions = []
 
 def get_open_positions_binance():
     if TEST_MODE:
@@ -55,13 +58,15 @@ def parse_alert(message: str):
         elif "CAB v13 TRAIL |" in message:
             ticker = message.split("CAB v13 TRAIL | ")[1].split(" |")[0].strip()
             kalan  = message.split("Kalan %")[1].split()[0]
-            return {"type": "TRAIL", "ticker": ticker, "kalan": int(kalan)}
+            tp_type = "TP2" if "TP2 trailing" in message else "TP1"
+            return {"type": "TRAIL", "ticker": ticker, "kalan": int(kalan), "tp_type": tp_type}
         elif "CAB v13 STOP |" in message:
             ticker = message.split("CAB v13 STOP | ")[1].split(" |")[0].strip()
             kalan  = "100"
             if "Kalan %" in message:
                 kalan = message.split("Kalan %")[1].split()[0]
-            return {"type": "STOP", "ticker": ticker, "kalan": int(kalan)}
+            stop_type = "BE" if "BE stop" in message else ("TP2" if "TP2 sonrasi" in message else "TAM")
+            return {"type": "STOP", "ticker": ticker, "kalan": int(kalan), "stop_type": stop_type}
     except Exception as e:
         return {"type": "ERROR", "msg": str(e)}
     return {"type": "UNKNOWN"}
@@ -69,12 +74,28 @@ def parse_alert(message: str):
 def get_symbol(ticker):
     return ticker + "USDT" if not ticker.endswith("USDT") else ticker
 
-# Fiyat artık JavaScript ile tarayıcıda çekiliyor
+def close_position(ticker, sonuc, kar):
+    """Pozisyonu kapat ve tarihçeye ekle"""
+    if ticker in open_positions:
+        pos = open_positions[ticker]
+        closed_positions.append({
+            "ticker": ticker,
+            "marj": pos["marj"],
+            "giris": pos["giris"],
+            "tp1": pos["tp1"],
+            "tp2": pos["tp2"],
+            "stop": pos["stop"],
+            "sonuc": sonuc,
+            "kar": kar,
+            "zaman_acilis": pos.get("zaman", ""),
+            "zaman_kapanis": datetime.utcnow().strftime("%H:%M"),
+        })
+        del open_positions[ticker]
 
 @app.get("/")
 def health():
     mode = "TEST MODU" if TEST_MODE else "CANLI"
-    return {"status": f"CAB Bot calisiyor — {mode}", "acik_poz": len(open_positions)}
+    return {"status": f"CAB Bot calisiyor — {mode}", "acik": len(open_positions), "kapanan": len(closed_positions)}
 
 @app.get("/ip")
 async def get_ip():
@@ -82,16 +103,12 @@ async def get_ip():
         r = await c.get("https://api.ipify.org?format=json")
         return r.json()
 
-@app.get("/positions")
-async def get_positions():
-    """JS için pozisyon verisi"""
-    return open_positions
-
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     mode_badge = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI"
 
-    rows = ""
+    # Açık pozisyonlar tablosu
+    acik_rows = ""
     for ticker, pos in sorted(open_positions.items()):
         symbol = get_symbol(ticker)
         giris = pos["giris"]
@@ -100,12 +117,12 @@ async def dashboard():
         tp2   = pos["tp2"]
         durum = pos.get("durum", "Aktif")
 
-        rows += f"""
-        <tr id="row-{ticker}">
+        acik_rows += f"""
+        <tr>
             <td><b>{ticker}</b></td>
             <td>{pos['marj']:.0f}$</td>
             <td>{giris:.6f}</td>
-            <td id="price-{symbol}" style="color:#94a3b8">Yükleniyor...</td>
+            <td id="price-{symbol}" style="color:#94a3b8">...</td>
             <td>{stop:.6f}</td>
             <td style="color:#4ade80">{tp1:.6f}</td>
             <td style="color:#2dd4bf">{tp2:.6f}</td>
@@ -113,12 +130,48 @@ async def dashboard():
             <td style="color:#94a3b8;font-size:11px">{pos.get('zaman','')}</td>
         </tr>"""
 
-    if not rows:
-        rows = '<tr><td colspan="9" style="text-align:center;color:#94a3b8;padding:20px">Açık pozisyon yok — sinyal bekleniyor</td></tr>'
+    if not acik_rows:
+        acik_rows = '<tr><td colspan="9" style="text-align:center;color:#94a3b8;padding:16px">Açık pozisyon yok</td></tr>'
+
+    # Kapanan pozisyonlar tablosu
+    kapanan_rows = ""
+    toplam_kar = 0
+    for pos in reversed(closed_positions):
+        kar = pos.get("kar", 0)
+        toplam_kar += kar
+        kar_renk = "#4ade80" if kar > 0 else "#f87171" if kar < 0 else "#94a3b8"
+        kar_str = f"+{kar:.1f}$" if kar > 0 else f"{kar:.1f}$" if kar < 0 else "±0$"
+
+        sonuc_renk = {
+            "≈ TP1+Trail": "#fb923c",
+            "★ TP1+TP2+Trail": "#c084fc",
+            "~ TP1+BE Stop": "#60a5fa",
+            "✗ Stop": "#f87171",
+            "↓ TP2+Stop": "#f472b6",
+        }.get(pos["sonuc"], "#94a3b8")
+
+        kapanan_rows += f"""
+        <tr>
+            <td><b>{pos['ticker']}</b></td>
+            <td>{pos['marj']:.0f}$</td>
+            <td>{pos['giris']:.6f}</td>
+            <td style="color:{sonuc_renk};font-weight:bold">{pos['sonuc']}</td>
+            <td style="color:{kar_renk};font-weight:bold">{kar_str}</td>
+            <td style="color:#94a3b8;font-size:11px">{pos.get('zaman_acilis','')} → {pos.get('zaman_kapanis','')}</td>
+        </tr>"""
+
+    if not kapanan_rows:
+        kapanan_rows = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:16px">Henüz kapanan pozisyon yok</td></tr>'
+
+    net_renk = "#4ade80" if toplam_kar > 0 else "#f87171" if toplam_kar < 0 else "#94a3b8"
+    net_str = f"+{toplam_kar:.1f}$" if toplam_kar > 0 else f"{toplam_kar:.1f}$"
 
     symbols_json = str([get_symbol(t) for t in open_positions.keys()])
-    positions_json = str({get_symbol(t): {"giris": p["giris"], "stop": p["stop"], "tp1": p["tp1"]} 
-                         for t, p in open_positions.items()}).replace("'", '"')
+    positions_json = "{"
+    for t, p in open_positions.items():
+        sym = get_symbol(t)
+        positions_json += f'"{sym}":{{"giris":{p["giris"]},"stop":{p["stop"]},"tp1":{p["tp1"]}}},'
+    positions_json = positions_json.rstrip(",") + "}"
 
     html = f"""<!DOCTYPE html>
 <html lang="tr">
@@ -129,9 +182,10 @@ async def dashboard():
 <style>
   body {{ background:#0f0f1a; color:#eee; font-family:monospace; padding:16px; margin:0; }}
   h2 {{ color:#a78bfa; margin-bottom:4px; font-size:16px; }}
+  h3 {{ color:#60a5fa; font-size:13px; margin:16px 0 6px 0; }}
   .badge {{ display:inline-block; padding:3px 10px; border-radius:12px; font-size:12px; background:#1e1b4b; margin-bottom:8px; }}
   .info {{ color:#94a3b8; font-size:11px; margin-bottom:12px; }}
-  table {{ border-collapse:collapse; width:100%; font-size:12px; }}
+  table {{ border-collapse:collapse; width:100%; font-size:12px; margin-bottom:16px; }}
   th {{ background:#1e1b4b; color:#a78bfa; padding:8px 6px; text-align:left; border-bottom:1px solid #3730a3; white-space:nowrap; }}
   td {{ padding:7px 6px; border-bottom:1px solid #1e1e2e; white-space:nowrap; }}
   tr:hover {{ background:#1a1a2e; }}
@@ -143,18 +197,31 @@ async def dashboard():
 <h2>🤖 CAB Bot Dashboard</h2>
 <div class="badge">{mode_badge}</div>
 <div class="info" id="timer">⟳ Fiyatlar yükleniyor...</div>
+
 <div style="margin-bottom:14px">
-  <div class="stat"><b>{len(open_positions)}</b>Açık Pozisyon</div>
-  <div class="stat"><b>{MAX_POSITIONS}</b>Max Pozisyon</div>
+  <div class="stat"><b>{len(open_positions)}</b>Açık</div>
+  <div class="stat"><b>{len(closed_positions)}</b>Kapanan</div>
+  <div class="stat"><b style="color:{net_renk}">{net_str}</b>Net Kar</div>
   <div class="stat"><b>{"TEST" if TEST_MODE else "CANLI"}</b>Mod</div>
 </div>
+
+<h3>📊 Açık Pozisyonlar</h3>
 <table>
   <tr>
     <th>Coin</th><th>Marjin</th><th>Giriş</th><th>Şu An</th>
     <th>Stop</th><th>TP1</th><th>TP2</th><th>Durum</th><th>Zaman</th>
   </tr>
-  {rows}
+  {acik_rows}
 </table>
+
+<h3>📋 Kapanan Pozisyonlar</h3>
+<table>
+  <tr>
+    <th>Coin</th><th>Marjin</th><th>Giriş</th><th>Sonuç</th><th>Kar/Zarar</th><th>Zaman</th>
+  </tr>
+  {kapanan_rows}
+</table>
+
 <script>
 var symbols = {symbols_json};
 var positions = {positions_json};
@@ -179,36 +246,33 @@ async function updatePrices() {{
     var price = await fetchPrice(sym);
     var priceEl = document.getElementById("price-" + sym);
     var statusEl = document.getElementById("status-" + sym);
-    if (!priceEl) continue;
-    if (!price) {{ priceEl.textContent = "—"; continue; }}
-    
+    if (!priceEl || !price) continue;
+
     var pos = positions[sym];
     var giris = pos.giris;
     var stop = pos.stop;
     var tp1 = pos.tp1;
     var pnl = ((price - giris) / giris * 100).toFixed(2);
-    
+
     priceEl.textContent = price.toFixed(6);
-    
+
     if (price >= tp1) {{
       priceEl.style.color = "#4ade80";
-      statusEl.textContent = "✓ TP1 Üstünde";
-      statusEl.style.color = "#4ade80";
+      if (statusEl.textContent === "Aktif") {{ statusEl.textContent = "✓ TP1 Üstünde"; statusEl.style.color = "#4ade80"; }}
     }} else if (price >= giris) {{
       priceEl.style.color = "#86efac";
-      statusEl.textContent = "▲ +" + pnl + "%";
-      statusEl.style.color = "#86efac";
+      if (statusEl.textContent === "Aktif") {{ statusEl.textContent = "▲ +" + pnl + "%"; statusEl.style.color = "#86efac"; }}
     }} else if (price > stop) {{
       priceEl.style.color = "#fbbf24";
-      statusEl.textContent = "▼ " + pnl + "%";
-      statusEl.style.color = "#fbbf24";
+      if (statusEl.textContent === "Aktif") {{ statusEl.textContent = "▼ " + pnl + "%"; statusEl.style.color = "#fbbf24"; }}
     }} else {{
       priceEl.style.color = "#f87171";
       statusEl.textContent = "⚠ STOP ALTI";
       statusEl.style.color = "#f87171";
     }}
   }}
-  document.getElementById("timer").textContent = "⟳ Son güncelleme: " + new Date().toLocaleTimeString();
+  var now = new Date();
+  document.getElementById("timer").textContent = "⟳ Son güncelleme: " + now.toLocaleTimeString();
   setTimeout(updatePrices, 15000);
 }}
 
@@ -230,7 +294,7 @@ async def webhook(request: Request):
     if parsed["type"] == "GIRIS":
         if len(open_positions) >= MAX_POSITIONS:
             print(f"[ATLA] Max pozisyon doldu ({MAX_POSITIONS})")
-            return {"status": "ATLANDI", "sebep": f"Max {MAX_POSITIONS} pozisyon doldu"}
+            return {"status": "ATLANDI"}
 
         ticker = parsed["ticker"]
         zaman  = datetime.utcnow().strftime("%H:%M")
@@ -238,7 +302,8 @@ async def webhook(request: Request):
             "giris": parsed["giris"], "stop": parsed["stop"],
             "tp1": parsed["tp1"], "tp2": parsed["tp2"],
             "marj": parsed["marj"], "lev": parsed["lev"],
-            "risk": parsed["risk"], "zaman": zaman, "durum": "Aktif"
+            "risk": parsed["risk"], "zaman": zaman, "durum": "Aktif",
+            "tp1_hit": False, "tp2_hit": False
         }
 
         symbol   = get_symbol(ticker)
@@ -252,8 +317,7 @@ async def webhook(request: Request):
 
         if TEST_MODE:
             print(f"[TEST] GIRIS: {symbol} | Fiyat:{giris} | Stop:{stop} | TP1:{tp1} | TP2:{tp2} | Lot:{pos_size} | Kaldırac:{lev}x")
-            return {"status": "TEST", "symbol": symbol, "lot": pos_size,
-                    "giris": giris, "stop": stop, "tp1": tp1, "tp2": tp2}
+            return {"status": "TEST", "symbol": symbol}
 
         client.change_leverage(symbol=symbol, leverage=lev)
         try:
@@ -261,57 +325,99 @@ async def webhook(request: Request):
         except:
             pass
         order = client.new_order(symbol=symbol, side="BUY", type="MARKET", quantity=pos_size)
-        client.new_order(symbol=symbol, side="SELL", type="STOP_MARKET",
-                        stopPrice=round(stop, 6), closePosition=True)
-        tp1_qty = round(pos_size * 0.60, 3)
-        client.new_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
-                        stopPrice=round(tp1, 6), quantity=tp1_qty)
-        tp2_qty = round(pos_size * 0.25, 3)
-        client.new_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
-                        stopPrice=round(tp2, 6), quantity=tp2_qty)
+        client.new_order(symbol=symbol, side="SELL", type="STOP_MARKET", stopPrice=round(stop, 6), closePosition=True)
+        client.new_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET", stopPrice=round(tp1, 6), quantity=round(pos_size * 0.60, 3))
+        client.new_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET", stopPrice=round(tp2, 6), quantity=round(pos_size * 0.25, 3))
         return {"status": "OK", "symbol": symbol, "order": order["orderId"]}
 
     elif parsed["type"] == "TP1":
         ticker = parsed["ticker"]
         if ticker in open_positions:
-            open_positions[ticker]["stop"]  = parsed["stop"]
-            open_positions[ticker]["durum"] = "TP1 Alındı"
+            open_positions[ticker]["stop"]    = parsed["stop"]
+            open_positions[ticker]["durum"]   = "✓ TP1 Alındı — BE'de"
+            open_positions[ticker]["tp1_hit"] = True
         symbol = get_symbol(ticker)
-
         if TEST_MODE:
-            print(f"[TEST] TP1: {symbol} | Stop BE ye cekiliyor: {parsed['stop']}")
-            return {"status": "TEST", "islem": "TP1 stop BE guncellendi", "symbol": symbol}
-
+            print(f"[TEST] TP1: {symbol} | Stop BE: {parsed['stop']}")
+            return {"status": "TEST"}
         orders = client.get_orders(symbol=symbol)
         for o in orders:
             if o["type"] == "STOP_MARKET":
                 client.cancel_order(symbol=symbol, orderId=o["orderId"])
-        client.new_order(symbol=symbol, side="SELL", type="STOP_MARKET",
-                        stopPrice=round(parsed["stop"], 6), closePosition=True)
+        client.new_order(symbol=symbol, side="SELL", type="STOP_MARKET", stopPrice=round(parsed["stop"], 6), closePosition=True)
         return {"status": "TP1 stop guncellendi"}
 
     elif parsed["type"] == "TP2":
         ticker = parsed["ticker"]
         if ticker in open_positions:
-            open_positions[ticker]["durum"] = "TP2 Alındı"
+            open_positions[ticker]["durum"]   = "✓✓ TP2 Alındı"
+            open_positions[ticker]["tp2_hit"] = True
         return {"status": "TP2 kaydedildi"}
 
-    elif parsed["type"] in ["TRAIL", "STOP"]:
-        ticker = parsed["ticker"]
+    elif parsed["type"] == "TRAIL":
+        ticker   = parsed["ticker"]
+        tp_type  = parsed.get("tp_type", "TP1")
+        tp1_hit  = open_positions.get(ticker, {}).get("tp1_hit", False)
+        tp2_hit  = open_positions.get(ticker, {}).get("tp2_hit", False)
+        marj     = open_positions.get(ticker, {}).get("marj", 0)
+        giris    = open_positions.get(ticker, {}).get("giris", 0)
+        tp1      = open_positions.get(ticker, {}).get("tp1", 0)
+        tp2      = open_positions.get(ticker, {}).get("tp2", 0)
+
+        if tp2_hit:
+            sonuc = "★ TP1+TP2+Trail"
+            pos_size = marj * 10 / giris if giris > 0 else 0
+            kar = round(pos_size * giris * 0.60 * (tp1-giris)/giris + pos_size * giris * 0.25 * (tp2-giris)/giris, 1) if giris > 0 else 0
+        else:
+            sonuc = "≈ TP1+Trail"
+            pos_size = marj * 10 / giris if giris > 0 else 0
+            kar = round(pos_size * giris * 0.60 * (tp1-giris)/giris, 1) if giris > 0 else 0
+
+        close_position(ticker, sonuc, kar)
         symbol = get_symbol(ticker)
-        if ticker in open_positions:
-            del open_positions[ticker]
-
         if TEST_MODE:
-            print(f"[TEST] KAPAT: {symbol} | Tip: {parsed['type']}")
-            return {"status": "TEST", "islem": "Pozisyon kapatildi", "symbol": symbol}
-
+            print(f"[TEST] TRAIL KAPAT: {symbol} | {sonuc} | Kar: +{kar}$")
+            return {"status": "TEST"}
         client.cancel_open_orders(symbol=symbol)
         pos = [p for p in get_open_positions_binance() if p["symbol"] == symbol]
         if pos:
             amt = abs(float(pos[0]["positionAmt"]))
             if amt > 0:
                 client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=amt)
-        return {"status": "Pozisyon kapatildi"}
+        return {"status": "Trail kapandi"}
+
+    elif parsed["type"] == "STOP":
+        ticker    = parsed["ticker"]
+        stop_type = parsed.get("stop_type", "TAM")
+        tp1_hit   = open_positions.get(ticker, {}).get("tp1_hit", False)
+        tp2_hit   = open_positions.get(ticker, {}).get("tp2_hit", False)
+        risk      = open_positions.get(ticker, {}).get("risk", 0)
+        marj      = open_positions.get(ticker, {}).get("marj", 0)
+        giris     = open_positions.get(ticker, {}).get("giris", 0)
+        tp1       = open_positions.get(ticker, {}).get("tp1", 0)
+
+        if stop_type == "BE":
+            sonuc = "~ TP1+BE Stop"
+            pos_size = marj * 10 / giris if giris > 0 else 0
+            kar = round(pos_size * giris * 0.60 * (tp1-giris)/giris, 1) if giris > 0 else 0
+        elif stop_type == "TP2":
+            sonuc = "↓ TP2+Stop"
+            kar = 0
+        else:
+            sonuc = "✗ Stop"
+            kar = -risk
+
+        close_position(ticker, sonuc, kar)
+        symbol = get_symbol(ticker)
+        if TEST_MODE:
+            print(f"[TEST] STOP KAPAT: {symbol} | {sonuc} | Kar: {kar}$")
+            return {"status": "TEST"}
+        client.cancel_open_orders(symbol=symbol)
+        pos = [p for p in get_open_positions_binance() if p["symbol"] == symbol]
+        if pos:
+            amt = abs(float(pos[0]["positionAmt"]))
+            if amt > 0:
+                client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=amt)
+        return {"status": "Stop kapandi"}
 
     return {"status": "Islem yapilmadi", "parsed": parsed}
