@@ -184,7 +184,7 @@ async def dashboard():
     bugun_stop   = sum(1 for p in bugun_pozlar if "Stop" in p.get("sonuc","") and "BE" not in p.get("sonuc",""))
     bugun_tp     = sum(1 for p in bugun_pozlar if p.get("kar",0) > 0)
 
-    net_renk = "#4ade80" if toplam_kar > 0 else "#f87171"
+    net_renk = "#4ade80" if toplam_kar > 0 else "#f87171" if toplam_kar < 0 else "#94a3b8"
     net_str  = f"+{toplam_kar:.1f}$" if toplam_kar > 0 else f"{toplam_kar:.1f}$"
     bugun_renk = "#4ade80" if bugun_kar > 0 else "#f87171"
     bugun_str  = f"+{bugun_kar:.1f}$" if bugun_kar > 0 else f"{bugun_kar:.1f}$"
