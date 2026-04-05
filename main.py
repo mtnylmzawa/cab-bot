@@ -344,6 +344,7 @@ tr:hover {{ background:#111120; }}
     <option value="~ TP1+BE Stop">~ TP1+BE Stop</option>
   </select></label>
 </div>
+<div class="ozet" id="ozet" style="margin-top:6px">—</div>
 <table id="kapananTable">
   <tr>
     <th onclick="sortT('kapananTable',0)">Coin ↕</th>
@@ -457,7 +458,9 @@ function filterT() {{
   var net=vK+vZ;
   var nc=net>=0?"#4ade80":"#f87171";
   var ns=net>=0?"+"+net.toFixed(1)+"$":net.toFixed(1)+"$";
-  document.getElementById("ozet").innerHTML = vN===0 ? "Henüz kapanan pozisyon yok" :
+  var ozetEl = document.getElementById("ozet");
+  if (!ozetEl) return;
+  ozetEl.innerHTML = vN===0 ? "Henüz kapanan pozisyon yok" :
     "<b>"+vN+"</b> pozisyon &nbsp;|&nbsp; "+
     "<span style='color:#4ade80'>Kar: +"+vK.toFixed(1)+"$</span> &nbsp;|&nbsp; "+
     "<span style='color:#f87171'>Zarar: "+vZ.toFixed(1)+"$</span> &nbsp;|&nbsp; "+
