@@ -234,7 +234,7 @@ async def dashboard():
         hh_str  = f'<span style="color:#f59e0b">%{max_y:.2f}</span>' if max_y > 0 else '<span style="color:#555">—</span>'
 
         acik_rows += f"""<tr>
-            <td><a href="{tv_app}" onclick="return tryApp(this, '{tv_link}')" style="color:#a78bfa;text-decoration:none"><b>{ticker}</b> 🔗</a></td>
+            <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none" data-app="{tv_app}" onclick="openTV(this);return false;"><b>{ticker}</b> 🔗</a></td>
             <td>{pos['marj']:.0f}$ <small style="color:#666">({lev}x)</small></td>
             <td>{giris:.6f}</td>
             <td id="price-{symbol}" style="color:#94a3b8">...</td>
@@ -265,7 +265,7 @@ async def dashboard():
         tarih    = pos.get("tarih","")
 
         kapanan_rows += f"""<tr data-tarih="{tarih}" data-kar="{kar}" data-sonuc="{pos['sonuc']}">
-            <td><a href="{tv_app}" onclick="return tryApp(this, '{tv_link}')" style="color:#a78bfa;text-decoration:none"><b>{pos['ticker']}</b> 🔗</a></td>
+            <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none" data-app="{tv_app}" onclick="openTV(this);return false;"><b>{pos['ticker']}</b> 🔗</a></td>
             <td>{pos['marj']:.0f}$</td>
             <td>{pos['giris']:.6f}</td>
             <td style="color:{sonuc_renk};font-weight:bold">{pos['sonuc']}</td>
@@ -386,16 +386,14 @@ tr:hover {{ background:#111120; }}
 </table>
 
 <script>
-function tryApp(el, webUrl) {
-  var app = el.href;
-  var start = Date.now();
-  setTimeout(function() {
-    if (Date.now() - start < 2000) {
-      window.open(webUrl, '_blank');
-    }
-  }, 500);
-  return true;
-}
+function openTV(el) {{
+  var appUrl = el.getAttribute("data-app");
+  var webUrl = el.href;
+  window.location.href = appUrl;
+  setTimeout(function() {{
+    window.open(webUrl, "_blank");
+  }}, 1500);
+}}
 var symbols   = {symbols_json};
 var positions = {positions_json};
 var sortDirs  = {{}};
