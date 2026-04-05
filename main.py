@@ -146,6 +146,7 @@ async def fetch_price(symbol):
 
 async def update_hh_background():
     """Arka planda açık pozisyonların HH değerini güncelle"""
+    await asyncio.sleep(10)  # Bot başlarken biraz bekle
     while True:
         try:
             data = load_data()
@@ -156,15 +157,18 @@ async def update_hh_background():
                 if price and price > 0:
                     giris   = pos["giris"]
                     pct     = (price - giris) / giris * 100 if giris > 0 else 0
-                    curr_hh = pos.get("max_yukselis", 0)
+                    curr_hh = pos.get("max_yukselis", 0.0)
+                    print(f"[HH] {ticker}: fiyat={price:.6f} pct={pct:.2f}% hh={curr_hh:.2f}%")
                     if pct > curr_hh:
                         data["open_positions"][ticker]["max_yukselis"] = round(pct, 2)
                         changed = True
+                        print(f"[HH UPDATE] {ticker}: {curr_hh:.2f}% -> {pct:.2f}%")
             if changed:
                 save_data(data)
+                print(f"[HH SAVED]")
         except Exception as e:
             print(f"[HH ERR] {e}")
-        await asyncio.sleep(60)  # Her 60 saniyede bir güncelle
+        await asyncio.sleep(30)  # Her 30 saniyede bir güncelle
 
 @app.on_event("startup")
 async def startup():
@@ -230,11 +234,10 @@ async def dashboard():
         tp2_kar = round(pos_sz * 0.25 * (tp2-giris)/giris, 1) if giris > 0 else 0
         tp1_pct = round((tp1-giris)/giris*100, 2) if giris > 0 else 0
         tv_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{ticker}.P"
-        tv_app  = f"tradingview://x-callback-url/chart?symbol=BINANCE:{ticker}.P"
         hh_str  = f'<span style="color:#f59e0b">%{max_y:.2f}</span>' if max_y > 0 else '<span style="color:#555">—</span>'
 
         acik_rows += f"""<tr>
-            <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none" data-app="{tv_app}" onclick="openTV(this);return false;"><b>{ticker}</b> 🔗</a></td>
+            <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none" target="_blank"><b>{ticker}</b> 🔗</a></td>
             <td>{pos['marj']:.0f}$ <small style="color:#666">({lev}x)</small></td>
             <td>{giris:.6f}</td>
             <td id="price-{symbol}" style="color:#94a3b8">...</td>
@@ -265,7 +268,7 @@ async def dashboard():
         tarih    = pos.get("tarih","")
 
         kapanan_rows += f"""<tr data-tarih="{tarih}" data-kar="{kar}" data-sonuc="{pos['sonuc']}">
-            <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none" data-app="{tv_app}" onclick="openTV(this);return false;"><b>{pos['ticker']}</b> 🔗</a></td>
+            <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none" target="_blank"><b>{pos['ticker']}</b> 🔗</a></td>
             <td>{pos['marj']:.0f}$</td>
             <td>{pos['giris']:.6f}</td>
             <td style="color:{sonuc_renk};font-weight:bold">{pos['sonuc']}</td>
@@ -287,7 +290,7 @@ async def dashboard():
     positions_json = "{"
     for t, p in open_positions.items():
         sym = get_symbol(t)
-        positions_json += f'"{sym}":{{"giris":{p["giris"]},"stop":{p["stop"]},"tp1":{p["tp1"]}}},'
+        positions_json += f'"{sym}":{{"giris":{p["giris"]},"stop":{p["stop"]},"tp1":{p["tp1"]},"marj":{p.get("marj",0)},"lev":{p.get("lev",10)}}},'
     positions_json = positions_json.rstrip(",") + "}"
 
     html = f"""<!DOCTYPE html>
@@ -295,7 +298,6 @@ async def dashboard():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="30">
 <title>CAB Bot</title>
 <style>
 * {{ box-sizing:border-box; }}
@@ -349,11 +351,11 @@ tr:hover {{ background:#111120; }}
     <th onclick="sortT('acikTable',2)">Giriş ↕</th>
     <th onclick="sortT('acikTable',3)">Şu An ↕</th>
     <th onclick="sortT('acikTable',4)">TP1'e Kalan ↕</th>
-    <th onclick="sortT('acikTable',5)">Stop</th>
-    <th onclick="sortT('acikTable',6)">TP1</th>
-    <th onclick="sortT('acikTable',7)">TP2</th>
-    <th onclick="sortT('acikTable',8)">Durum ↕</th>
-    <th onclick="sortT('acikTable',9)">HH% ↕</th>
+    <th onclick="sortT('acikTable',5)">Durum ↕</th>
+    <th onclick="sortT('acikTable',6)">HH% ↕</th>
+    <th onclick="sortT('acikTable',7)">Stop</th>
+    <th onclick="sortT('acikTable',8)">TP1</th>
+    <th onclick="sortT('acikTable',9)">TP2</th>
     <th onclick="sortT('acikTable',10)">Zaman ↕</th>
   </tr>
   {acik_rows}
@@ -386,14 +388,7 @@ tr:hover {{ background:#111120; }}
 </table>
 
 <script>
-function openTV(el) {{
-  var appUrl = el.getAttribute("data-app");
-  var webUrl = el.href;
-  window.location.href = appUrl;
-  setTimeout(function() {{
-    window.open(webUrl, "_blank");
-  }}, 1500);
-}}
+
 var symbols   = {symbols_json};
 var positions = {positions_json};
 var sortDirs  = {{}};
@@ -424,18 +419,27 @@ async function updatePrices() {{
     pEl.textContent = price.toFixed(6);
     dEl.textContent = (price >= pos.tp1) ? "✓ Geçildi" : ("%"+tp1d+" uzak");
     dEl.style.color = (price >= pos.tp1) ? "#4ade80" : "#f59e0b";
+    var marj = pos.marj || 0;
+    var lev  = pos.lev  || 10;
+    var posSz = marj * lev;
+    var pnlUsdt = (posSz * (price - pos.giris) / pos.giris).toFixed(1);
+    var pnlStr = (pnlUsdt >= 0 ? "+" : "") + pnlUsdt + "$ (" + (pnl >= 0 ? "+" : "") + pnl + "%)";
     if (price >= pos.tp1) {{
       pEl.style.color = "#4ade80";
-      if (sEl.textContent==="Aktif") {{ sEl.textContent="✓ TP1 Üstünde"; sEl.style.color="#4ade80"; }}
+      sEl.textContent = "✓ TP1+ " + pnlStr;
+      sEl.style.color = "#4ade80";
     }} else if (price >= pos.giris) {{
       pEl.style.color = "#86efac";
-      if (sEl.textContent==="Aktif") {{ sEl.textContent="▲ +"+pnl+"%"; sEl.style.color="#86efac"; }}
+      sEl.textContent = "▲ " + pnlStr;
+      sEl.style.color = "#86efac";
     }} else if (price > pos.stop) {{
       pEl.style.color = "#fbbf24";
-      if (sEl.textContent==="Aktif") {{ sEl.textContent="▼ "+pnl+"%"; sEl.style.color="#fbbf24"; }}
+      sEl.textContent = "▼ " + pnlStr;
+      sEl.style.color = "#fbbf24";
     }} else {{
       pEl.style.color = "#f87171";
-      sEl.textContent = "⚠ STOP ALTI"; sEl.style.color="#f87171";
+      sEl.textContent = "⚠ STOP " + pnlStr;
+      sEl.style.color = "#f87171";
     }}
   }}
   document.getElementById("timer").textContent = "⟳ Son güncelleme: "+new Date().toLocaleTimeString();
@@ -465,6 +469,7 @@ function filterT() {{
   var rows  = Array.from(document.getElementById("kapananTable").rows).slice(1);
   var vK=0, vZ=0, vN=0;
   rows.forEach(function(r) {{
+    if (!r.getAttribute("data-tarih")) return; // boş satırı atla
     var rT = r.getAttribute("data-tarih")||"";
     var rK = parseFloat(r.getAttribute("data-kar")||"0");
     var rS = r.getAttribute("data-sonuc")||"";
@@ -478,7 +483,7 @@ function filterT() {{
   var net=vK+vZ;
   var nc=net>=0?"#4ade80":"#f87171";
   var ns=net>=0?"+"+net.toFixed(1)+"$":net.toFixed(1)+"$";
-  document.getElementById("ozet").innerHTML =
+  document.getElementById("ozet").innerHTML = vN===0 ? "Henüz kapanan pozisyon yok" :
     "<b>"+vN+"</b> pozisyon &nbsp;|&nbsp; "+
     "<span style='color:#4ade80'>Kar: +"+vK.toFixed(1)+"$</span> &nbsp;|&nbsp; "+
     "<span style='color:#f87171'>Zarar: "+vZ.toFixed(1)+"$</span> &nbsp;|&nbsp; "+
