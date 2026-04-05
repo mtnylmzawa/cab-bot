@@ -19,12 +19,51 @@ MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "3"))
 # Kalıcı veri dosyası — Railway volume'da
 DATA_FILE = os.environ.get("DATA_FILE", "/data/cab_data.json")
 
+INITIAL_DATA = {"open_positions": {}, "closed_positions": [
+    {"ticker":"GRASSUSDT","marj":77,"giris":0.283,"sonuc":"✗ Stop","kar":-22.7,"tarih":"2026-04-04","zaman_acilis":"16:00","zaman_kapanis":"06:18","max_yukselis":0},
+    {"ticker":"1INCHUSDT","marj":72,"giris":0.0887,"sonuc":"✗ Stop","kar":-14.7,"tarih":"2026-04-05","zaman_acilis":"00:15","zaman_kapanis":"06:17","max_yukselis":0},
+    {"ticker":"ADAUSDT","marj":191,"giris":0.2462,"sonuc":"✗ Stop","kar":-30.1,"tarih":"2026-04-04","zaman_acilis":"15:15","zaman_kapanis":"06:13","max_yukselis":0},
+    {"ticker":"SUSHIUSDT","marj":135,"giris":0.1945,"sonuc":"✗ Stop","kar":-27.2,"tarih":"2026-04-04","zaman_acilis":"15:00","zaman_kapanis":"06:10","max_yukselis":0},
+    {"ticker":"VANAUSDT","marj":151,"giris":1.222,"sonuc":"✗ Stop","kar":-24.1,"tarih":"2026-04-05","zaman_acilis":"00:30","zaman_kapanis":"06:10","max_yukselis":0},
+    {"ticker":"SPXUSDT","marj":129,"giris":0.2652,"sonuc":"✗ Stop","kar":-27.2,"tarih":"2026-04-04","zaman_acilis":"15:15","zaman_kapanis":"06:07","max_yukselis":0},
+    {"ticker":"AXSUSDT","marj":128,"giris":1.124,"sonuc":"✗ Stop","kar":-24.4,"tarih":"2026-04-04","zaman_acilis":"21:15","zaman_kapanis":"06:02","max_yukselis":0},
+    {"ticker":"HYPERUSDT","marj":140,"giris":0.0866,"sonuc":"✗ Stop","kar":-27.0,"tarih":"2026-04-05","zaman_acilis":"01:15","zaman_kapanis":"05:53","max_yukselis":0},
+    {"ticker":"RESOLVUSDT","marj":84,"giris":0.04047,"sonuc":"✗ Stop","kar":-25.5,"tarih":"2026-04-05","zaman_acilis":"02:30","zaman_kapanis":"05:52","max_yukselis":0},
+    {"ticker":"BATUSDT","marj":130,"giris":0.0959,"sonuc":"✗ Stop","kar":-24.9,"tarih":"2026-04-05","zaman_acilis":"00:00","zaman_kapanis":"05:52","max_yukselis":0},
+    {"ticker":"PNUTUSDT","marj":107,"giris":0.04049,"sonuc":"✗ Stop","kar":-24.2,"tarih":"2026-04-04","zaman_acilis":"15:15","zaman_kapanis":"05:52","max_yukselis":0},
+    {"ticker":"ARBUSDT","marj":144,"giris":0.0929,"sonuc":"✗ Stop","kar":-26.1,"tarih":"2026-04-04","zaman_acilis":"15:15","zaman_kapanis":"05:51","max_yukselis":0},
+    {"ticker":"SONICUSDT","marj":48,"giris":0.03757,"sonuc":"✗ Stop","kar":-14.6,"tarih":"2026-04-05","zaman_acilis":"00:15","zaman_kapanis":"05:39","max_yukselis":0},
+    {"ticker":"KAVAUSDT","marj":113,"giris":0.0525,"sonuc":"✗ Stop","kar":-22.0,"tarih":"2026-04-05","zaman_acilis":"00:15","zaman_kapanis":"05:37","max_yukselis":0},
+    {"ticker":"1000XECUSDT","marj":85,"giris":0.00697,"sonuc":"✗ Stop","kar":-20.2,"tarih":"2026-04-04","zaman_acilis":"19:15","zaman_kapanis":"05:28","max_yukselis":0},
+    {"ticker":"ATHUSDT","marj":96,"giris":0.00685,"sonuc":"✗ Stop","kar":-25.5,"tarih":"2026-04-04","zaman_acilis":"23:00","zaman_kapanis":"05:15","max_yukselis":0},
+    {"ticker":"ZBTUSDT","marj":66,"giris":0.09695,"sonuc":"≈ TP1+Trail","kar":25.3,"tarih":"2026-04-05","zaman_acilis":"04:45","zaman_kapanis":"05:13","max_yukselis":0},
+    {"ticker":"INJUSDT","marj":144,"giris":2.835,"sonuc":"✗ Stop","kar":-23.4,"tarih":"2026-04-04","zaman_acilis":"19:15","zaman_kapanis":"04:49","max_yukselis":0},
+    {"ticker":"COWUSDT","marj":111,"giris":0.204,"sonuc":"✗ Stop","kar":-22.8,"tarih":"2026-04-04","zaman_acilis":"19:15","zaman_kapanis":"04:11","max_yukselis":0},
+    {"ticker":"SAHARAUSDT","marj":65,"giris":0.02365,"sonuc":"✗ Stop","kar":-21.7,"tarih":"2026-04-05","zaman_acilis":"00:15","zaman_kapanis":"02:40","max_yukselis":0},
+    {"ticker":"DIAUSDT","marj":64,"giris":0.1846,"sonuc":"✗ Stop","kar":-17.8,"tarih":"2026-04-04","zaman_acilis":"17:00","zaman_kapanis":"02:30","max_yukselis":0},
+    {"ticker":"CVCUSDT","marj":119,"giris":0.03012,"sonuc":"✗ Stop","kar":-26.0,"tarih":"2026-04-05","zaman_acilis":"00:15","zaman_kapanis":"01:53","max_yukselis":0},
+    {"ticker":"KASUSDT","marj":125,"giris":0.03166,"sonuc":"✗ Stop","kar":-24.4,"tarih":"2026-04-04","zaman_acilis":"14:00","zaman_kapanis":"00:46","max_yukselis":0},
+    {"ticker":"AEROUSDT","marj":136,"giris":0.317,"sonuc":"✗ Stop","kar":-22.9,"tarih":"2026-04-04","zaman_acilis":"19:15","zaman_kapanis":"00:34","max_yukselis":0},
+    {"ticker":"COSUSDT","marj":39,"giris":0.00128,"sonuc":"≈ TP1+Trail","kar":18.3,"tarih":"2026-04-04","zaman_acilis":"21:15","zaman_kapanis":"23:00","max_yukselis":0},
+    {"ticker":"EDENUSDT","marj":76,"giris":0.03301,"sonuc":"✗ Stop","kar":-34.5,"tarih":"2026-04-04","zaman_acilis":"12:45","zaman_kapanis":"22:06","max_yukselis":0},
+    {"ticker":"FFUSDT","marj":203,"giris":0.0696,"sonuc":"≈ TP1+Trail","kar":19.8,"tarih":"2026-04-04","zaman_acilis":"19:45","zaman_kapanis":"20:15","max_yukselis":0},
+    {"ticker":"DOGEUSDT","marj":249,"giris":0.09146,"sonuc":"≈ TP1+Trail","kar":24.8,"tarih":"2026-04-04","zaman_acilis":"15:15","zaman_kapanis":"19:14","max_yukselis":0},
+    {"ticker":"AIXBTUSDT","marj":77,"giris":0.02296,"sonuc":"✗ Stop","kar":-26.2,"tarih":"2026-04-04","zaman_acilis":"15:00","zaman_kapanis":"18:43","max_yukselis":0},
+    {"ticker":"TRUMPUSDT","marj":102,"giris":2.882,"sonuc":"≈ TP1+Trail","kar":19.2,"tarih":"2026-04-04","zaman_acilis":"17:15","zaman_kapanis":"17:43","max_yukselis":0},
+]}
+
 def load_data():
     try:
         with open(DATA_FILE, 'r') as f:
-            return json.load(f)
+            d = json.load(f)
+            # Eski veri varsa koru, yoksa başlangıç verisini kullan
+            if d.get("closed_positions"):
+                return d
     except:
-        return {"open_positions": {}, "closed_positions": []}
+        pass
+    # İlk çalışma — başlangıç verisini kaydet
+    save_data(INITIAL_DATA)
+    return dict(INITIAL_DATA)
 
 def save_data(data):
     try:
