@@ -237,16 +237,16 @@ async def dashboard():
         hh_str  = f'<span style="color:#f59e0b">%{max_y:.2f}</span>' if max_y > 0 else '<span style="color:#555">—</span>'
 
         acik_rows += f"""<tr>
-            <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none" target="_blank"><b>{ticker}</b> 🔗</a></td>
+            <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none"><b>{ticker}</b> 🔗</a></td>
             <td>{pos['marj']:.0f}$ <small style="color:#666">({lev}x)</small></td>
             <td>{giris:.6f}</td>
             <td id="price-{symbol}" style="color:#94a3b8">...</td>
             <td id="tp1dist-{symbol}" style="color:#94a3b8">—</td>
+            <td id="status-{symbol}" style="color:#94a3b8">Yükleniyor...</td>
+            <td>{hh_str}</td>
             <td>{stop:.6f} <small style="color:#f87171">(-{risk:.1f}$)</small></td>
             <td style="color:#4ade80">{tp1:.6f} <small style="color:#4ade80">(+{tp1_kar:.1f}$)</small></td>
             <td style="color:#2dd4bf">{tp2:.6f} <small style="color:#2dd4bf">(+{tp2_kar:.1f}$)</small></td>
-            <td id="status-{symbol}" style="color:#94a3b8">{durum}</td>
-            <td>{hh_str}</td>
             <td style="color:#94a3b8;font-size:10px">{pos.get('zaman','')}</td>
         </tr>"""
 
@@ -444,6 +444,9 @@ async function updatePrices() {{
   document.getElementById("timer").textContent = "⟳ Son güncelleme: "+new Date().toLocaleTimeString();
   setTimeout(updatePrices, 15000);
 }}
+
+// Her 30 saniyede sayfayı yenile (yeni pozisyonlar için)
+setTimeout(function() {{ location.reload(); }}, 30000);
 
 function sortT(tid, col) {{
   var tbl  = document.getElementById(tid);
