@@ -144,35 +144,7 @@ async def fetch_price(symbol):
             pass
     return None
 
-async def update_hh_background():
-    """Arka planda açık pozisyonların HH değerini güncelle"""
-    await asyncio.sleep(10)  # Bot başlarken biraz bekle
-    while True:
-        try:
-            data = load_data()
-            changed = False
-            for ticker, pos in list(data["open_positions"].items()):
-                symbol = get_symbol(ticker)
-                price  = await fetch_price(symbol)
-                if price and price > 0:
-                    giris   = pos["giris"]
-                    pct     = (price - giris) / giris * 100 if giris > 0 else 0
-                    curr_hh = pos.get("max_yukselis", 0.0)
-                    print(f"[HH] {ticker}: fiyat={price:.6f} pct={pct:.2f}% hh={curr_hh:.2f}%")
-                    if pct > curr_hh:
-                        data["open_positions"][ticker]["max_yukselis"] = round(pct, 2)
-                        changed = True
-                        print(f"[HH UPDATE] {ticker}: {curr_hh:.2f}% -> {pct:.2f}%")
-            if changed:
-                save_data(data)
-                print(f"[HH SAVED]")
-        except Exception as e:
-            print(f"[HH ERR] {e}")
-        await asyncio.sleep(30)  # Her 30 saniyede bir güncelle
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(update_hh_background())
+# HH artık tarayıcı üzerinden güncelleniyor (/update_hh endpoint)
 
 @app.get("/")
 def health():
@@ -329,7 +301,7 @@ tr:hover {{ background:#111120; }}
 <div class="stats">
   <div class="stat"><b>{len(open_positions)}</b><small>Açık</small></div>
   <div class="stat"><b>{kapanan_n}</b><small>Kapanan</small></div>
-  <div class="stat"><b style="color:{net_renk}">{net_str}</b><small>Net Kar</small></div>
+  <div class="stat"><b id="netkar" style="color:{net_renk}">{net_str}</b><small>Net Kar</small></div>
   <div class="stat"><b style="color:{'#4ade80' if win_rate>=50 else '#f87171'}">{win_rate}%</b><small>Win Rate</small></div>
   <div class="stat"><b>{sure_str(ort_sure)}</b><small>Ort. Süre</small></div>
   <div class="stat"><b>{"TEST" if TEST_MODE else "CANLI"}</b><small>Mod</small></div>
@@ -432,9 +404,9 @@ async function updatePrices() {{
       sEl.textContent = "▲ " + pnlStr;
       sEl.style.color = "#86efac";
     }} else if (price > pos.stop) {{
-      pEl.style.color = "#fbbf24";
+      pEl.style.color = "#f87171";
       sEl.textContent = "▼ " + pnlStr;
-      sEl.style.color = "#fbbf24";
+      sEl.style.color = "#f87171";
     }} else {{
       pEl.style.color = "#f87171";
       sEl.textContent = "⚠ STOP " + pnlStr;
