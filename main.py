@@ -372,7 +372,6 @@ tr:hover {{ background:#111120; }}
     <option value="~ TP1+BE Stop">~ TP1+BE Stop</option>
   </select></label>
 </div>
-<div class="ozet" id="ozet">—</div>
 <table id="kapananTable">
   <tr>
     <th onclick="sortT('kapananTable',0)">Coin ↕</th>
