@@ -230,7 +230,7 @@ async def dashboard():
         tp2_kar = round(pos_sz * 0.25 * (tp2-giris)/giris, 1) if giris > 0 else 0
         tp1_pct = round((tp1-giris)/giris*100, 2) if giris > 0 else 0
         tv_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{ticker}.P"
-        tv_app  = f"tradingview://chart/?symbol=BINANCE:{ticker}.P"
+        tv_app  = f"tradingview://x-callback-url/chart?symbol=BINANCE:{ticker}.P"
         hh_str  = f'<span style="color:#f59e0b">%{max_y:.2f}</span>' if max_y > 0 else '<span style="color:#555">—</span>'
 
         acik_rows += f"""<tr>
