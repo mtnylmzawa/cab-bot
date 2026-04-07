@@ -368,11 +368,15 @@ var sortDirs  = {{}};
 async function fp(sym) {{
   try {{
     var r = await fetch("https://fapi.binance.com/fapi/v1/ticker/price?symbol="+sym);
-    return parseFloat((await r.json()).price);
+    if (!r.ok) return null;
+    var d = await r.json();
+    return d.price ? parseFloat(d.price) : null;
   }} catch(e) {{
     try {{
       var r2 = await fetch("https://api.binance.com/api/v3/ticker/price?symbol="+sym);
-      return parseFloat((await r2.json()).price);
+      if (!r2.ok) return null;
+      var d2 = await r2.json();
+      return d2.price ? parseFloat(d2.price) : null;
     }} catch(e2) {{ return null; }}
   }}
 }}
@@ -413,6 +417,13 @@ async function updatePrices() {{
       sEl.textContent = "⚠ STOP " + pnlStr;
       sEl.style.color = "#f87171";
     }}
+    // HH güncelle
+    var hhTicker = sym.endsWith("USDT") ? sym.slice(0,-4) : sym;
+    fetch("/update_hh", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{ticker: sym, price: price}})
+    }}).catch(function(){{}});
   }}
   document.getElementById("timer").textContent = "⟳ Son güncelleme: "+new Date().toLocaleTimeString();
   setTimeout(updatePrices, 15000);
@@ -597,3 +608,28 @@ async def webhook(request: Request):
         return {"status":"Stop ok"}
 
     return {"status":"Islem yapilmadi"}
+
+@app.post("/update_hh")
+async def update_hh(request: Request):
+    """Tarayıcıdan gelen fiyatla HH güncelle"""
+    try:
+        body = await request.body()
+        req  = json.loads(body)
+        data = load_data()
+        ticker = req.get("ticker", "")
+        price  = float(req.get("price", 0))
+        # XXXUSDT veya XXX formatını destekle
+        if ticker not in data["open_positions"]:
+            alt = ticker[:-4] if ticker.endswith("USDT") else ticker + "USDT"
+            ticker = alt if alt in data["open_positions"] else None
+        if ticker and price > 0:
+            giris    = data["open_positions"][ticker]["giris"]
+            pct      = (price - giris) / giris * 100 if giris > 0 else 0
+            curr_hh  = data["open_positions"][ticker].get("max_yukselis", 0.0)
+            if pct > curr_hh:
+                data["open_positions"][ticker]["max_yukselis"] = round(pct, 2)
+                save_data(data)
+                print(f"[HH] {ticker}: {curr_hh:.2f}% -> {pct:.2f}%")
+    except Exception as e:
+        print(f"[HH ERR] {e}")
+    return {"status": "ok"}
