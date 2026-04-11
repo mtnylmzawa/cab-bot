@@ -55,8 +55,17 @@ def parse_alert(message: str):
             marj   = float(message.split("Marj:")[1].split("$")[0])
             lev    = int(message.split("Lev:")[1].split("x")[0])
             risk   = float(message.split("Risk:")[1].split("$")[0])
+            kapat_oran = 60
+            atr_skor   = 100
+            if "Kapat:" in message:
+                try: kapat_oran = int(message.split("Kapat:")[1].split()[0])
+                except: pass
+            if "ATR:" in message:
+                try: atr_skor = int(message.split("ATR:")[1].split()[0])
+                except: pass
             return {"type":"GIRIS","ticker":ticker,"giris":giris,"stop":stop,
-                    "tp1":tp1,"tp2":tp2,"marj":marj,"lev":lev,"risk":risk}
+                    "tp1":tp1,"tp2":tp2,"marj":marj,"lev":lev,"risk":risk,
+                    "kapat_oran":kapat_oran,"atr_skor":atr_skor}
         elif "CAB v13 TP1 |" in message:
             ticker = message.split("CAB v13 TP1 | ")[1].split(" |")[0].strip()
             tp1    = float(message.split("TP1:")[1].split()[0])
@@ -236,7 +245,11 @@ async def dashboard():
         else:
             atr_str = '<span style="color:#555">—</span>'
 
-        acik_rows += f"""<tr>
+        trail_aktif = pos.get("trail_aktif", False)
+        tp1_kar_pos = pos.get("tp1_kar", 0)
+        row_bg = "background:#1a2a1a;" if trail_aktif else ""
+        durum_str = pos.get("durum", "Aktif")
+        acik_rows += f"""<tr style="{row_bg}">
             <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none"><b>{ticker}</b> 🔗</a></td>
             <td>{pos['marj']:.0f}$ <small style="color:#666">({lev}x)</small></td>
             <td>{giris:.6f}</td>
@@ -245,6 +258,7 @@ async def dashboard():
             <td id="status-{symbol}" style="color:#94a3b8">Yükleniyor...</td>
             <td>{hh_str}</td>
             <td>{atr_str}</td>
+            <td id="trail-{symbol}" style="color:#fb923c">{'✓ Aktif (+' + str(tp1_kar_pos) + '$)' if trail_aktif else '—'}</td>
             <td>{stop:.6f} <small style="color:#f87171">(-{risk:.1f}$)</small></td>
             <td style="color:#4ade80">{tp1:.6f} <small style="color:#4ade80">(+{tp1_kar:.1f}$)</small></td>
             <td style="color:#2dd4bf">{tp2:.6f} <small style="color:#2dd4bf">(+{tp2_kar:.1f}$)</small></td>
@@ -252,7 +266,7 @@ async def dashboard():
         </tr>"""
 
     if not acik_rows:
-        acik_rows = '<tr><td colspan="12" style="text-align:center;color:#555;padding:16px">Açık pozisyon yok</td></tr>'
+        acik_rows = '<tr><td colspan="13" style="text-align:center;color:#555;padding:16px">Açık pozisyon yok</td></tr>'
 
     # Kapanan pozisyonlar
     kapanan_rows = ""
@@ -364,7 +378,8 @@ tr:hover {{ background:#111120; }}
     <th onclick="sortT('acikTable',5)">Durum ↕</th>
     <th onclick="sortT('acikTable',6)">HH% ↕</th>
     <th onclick="sortT('acikTable',7)">ATR/Kapat ↕</th>
-    <th onclick="sortT('acikTable',8)">Stop</th>
+    <th onclick="sortT('acikTable',8)">Trailing ↕</th>
+    <th onclick="sortT('acikTable',9)">Stop</th>
     <th onclick="sortT('acikTable',9)">TP1</th>
     <th onclick="sortT('acikTable',10)">TP2</th>
     <th onclick="sortT('acikTable',11)">Zaman ↕</th>
@@ -541,7 +556,9 @@ async def webhook(request: Request):
             "risk":parsed["risk"],"zaman":now_str(),
             "tarih":today_str(),"durum":"Aktif",
             "tp1_hit":False,"tp2_hit":False,"max_yukselis":0.0,
-            "kapat_oran":None,"atr_skor":None
+            "kapat_oran":parsed.get("kapat_oran", 60),
+            "atr_skor":parsed.get("atr_skor", 100),
+            "tp1_kar":0.0,"trail_aktif":False,"trail_px":None
         }
         save_data(data)
         symbol = get_symbol(ticker)
@@ -561,19 +578,29 @@ async def webhook(request: Request):
         return {"status":"OK","order":order["orderId"]}
 
     elif parsed["type"] == "TP1":
-        ticker = parsed["ticker"]
+        ticker     = parsed["ticker"]
         kapat_oran = parsed.get("kapat_oran", 60)
-        atr_skor   = parsed.get("atr_skor", 1.0)
+        atr_skor   = parsed.get("atr_skor", 100)
         if ticker in data["open_positions"]:
-            data["open_positions"][ticker]["stop"]      = parsed["stop"]
-            data["open_positions"][ticker]["durum"]     = "✓ TP1 Alındı"
-            data["open_positions"][ticker]["tp1_hit"]   = True
+            pos        = data["open_positions"][ticker]
+            marj       = pos.get("marj", 0)
+            lev        = pos.get("lev", 10)
+            giris      = pos.get("giris", 0)
+            tp1        = pos.get("tp1", 0)
+            pos_sz     = marj * lev
+            kap_r      = kapat_oran / 100
+            tp1_kar    = round(pos_sz * kap_r * (tp1 - giris) / giris, 1) if giris > 0 else 0
+            data["open_positions"][ticker]["stop"]       = parsed["stop"]
+            data["open_positions"][ticker]["durum"]      = f"✓ TP1 (+{tp1_kar}$)"
+            data["open_positions"][ticker]["tp1_hit"]    = True
             data["open_positions"][ticker]["kapat_oran"] = kapat_oran
-            data["open_positions"][ticker]["atr_skor"]  = atr_skor
+            data["open_positions"][ticker]["atr_skor"]   = atr_skor
+            data["open_positions"][ticker]["tp1_kar"]    = tp1_kar
+            data["open_positions"][ticker]["trail_aktif"] = True
         save_data(data)
         symbol = get_symbol(ticker)
         if TEST_MODE:
-            print(f"[TEST] TP1: {symbol} | BE:{parsed['stop']} | Kapat:%{kapat_oran} | ATR:{atr_skor}x")
+            print(f"[TEST] TP1: {symbol} | BE:{parsed['stop']} | Kapat:%{kapat_oran} | TP1Kar:{tp1_kar}$")
             return {"status":"TEST"}
         orders = client.get_orders(symbol=symbol)
         for o in orders:
@@ -590,23 +617,32 @@ async def webhook(request: Request):
         return {"status":"TP2 ok"}
 
     elif parsed["type"] == "TRAIL":
-        ticker  = parsed["ticker"]
-        tp2_hit = data["open_positions"].get(ticker,{}).get("tp2_hit",False)
-        marj    = data["open_positions"].get(ticker,{}).get("marj",0)
-        lev     = data["open_positions"].get(ticker,{}).get("lev",10)
-        giris   = data["open_positions"].get(ticker,{}).get("giris",0)
-        tp1     = data["open_positions"].get(ticker,{}).get("tp1",0)
-        tp2     = data["open_positions"].get(ticker,{}).get("tp2",0)
-        kap_o   = data["open_positions"].get(ticker,{}).get("kapat_oran", 60)
-        pos_sz  = marj * lev
-        kap_r   = (kap_o or 60) / 100
-        kalan_r = 1.0 - kap_r
+        ticker    = parsed["ticker"]
+        pos       = data["open_positions"].get(ticker, {})
+        tp2_hit   = pos.get("tp2_hit", False)
+        marj      = pos.get("marj", 0)
+        lev       = pos.get("lev", 10)
+        giris     = pos.get("giris", 0)
+        tp1       = pos.get("tp1", 0)
+        tp2       = pos.get("tp2", 0)
+        kap_o     = pos.get("kapat_oran", 60)
+        tp1_kar   = pos.get("tp1_kar", 0)
+        pos_sz    = marj * lev
+        kap_r     = (kap_o or 60) / 100
+        kalan_r   = 1.0 - kap_r
+        # Trail fiyatı alert'ten al
+        trail_px  = None
+        if "Trailing:" in message:
+            try: trail_px = float(message.split("Trailing:")[1].strip())
+            except: pass
         if tp2_hit:
-            sonuc = "★ TP1+TP2+Trail"
-            kar = round(pos_sz*kap_r*(tp1-giris)/giris + pos_sz*0.25*(tp2-giris)/giris, 1) if giris>0 else 0
+            sonuc    = "★ TP1+TP2+Trail"
+            trail_kar = round(pos_sz * 0.25 * (tp2 - giris) / giris, 1) if giris > 0 else 0
+            kar      = round(tp1_kar + trail_kar, 1)
         else:
-            sonuc = "≈ TP1+Trail"
-            kar = round(pos_sz*kap_r*(tp1-giris)/giris, 1) if giris>0 else 0
+            sonuc    = "≈ TP1+Trail"
+            trail_kar = round(pos_sz * kalan_r * (trail_px - giris) / giris, 1) if trail_px and giris > 0 else 0
+            kar      = round(tp1_kar + trail_kar, 1)
         close_position(data, ticker, sonuc, kar)
         save_data(data)
         symbol = get_symbol(ticker)
