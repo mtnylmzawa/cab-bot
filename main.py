@@ -61,7 +61,7 @@ def parse_alert(message: str):
                 try: kapat_oran = int(message.split("Kapat:")[1].split()[0])
                 except: pass
             if "ATR:" in message:
-                try: atr_skor = int(message.split("ATR:")[1].split()[0])
+                try: atr_skor = round(int(message.split("ATR:")[1].split()[0]) / 100, 2)
                 except: pass
             return {"type":"GIRIS","ticker":ticker,"giris":giris,"stop":stop,
                     "tp1":tp1,"tp2":tp2,"marj":marj,"lev":lev,"risk":risk,
@@ -81,7 +81,9 @@ def parse_alert(message: str):
             atr_skor = 1.0
             if "ATR:" in message:
                 try:
-                    atr_skor = float(message.split("ATR:")[1].strip())
+                    raw = message.split("ATR:")[1].strip().split()[0]
+                    val = float(raw)
+                    atr_skor = round(val / 100, 2) if val > 10 else round(val, 2)
                 except:
                     pass
             return {"type":"TP1","ticker":ticker,"tp1":tp1,"stop":stop,
@@ -557,7 +559,7 @@ async def webhook(request: Request):
             "tarih":today_str(),"durum":"Aktif",
             "tp1_hit":False,"tp2_hit":False,"max_yukselis":0.0,
             "kapat_oran":parsed.get("kapat_oran", 60),
-            "atr_skor":parsed.get("atr_skor", 100),
+            "atr_skor":parsed.get("atr_skor", 1.0),
             "tp1_kar":0.0,"trail_aktif":False,"trail_px":None
         }
         save_data(data)
@@ -581,6 +583,7 @@ async def webhook(request: Request):
         ticker     = parsed["ticker"]
         kapat_oran = parsed.get("kapat_oran", 60)
         atr_skor   = parsed.get("atr_skor", 100)
+        tp1_kar    = 0
         if ticker in data["open_positions"]:
             pos        = data["open_positions"][ticker]
             marj       = pos.get("marj", 0)
