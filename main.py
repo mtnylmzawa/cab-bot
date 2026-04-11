@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from binance.um_futures import UMFutures
 import os, json, httpx, asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
@@ -18,11 +18,12 @@ MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "3"))
 DATA_FILE = os.environ.get("DATA_FILE", "/tmp/cab_data.json")
 
 INITIAL_DATA = {"open_positions": {}, "closed_positions": []}
+
 def load_data():
     try:
         with open(DATA_FILE, 'r') as f:
             d = json.load(f)
-            if d.get("closed_positions"):
+            if d.get("closed_positions") is not None:
                 return d
     except:
         pass
@@ -59,8 +60,23 @@ def parse_alert(message: str):
         elif "CAB v13 TP1 |" in message:
             ticker = message.split("CAB v13 TP1 | ")[1].split(" |")[0].strip()
             tp1    = float(message.split("TP1:")[1].split()[0])
-            stop   = float(message.split("YeniStop:")[1].strip())
-            return {"type":"TP1","ticker":ticker,"tp1":tp1,"stop":stop}
+            stop   = float(message.split("YeniStop:")[1].split()[0])
+            # Adaptif kapatma oranı — v13.13'te alert mesajında geliyor
+            kapat_oran = 60  # varsayılan
+            if "% kapat" in message:
+                try:
+                    kapat_oran = int(message.split("| %")[1].split(" kapat")[0].strip())
+                except:
+                    pass
+            # ATR skoru
+            atr_skor = 1.0
+            if "ATR:" in message:
+                try:
+                    atr_skor = float(message.split("ATR:")[1].strip())
+                except:
+                    pass
+            return {"type":"TP1","ticker":ticker,"tp1":tp1,"stop":stop,
+                    "kapat_oran":kapat_oran,"atr_skor":atr_skor}
         elif "CAB v13 TP2 |" in message:
             ticker = message.split("CAB v13 TP2 | ")[1].split(" |")[0].strip()
             return {"type":"TP2","ticker":ticker}
@@ -84,10 +100,12 @@ def get_symbol(ticker):
     return ticker + "USDT" if not ticker.endswith("USDT") else ticker
 
 def now_str():
-    return datetime.now(timezone.utc).strftime("%H:%M")
+    # UTC+3 (Türkiye saati)
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M")
 
 def today_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # UTC+3
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
 
 def calc_sure(zaman_acilis, zaman_kapanis):
     try:
@@ -121,6 +139,8 @@ def close_position(data, ticker, sonuc, kar):
             "sonuc":         sonuc,
             "kar":           round(kar, 1),
             "max_yukselis":  pos.get("max_yukselis", 0),
+            "kapat_oran":    pos.get("kapat_oran", 60),
+            "atr_skor":      pos.get("atr_skor", 1.0),
             "sure_dk":       sure_dk,
             "tarih":         today_str(),
             "zaman_acilis":  pos.get("zaman",""),
@@ -137,14 +157,13 @@ async def fetch_price(symbol):
         try:
             async with httpx.AsyncClient(timeout=4) as c:
                 r = await c.get(url)
+                if not r.ok: continue
                 d = r.json()
                 if "price" in d:
                     return float(d["price"])
         except:
             pass
     return None
-
-# HH artık tarayıcı üzerinden güncelleniyor (/update_hh endpoint)
 
 @app.get("/")
 def health():
@@ -167,27 +186,30 @@ async def dashboard():
     closed_positions = data["closed_positions"]
     mode_badge = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI"
 
-    # İstatistikler
     toplam_kar   = sum(p.get("kar",0) for p in closed_positions)
     kapanan_n    = len(closed_positions)
     karli_n      = sum(1 for p in closed_positions if p.get("kar",0) > 0)
-    stop_n       = sum(1 for p in closed_positions if "Stop" in p.get("sonuc","") and "BE" not in p.get("sonuc","") and "TP2" not in p.get("sonuc",""))
     win_rate     = round(karli_n / kapanan_n * 100, 1) if kapanan_n > 0 else 0
     sure_list    = [p.get("sure_dk",0) for p in closed_positions if p.get("sure_dk",0) > 0]
     ort_sure     = round(sum(sure_list)/len(sure_list)) if sure_list else 0
 
-    # Günlük özet
+    # Günlük istatistikler
     bugun        = today_str()
     bugun_pozlar = [p for p in closed_positions if p.get("tarih","") == bugun]
     bugun_kar    = sum(p.get("kar",0) for p in bugun_pozlar)
     bugun_giris  = len(bugun_pozlar)
     bugun_stop   = sum(1 for p in bugun_pozlar if "Stop" in p.get("sonuc","") and "BE" not in p.get("sonuc",""))
     bugun_tp     = sum(1 for p in bugun_pozlar if p.get("kar",0) > 0)
+    # Günlük win rate
+    bugun_karli  = sum(1 for p in bugun_pozlar if p.get("kar",0) > 0)
+    bugun_wr     = round(bugun_karli / len(bugun_pozlar) * 100, 1) if bugun_pozlar else 0
+    bugun_wr_renk = "#4ade80" if bugun_wr > 50 else "#f87171" if bugun_pozlar else "#94a3b8"
 
     net_renk = "#4ade80" if toplam_kar > 0 else "#f87171" if toplam_kar < 0 else "#94a3b8"
     net_str  = f"+{toplam_kar:.1f}$" if toplam_kar > 0 else f"{toplam_kar:.1f}$"
     bugun_renk = "#4ade80" if bugun_kar > 0 else "#f87171"
     bugun_str  = f"+{bugun_kar:.1f}$" if bugun_kar > 0 else f"{bugun_kar:.1f}$"
+    wr_renk = "#4ade80" if win_rate > 50 else "#94a3b8" if kapanan_n == 0 else "#f87171"
 
     # Açık pozisyonlar
     acik_rows = ""
@@ -199,14 +221,20 @@ async def dashboard():
         tp2     = pos["tp2"]
         lev     = pos.get("lev", 10)
         risk    = pos.get("risk", 0)
-        durum   = pos.get("durum", "Aktif")
         max_y   = pos.get("max_yukselis", 0)
+        atr_s   = pos.get("atr_skor", None)
+        kap_o   = pos.get("kapat_oran", None)
         pos_sz  = pos["marj"] * lev
-        tp1_kar = round(pos_sz * 0.60 * (tp1-giris)/giris, 1) if giris > 0 else 0
+        tp1_kar = round(pos_sz * (kap_o/100 if kap_o else 0.60) * (tp1-giris)/giris, 1) if giris > 0 else 0
         tp2_kar = round(pos_sz * 0.25 * (tp2-giris)/giris, 1) if giris > 0 else 0
-        tp1_pct = round((tp1-giris)/giris*100, 2) if giris > 0 else 0
         tv_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{ticker}.P"
         hh_str  = f'<span style="color:#f59e0b">%{max_y:.2f}</span>' if max_y > 0 else '<span style="color:#555">—</span>'
+        # ATR skoru göster
+        if atr_s is not None:
+            atr_renk = "#f87171" if atr_s >= 1.5 else "#f59e0b" if atr_s >= 1.0 else "#4ade80"
+            atr_str = f'<span style="color:{atr_renk}">{atr_s:.2f}x ({kap_o}%)</span>'
+        else:
+            atr_str = '<span style="color:#555">—</span>'
 
         acik_rows += f"""<tr>
             <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none"><b>{ticker}</b> 🔗</a></td>
@@ -216,6 +244,7 @@ async def dashboard():
             <td id="tp1dist-{symbol}" style="color:#94a3b8">—</td>
             <td id="status-{symbol}" style="color:#94a3b8">Yükleniyor...</td>
             <td>{hh_str}</td>
+            <td>{atr_str}</td>
             <td>{stop:.6f} <small style="color:#f87171">(-{risk:.1f}$)</small></td>
             <td style="color:#4ade80">{tp1:.6f} <small style="color:#4ade80">(+{tp1_kar:.1f}$)</small></td>
             <td style="color:#2dd4bf">{tp2:.6f} <small style="color:#2dd4bf">(+{tp2_kar:.1f}$)</small></td>
@@ -223,7 +252,7 @@ async def dashboard():
         </tr>"""
 
     if not acik_rows:
-        acik_rows = '<tr><td colspan="11" style="text-align:center;color:#555;padding:16px">Açık pozisyon yok</td></tr>'
+        acik_rows = '<tr><td colspan="12" style="text-align:center;color:#555;padding:16px">Açık pozisyon yok</td></tr>'
 
     # Kapanan pozisyonlar
     kapanan_rows = ""
@@ -234,24 +263,32 @@ async def dashboard():
         max_y    = pos.get("max_yukselis", 0)
         max_str  = f'%{max_y:.2f}' if max_y > 0 else "—"
         sure_dk  = pos.get("sure_dk", 0)
+        atr_s    = pos.get("atr_skor", None)
+        kap_o    = pos.get("kapat_oran", None)
         sonuc_renk = {"≈ TP1+Trail":"#fb923c","★ TP1+TP2+Trail":"#c084fc",
                       "~ TP1+BE Stop":"#60a5fa","✗ Stop":"#f87171","↓ TP2+Stop":"#f472b6"}.get(pos["sonuc"],"#94a3b8")
         tv_link  = f"https://www.tradingview.com/chart/?symbol=BINANCE:{pos['ticker']}.P"
         tarih    = pos.get("tarih","")
+        if atr_s is not None:
+            atr_renk = "#f87171" if atr_s >= 1.5 else "#f59e0b" if atr_s >= 1.0 else "#4ade80"
+            atr_str = f'<span style="color:{atr_renk}">{atr_s:.2f}x/{kap_o}%</span>'
+        else:
+            atr_str = "—"
 
         kapanan_rows += f"""<tr data-tarih="{tarih}" data-kar="{kar}" data-sonuc="{pos['sonuc']}">
-            <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none" target="_blank"><b>{pos['ticker']}</b> 🔗</a></td>
+            <td><a href="{tv_link}" target="_blank" style="color:#a78bfa;text-decoration:none"><b>{pos['ticker']}</b> 🔗</a></td>
             <td>{pos['marj']:.0f}$</td>
             <td>{pos['giris']:.6f}</td>
             <td style="color:{sonuc_renk};font-weight:bold">{pos['sonuc']}</td>
             <td style="color:{kar_renk};font-weight:bold">{kar_str}</td>
             <td style="color:#f59e0b">{max_str}</td>
+            <td style="color:#94a3b8">{atr_str}</td>
             <td style="color:#94a3b8">{sure_str(sure_dk)}</td>
             <td style="color:#94a3b8;font-size:10px">{tarih} {pos.get('zaman_acilis','')}→{pos.get('zaman_kapanis','')}</td>
         </tr>"""
 
     if not kapanan_rows:
-        kapanan_rows = '<tr><td colspan="8" style="text-align:center;color:#555;padding:16px">Henüz kapanan yok</td></tr>'
+        kapanan_rows = '<tr><td colspan="9" style="text-align:center;color:#555;padding:16px">Henüz kapanan yok</td></tr>'
 
     tarihler = sorted(set(p.get("tarih","") for p in closed_positions if p.get("tarih","")), reverse=True)
     tarih_options = '<option value="hepsi">Tüm Zamanlar</option><option value="bugun">Bugün</option>'
@@ -302,7 +339,8 @@ tr:hover {{ background:#111120; }}
   <div class="stat"><b>{len(open_positions)}</b><small>Açık</small></div>
   <div class="stat"><b>{kapanan_n}</b><small>Kapanan</small></div>
   <div class="stat"><b id="netkar" style="color:{net_renk}">{net_str}</b><small>Net Kar</small></div>
-  <div class="stat"><b style="color:{'#4ade80' if win_rate>=50 else '#f87171'}">{win_rate}%</b><small>Win Rate</small></div>
+  <div class="stat"><b style="color:{wr_renk}">{win_rate}%</b><small>Win Rate</small></div>
+  <div class="stat"><b style="color:{bugun_wr_renk}">{bugun_wr}%</b><small>Bugün WR</small></div>
   <div class="stat"><b>{sure_str(ort_sure)}</b><small>Ort. Süre</small></div>
   <div class="stat"><b>{"TEST" if TEST_MODE else "CANLI"}</b><small>Mod</small></div>
 </div>
@@ -312,7 +350,7 @@ tr:hover {{ background:#111120; }}
   {bugun_giris} kapanan &nbsp;|&nbsp;
   <span style="color:#4ade80">{bugun_tp} TP</span> &nbsp;|&nbsp;
   <span style="color:#f87171">{bugun_stop} Stop</span> &nbsp;|&nbsp;
-  <span style="color:{'#4ade80' if bugun_kar>=0 else '#f87171'}">{bugun_str}</span>
+  <span style="color:{bugun_renk}">{bugun_str}</span>
 </div>
 
 <h3>📊 Açık Pozisyonlar</h3>
@@ -325,10 +363,11 @@ tr:hover {{ background:#111120; }}
     <th onclick="sortT('acikTable',4)">TP1'e Kalan ↕</th>
     <th onclick="sortT('acikTable',5)">Durum ↕</th>
     <th onclick="sortT('acikTable',6)">HH% ↕</th>
-    <th onclick="sortT('acikTable',7)">Stop</th>
-    <th onclick="sortT('acikTable',8)">TP1</th>
-    <th onclick="sortT('acikTable',9)">TP2</th>
-    <th onclick="sortT('acikTable',10)">Zaman ↕</th>
+    <th onclick="sortT('acikTable',7)">ATR/Kapat ↕</th>
+    <th onclick="sortT('acikTable',8)">Stop</th>
+    <th onclick="sortT('acikTable',9)">TP1</th>
+    <th onclick="sortT('acikTable',10)">TP2</th>
+    <th onclick="sortT('acikTable',11)">Zaman ↕</th>
   </tr>
   {acik_rows}
 </table>
@@ -353,14 +392,14 @@ tr:hover {{ background:#111120; }}
     <th onclick="sortT('kapananTable',3)">Sonuç ↕</th>
     <th onclick="sortT('kapananTable',4)">Kar/Zarar ↕</th>
     <th onclick="sortT('kapananTable',5)">HH% ↕</th>
-    <th onclick="sortT('kapananTable',6)">Süre ↕</th>
-    <th onclick="sortT('kapananTable',7)">Zaman ↕</th>
+    <th onclick="sortT('kapananTable',6)">ATR/Kapat ↕</th>
+    <th onclick="sortT('kapananTable',7)">Süre ↕</th>
+    <th onclick="sortT('kapananTable',8)">Zaman ↕</th>
   </tr>
   {kapanan_rows}
 </table>
 
 <script>
-
 var symbols   = {symbols_json};
 var positions = {positions_json};
 var sortDirs  = {{}};
@@ -383,7 +422,7 @@ async function fp(sym) {{
 
 async function updatePrices() {{
   for (var i=0; i<symbols.length; i++) {{
-    var sym  = symbols[i];
+    var sym   = symbols[i];
     var price = await fp(sym);
     var pEl   = document.getElementById("price-"+sym);
     var sEl   = document.getElementById("status-"+sym);
@@ -417,8 +456,6 @@ async function updatePrices() {{
       sEl.textContent = "⚠ STOP " + pnlStr;
       sEl.style.color = "#f87171";
     }}
-    // HH güncelle
-    var hhTicker = sym.endsWith("USDT") ? sym.slice(0,-4) : sym;
     fetch("/update_hh", {{
       method: "POST",
       headers: {{"Content-Type": "application/json"}},
@@ -429,7 +466,6 @@ async function updatePrices() {{
   setTimeout(updatePrices, 15000);
 }}
 
-// Her 30 saniyede sayfayı yenile (yeni pozisyonlar için)
 setTimeout(function() {{ location.reload(); }}, 30000);
 
 function sortT(tid, col) {{
@@ -455,7 +491,7 @@ function filterT() {{
   var rows  = Array.from(document.getElementById("kapananTable").rows).slice(1);
   var vK=0, vZ=0, vN=0;
   rows.forEach(function(r) {{
-    if (!r.getAttribute("data-tarih")) return; // boş satırı atla
+    if (!r.getAttribute("data-tarih")) return;
     var rT = r.getAttribute("data-tarih")||"";
     var rK = parseFloat(r.getAttribute("data-kar")||"0");
     var rS = r.getAttribute("data-sonuc")||"";
@@ -504,7 +540,8 @@ async def webhook(request: Request):
             "marj":parsed["marj"],"lev":parsed["lev"],
             "risk":parsed["risk"],"zaman":now_str(),
             "tarih":today_str(),"durum":"Aktif",
-            "tp1_hit":False,"tp2_hit":False,"max_yukselis":0.0
+            "tp1_hit":False,"tp2_hit":False,"max_yukselis":0.0,
+            "kapat_oran":None,"atr_skor":None
         }
         save_data(data)
         symbol = get_symbol(ticker)
@@ -525,14 +562,18 @@ async def webhook(request: Request):
 
     elif parsed["type"] == "TP1":
         ticker = parsed["ticker"]
+        kapat_oran = parsed.get("kapat_oran", 60)
+        atr_skor   = parsed.get("atr_skor", 1.0)
         if ticker in data["open_positions"]:
-            data["open_positions"][ticker]["stop"]    = parsed["stop"]
-            data["open_positions"][ticker]["durum"]   = "✓ TP1 Alındı"
-            data["open_positions"][ticker]["tp1_hit"] = True
+            data["open_positions"][ticker]["stop"]      = parsed["stop"]
+            data["open_positions"][ticker]["durum"]     = "✓ TP1 Alındı"
+            data["open_positions"][ticker]["tp1_hit"]   = True
+            data["open_positions"][ticker]["kapat_oran"] = kapat_oran
+            data["open_positions"][ticker]["atr_skor"]  = atr_skor
         save_data(data)
         symbol = get_symbol(ticker)
         if TEST_MODE:
-            print(f"[TEST] TP1: {symbol} | BE:{parsed['stop']}")
+            print(f"[TEST] TP1: {symbol} | BE:{parsed['stop']} | Kapat:%{kapat_oran} | ATR:{atr_skor}x")
             return {"status":"TEST"}
         orders = client.get_orders(symbol=symbol)
         for o in orders:
@@ -556,13 +597,16 @@ async def webhook(request: Request):
         giris   = data["open_positions"].get(ticker,{}).get("giris",0)
         tp1     = data["open_positions"].get(ticker,{}).get("tp1",0)
         tp2     = data["open_positions"].get(ticker,{}).get("tp2",0)
+        kap_o   = data["open_positions"].get(ticker,{}).get("kapat_oran", 60)
         pos_sz  = marj * lev
+        kap_r   = (kap_o or 60) / 100
+        kalan_r = 1.0 - kap_r
         if tp2_hit:
             sonuc = "★ TP1+TP2+Trail"
-            kar = round(pos_sz*0.60*(tp1-giris)/giris + pos_sz*0.25*(tp2-giris)/giris, 1) if giris>0 else 0
+            kar = round(pos_sz*kap_r*(tp1-giris)/giris + pos_sz*0.25*(tp2-giris)/giris, 1) if giris>0 else 0
         else:
             sonuc = "≈ TP1+Trail"
-            kar = round(pos_sz*0.60*(tp1-giris)/giris, 1) if giris>0 else 0
+            kar = round(pos_sz*kap_r*(tp1-giris)/giris, 1) if giris>0 else 0
         close_position(data, ticker, sonuc, kar)
         save_data(data)
         symbol = get_symbol(ticker)
@@ -584,10 +628,12 @@ async def webhook(request: Request):
         lev       = data["open_positions"].get(ticker,{}).get("lev",10)
         giris     = data["open_positions"].get(ticker,{}).get("giris",0)
         tp1       = data["open_positions"].get(ticker,{}).get("tp1",0)
+        kap_o     = data["open_positions"].get(ticker,{}).get("kapat_oran", 60)
         pos_sz    = marj * lev
+        kap_r     = (kap_o or 60) / 100
         if stop_type == "BE":
             sonuc = "~ TP1+BE Stop"
-            kar   = round(pos_sz*0.60*(tp1-giris)/giris, 1) if giris>0 else 0
+            kar   = round(pos_sz*kap_r*(tp1-giris)/giris, 1) if giris>0 else 0
         elif stop_type == "TP2":
             sonuc = "↓ TP2+Stop"
             kar   = 0
@@ -611,14 +657,12 @@ async def webhook(request: Request):
 
 @app.post("/update_hh")
 async def update_hh(request: Request):
-    """Tarayıcıdan gelen fiyatla HH güncelle"""
     try:
         body = await request.body()
         req  = json.loads(body)
         data = load_data()
         ticker = req.get("ticker", "")
         price  = float(req.get("price", 0))
-        # XXXUSDT veya XXX formatını destekle
         if ticker not in data["open_positions"]:
             alt = ticker[:-4] if ticker.endswith("USDT") else ticker + "USDT"
             ticker = alt if alt in data["open_positions"] else None
