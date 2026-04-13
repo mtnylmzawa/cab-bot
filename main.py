@@ -78,16 +78,24 @@ def parse_alert(message: str):
                 except:
                     pass
             # ATR skoru
-            atr_skor = 1.0
+            atr_skor   = 1.0
+            trail_pct  = None
+            trail_stop = None
             if "ATR:" in message:
                 try:
                     raw = message.split("ATR:")[1].strip().split()[0]
                     val = float(raw)
                     atr_skor = round(val / 100, 2) if val > 10 else round(val, 2)
-                except:
-                    pass
+                except: pass
+            if "Trail:" in message:
+                try: trail_pct = float(message.split("Trail:")[1].split()[0])
+                except: pass
+            if "TrailStop:" in message:
+                try: trail_stop = float(message.split("TrailStop:")[1].split()[0])
+                except: pass
             return {"type":"TP1","ticker":ticker,"tp1":tp1,"stop":stop,
-                    "kapat_oran":kapat_oran,"atr_skor":atr_skor}
+                    "kapat_oran":kapat_oran,"atr_skor":atr_skor,
+                    "trail_pct":trail_pct,"trail_stop":trail_stop}
         elif "CAB v13 TP2 |" in message:
             ticker = message.split("CAB v13 TP2 | ")[1].split(" |")[0].strip()
             return {"type":"TP2","ticker":ticker}
@@ -247,8 +255,10 @@ async def dashboard():
         else:
             atr_str = '<span style="color:#555">—</span>'
 
-        trail_aktif = pos.get("trail_aktif", False)
-        tp1_kar_pos = pos.get("tp1_kar", 0)
+        trail_aktif  = pos.get("trail_aktif", False)
+        tp1_kar_pos  = pos.get("tp1_kar", 0)
+        trail_pct    = pos.get("trail_pct")
+        trail_stop_v = pos.get("trail_stop")
         row_bg = "background:#1a2a1a;" if trail_aktif else ""
         durum_str = pos.get("durum", "Aktif")
         acik_rows += f"""<tr style="{row_bg}">
@@ -260,7 +270,7 @@ async def dashboard():
             <td id="status-{symbol}" style="color:#94a3b8">Yükleniyor...</td>
             <td>{hh_str}</td>
             <td>{atr_str}</td>
-            <td id="trail-{symbol}" style="color:#fb923c">{'✓ Aktif (+' + str(tp1_kar_pos) + '$)' if trail_aktif else '—'}</td>
+            <td id="trail-{symbol}" style="color:#fb923c">{'✓ +' + str(tp1_kar_pos) + '$ | Stop:' + str(round(trail_stop_v,6) if trail_stop_v else '—') + ' | %' + str(trail_pct if trail_pct else '—') if trail_aktif else '—'}</td>
             <td>{stop:.6f} <small style="color:#f87171">(-{risk:.1f}$)</small></td>
             <td style="color:#4ade80">{tp1:.6f} <small style="color:#4ade80">(+{tp1_kar:.1f}$)</small></td>
             <td style="color:#2dd4bf">{tp2:.6f} <small style="color:#2dd4bf">(+{tp2_kar:.1f}$)</small></td>
@@ -593,13 +603,15 @@ async def webhook(request: Request):
             pos_sz     = marj * lev
             kap_r      = kapat_oran / 100
             tp1_kar    = round(pos_sz * kap_r * (tp1 - giris) / giris, 1) if giris > 0 else 0
-            data["open_positions"][ticker]["stop"]       = parsed["stop"]
-            data["open_positions"][ticker]["durum"]      = f"✓ TP1 (+{tp1_kar}$)"
-            data["open_positions"][ticker]["tp1_hit"]    = True
-            data["open_positions"][ticker]["kapat_oran"] = kapat_oran
-            data["open_positions"][ticker]["atr_skor"]   = atr_skor
-            data["open_positions"][ticker]["tp1_kar"]    = tp1_kar
+            data["open_positions"][ticker]["stop"]        = parsed["stop"]
+            data["open_positions"][ticker]["durum"]       = f"✓ TP1 (+{tp1_kar}$)"
+            data["open_positions"][ticker]["tp1_hit"]     = True
+            data["open_positions"][ticker]["kapat_oran"]  = kapat_oran
+            data["open_positions"][ticker]["atr_skor"]    = atr_skor
+            data["open_positions"][ticker]["tp1_kar"]     = tp1_kar
             data["open_positions"][ticker]["trail_aktif"] = True
+            data["open_positions"][ticker]["trail_pct"]   = parsed.get("trail_pct")
+            data["open_positions"][ticker]["trail_stop"]  = parsed.get("trail_stop")
         save_data(data)
         symbol = get_symbol(ticker)
         if TEST_MODE:
