@@ -19,7 +19,7 @@ client = UMFutures(
     base_url="https://fapi.binance.com"
 )
 
-INITIAL_DATA = {"open_positions": {}, "closed_positions": []}
+INITIAL_DATA = {"open_positions": {}, "closed_positions": [], "skipped_signals": []}
 
 # ============ VERİ YÖNETİMİ ============
 def load_data():
@@ -623,6 +623,13 @@ async def api_clear_old(req: Request):
     save_data(data)
     return {"removed": before - after, "remaining": after}
 
+@app.post("/api/clear_skipped")
+async def api_clear_skipped():
+    if "skipped_signals" in data:
+        data["skipped_signals"] = []
+        save_data(data)
+    return {"status": "ok"}
+
 # ============ WEBHOOK ============
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -639,7 +646,28 @@ async def webhook(req: Request):
         ticker = parsed["ticker"]
 
         if len(data["open_positions"]) >= MAX_POSITIONS:
-            print(f"[LIMIT] Max {MAX_POSITIONS} — {ticker} atlandı")
+            # Kaçırılan sinyali kaydet
+            if "skipped_signals" not in data:
+                data["skipped_signals"] = []
+            data["skipped_signals"].append({
+                "ticker": ticker,
+                "giris": parsed["giris"],
+                "stop": parsed["stop"],
+                "tp1": parsed["tp1"],
+                "tp2": parsed["tp2"],
+                "marj": parsed["marj"],
+                "lev": parsed["lev"],
+                "risk": parsed["risk"],
+                "kapat_oran": parsed["kapat_oran"],
+                "atr_skor": parsed["atr_skor"],
+                "zaman": now_tr(),
+                "sebep": f"Max {MAX_POSITIONS} poz dolu"
+            })
+            # Son 50 kaydı tut
+            if len(data["skipped_signals"]) > 50:
+                data["skipped_signals"] = data["skipped_signals"][-50:]
+            save_data(data)
+            print(f"[LIMIT] Max {MAX_POSITIONS} — {ticker} atlandı (kaydedildi)")
             return {"status": "limit"}
         if ticker in data["open_positions"]:
             print(f"[DUP] {ticker} zaten açık")
@@ -1039,6 +1067,22 @@ small{{color:#9ca3af}}
   </div>
 </div>
 
+<!-- KAÇIRILAN SİNYALLER -->
+<div class="section" id="skippedSection" style="display:none">
+  <div class="section-head">
+    <h2>⏭ Kaçırılan Sinyaller <small id="skippedCount"></small></h2>
+    <div class="toolbar">
+      <button class="btn btn-danger" onclick="clearSkipped()">🗑 Temizle</button>
+    </div>
+  </div>
+  <div style="overflow-x:auto;">
+    <table id="skippedTable"><thead><tr>
+      <th>Coin</th><th>Marjin</th><th>Giriş</th><th>Stop</th><th>TP1</th><th>TP2</th>
+      <th>R:R</th><th>ATR</th><th>Sebep</th><th>Zaman</th>
+    </tr></thead><tbody id="skippedBody"></tbody></table>
+  </div>
+</div>
+
 <!-- ANALIZ MODAL -->
 <div class="modal-overlay" id="analysisModal" onclick="if(event.target.id=='analysisModal')closeModal()">
   <div class="modal">
@@ -1051,10 +1095,10 @@ small{{color:#9ca3af}}
 
 <script>
 const MODE="{mod_text}",MC="{mod_color}";
-let openPositions={{}},closedPositions=[],openPrices={{}},lastOpenState={{}};
+let openPositions={{}},closedPositions=[],skippedSignals=[],openPrices={{}},lastOpenState={{}};
 let sortState={{open:{{col:null,dir:'asc'}},closed:{{col:'kapanis',dir:'desc'}}}};
 
-async function loadData(){{try{{const r=await fetch('/api/data');const d=await r.json();openPositions=d.open_positions||{{}};closedPositions=d.closed_positions||[];renderAll();detectChanges()}}catch(e){{console.error(e)}}}}
+async function loadData(){{try{{const r=await fetch('/api/data');const d=await r.json();openPositions=d.open_positions||{{}};closedPositions=d.closed_positions||[];skippedSignals=d.skipped_signals||[];renderAll();detectChanges()}}catch(e){{console.error(e)}}}}
 
 async function fp(sym){{try{{const r=await fetch('https://fapi.binance.com/fapi/v1/ticker/price?symbol='+sym);if(!r.ok)return null;return parseFloat((await r.json()).price)}}catch(e){{return null}}}}
 
@@ -1068,7 +1112,30 @@ function resultMatches(s,f){{if(f==='all')return true;if(f==='stop')return s==='
 function openTV(t){{window.open('https://www.tradingview.com/chart/?symbol=BINANCE:'+t+'.P','_blank')}}
 function toast(msg,err){{const t=document.getElementById('toast');t.textContent=msg;t.className='toast show'+(err?' err':'');setTimeout(()=>t.classList.remove('show'),2500)}}
 
-function renderAll(){{renderStats();renderOpen();renderClosed();checkWarnings()}}
+function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();checkWarnings()}}
+
+function renderSkipped(){{
+const sec=document.getElementById('skippedSection');
+if(!skippedSignals.length){{sec.style.display='none';return}}
+sec.style.display='block';
+document.getElementById('skippedCount').textContent=`(${{skippedSignals.length}})`;
+const body=document.getElementById('skippedBody');
+body.innerHTML=skippedSignals.slice().reverse().map(s=>{{
+const rr=s.stop>0?((s.tp1-s.giris)/(s.giris-s.stop)).toFixed(1):'—';
+return`<tr>
+<td><a href="javascript:void(0)" onclick="openTV('${{s.ticker}}')" style="color:#60a5fa;text-decoration:none">${{s.ticker}}</a></td>
+<td>${{s.marj}}$ (${{s.lev}}x)</td>
+<td>${{s.giris.toFixed(6)}}</td>
+<td>${{s.stop.toFixed(6)}}</td>
+<td>${{s.tp1.toFixed(6)}}</td>
+<td>${{s.tp2.toFixed(6)}}</td>
+<td>${{rr}}</td>
+<td>${{(s.atr_skor||1).toFixed(2)}}x</td>
+<td style="color:#f97316">${{s.sebep}}</td>
+<td>${{s.zaman.slice(5)}}</td>
+</tr>`}}).join('')}}
+
+async function clearSkipped(){{if(!confirm('Kaçırılan sinyal kayıtlarını temizlemek istiyor musun?'))return;try{{await fetch('/api/clear_skipped',{{method:'POST'}});skippedSignals=[];renderSkipped();toast('✓ Temizlendi')}}catch(e){{toast('Hata',true)}}}}
 
 function renderStats(){{
 const tk=closedPositions.reduce((s,c)=>s+c.kar,0),ts=closedPositions.length,ws=closedPositions.filter(c=>c.kar>0).length,wr=ts>0?(ws/ts*100).toFixed(1):0;
