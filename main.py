@@ -11,7 +11,7 @@ app = FastAPI()
 TEST_MODE = False  # 🟢 CANLI MOD
 MAX_POSITIONS = 5
 DATA_FILE = os.environ.get("DATA_FILE", "/tmp/cab_data.json")
-TIMEOUT_HOURS = 18  # pozisyon timeout süresi
+TIMEOUT_HOURS = 12  # pozisyon timeout süresi
 
 client = UMFutures(
     key=os.environ.get("BINANCE_API_KEY"),
@@ -1067,18 +1067,27 @@ small{{color:#9ca3af}}
   </div>
 </div>
 
-<!-- KAÇIRILAN SİNYALLER -->
+<!-- KAÇIRILAN SİNYALLER — Canlı Takip -->
 <div class="section" id="skippedSection" style="display:none">
   <div class="section-head">
     <h2>⏭ Kaçırılan Sinyaller <small id="skippedCount"></small></h2>
     <div class="toolbar">
+      <label>Durum:</label>
+      <select id="filterSkipped" onchange="renderSkipped()">
+        <option value="all">Hepsi</option>
+        <option value="tp">✓ TP Vurmuş</option>
+        <option value="stop">✗ Stop Olmuş</option>
+        <option value="active">⏳ Hala Aktif</option>
+      </select>
       <button class="btn btn-danger" onclick="clearSkipped()">🗑 Temizle</button>
     </div>
   </div>
+  <div class="ozet" id="skippedOzet"></div>
   <div style="overflow-x:auto;">
     <table id="skippedTable"><thead><tr>
-      <th>Coin</th><th>Marjin</th><th>Giriş</th><th>Stop</th><th>TP1</th><th>TP2</th>
-      <th>R:R</th><th>ATR</th><th>Sebep</th><th>Zaman</th>
+      <th>Coin</th><th>Marjin</th><th>Sinyal Fiyat</th><th>Şu An</th>
+      <th>Durum</th><th>TP1'e Kalan</th><th>Sanal Kar/Zarar</th>
+      <th>R:R</th><th>ATR</th><th>Zaman</th>
     </tr></thead><tbody id="skippedBody"></tbody></table>
   </div>
 </div>
@@ -1102,7 +1111,10 @@ async function loadData(){{try{{const r=await fetch('/api/data');const d=await r
 
 async function fp(sym){{try{{const r=await fetch('https://fapi.binance.com/fapi/v1/ticker/price?symbol='+sym);if(!r.ok)return null;return parseFloat((await r.json()).price)}}catch(e){{return null}}}}
 
-async function updatePrices(){{for(const sym of Object.keys(openPositions)){{const px=await fp(sym);if(px===null)continue;openPrices[sym]=px;try{{await fetch('/update_hh',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ticker:sym,price:px}})}})}}catch(e){{}}}}renderOpen();document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8);setTimeout(updatePrices,5000)}}
+let skippedUpdateCounter=0;
+async function updatePrices(){{for(const sym of Object.keys(openPositions)){{const px=await fp(sym);if(px===null)continue;openPrices[sym]=px;try{{await fetch('/update_hh',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ticker:sym,price:px}})}})}}catch(e){{}}}}renderOpen();
+skippedUpdateCounter++;if(skippedUpdateCounter%6===0)updateSkippedPrices();
+document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8);setTimeout(updatePrices,5000)}}
 
 function now_tr(){{return new Date().toISOString().replace('T',' ').slice(0,16)}}
 function sureDk(c){{try{{const a=new Date(c.acilis.replace(' ','T')+':00+03:00'),k=new Date(c.kapanis.replace(' ','T')+':00+03:00');return Math.round((k-a)/60000)}}catch(e){{return 0}}}}
@@ -1114,28 +1126,75 @@ function toast(msg,err){{const t=document.getElementById('toast');t.textContent=
 
 function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();checkWarnings()}}
 
+let skippedPrices={{}};
+async function updateSkippedPrices(){{
+for(const s of skippedSignals){{
+const px=await fp(s.ticker);
+if(px!==null)skippedPrices[s.ticker]=px}}
+renderSkipped()}}
+
 function renderSkipped(){{
 const sec=document.getElementById('skippedSection');
 if(!skippedSignals.length){{sec.style.display='none';return}}
 sec.style.display='block';
+const filter=document.getElementById('filterSkipped').value;
+
+let rows=skippedSignals.slice().reverse().map(s=>{{
+const px=skippedPrices[s.ticker]||null;
+const giris=s.giris,stop=s.stop,tp1=s.tp1,tp2=s.tp2;
+let status='active',statusTxt='⏳ Aktif',statusColor='#fbbf24';
+let sanalKar=0;
+const posSize=s.marj*s.lev;
+
+if(px){{
+if(px<=stop){{status='stop';statusTxt='✗ Stop Olmuş';statusColor='#f87171';sanalKar=posSize*((stop-giris)/giris)}}
+else if(px>=tp2){{status='tp2';statusTxt='★ TP2 Vurmuş!';statusColor='#14b8a6';sanalKar=posSize*0.5*((tp1-giris)/giris)+posSize*0.25*((tp2-giris)/giris)+posSize*0.25*((px-giris)/giris)}}
+else if(px>=tp1){{status='tp1';statusTxt='✓ TP1 Vurmuş';statusColor='#84cc16';sanalKar=posSize*0.5*((tp1-giris)/giris)+posSize*0.5*((px-giris)/giris)}}
+else{{sanalKar=posSize*((px-giris)/giris);if(sanalKar>0)statusTxt='📈 Kârda';else statusTxt='📉 Zararda'}}
+}}
+const rr=stop>0?((tp1-giris)/(giris-stop)).toFixed(1):'—';
+const tp1kalan=px?((tp1-px)/px*100):null;
+return{{...s,px,status,statusTxt,statusColor,sanalKar:Math.round(sanalKar*100)/100,rr,tp1kalan}}}});
+
+// Filtre
+if(filter==='tp')rows=rows.filter(r=>r.status==='tp1'||r.status==='tp2');
+else if(filter==='stop')rows=rows.filter(r=>r.status==='stop');
+else if(filter==='active')rows=rows.filter(r=>r.status==='active');
+
+// Özet
+const tpCount=rows.filter(r=>r.status==='tp1'||r.status==='tp2').length;
+const stopCount=rows.filter(r=>r.status==='stop').length;
+const activeCount=rows.filter(r=>r.status==='active').length;
+const missedKar=rows.filter(r=>r.status==='tp1'||r.status==='tp2').reduce((s,r)=>s+r.sanalKar,0);
+const dodgedZarar=rows.filter(r=>r.status==='stop').reduce((s,r)=>s+Math.abs(r.sanalKar),0);
+document.getElementById('skippedOzet').innerHTML=`✓ TP:${{tpCount}} <span style="color:#f87171">(<b>-${{missedKar.toFixed(0)}}$</b> kaçırılan kar)</span> | ✗ Stop:${{stopCount}} <span style="color:#4ade80">(+${{dodgedZarar.toFixed(0)}}$ korunulan zarar)</span> | ⏳ Aktif:${{activeCount}}`;
 document.getElementById('skippedCount').textContent=`(${{skippedSignals.length}})`;
+
 const body=document.getElementById('skippedBody');
-body.innerHTML=skippedSignals.slice().reverse().map(s=>{{
-const rr=s.stop>0?((s.tp1-s.giris)/(s.giris-s.stop)).toFixed(1):'—';
-return`<tr>
-<td><a href="javascript:void(0)" onclick="openTV('${{s.ticker}}')" style="color:#60a5fa;text-decoration:none">${{s.ticker}}</a></td>
+if(!rows.length){{body.innerHTML='<tr><td colspan="10" style="text-align:center;color:#9ca3af">Filtre sonucu boş</td></tr>';return}}
+body.innerHTML=rows.map(s=>{{
+const pxStr=s.px?s.px.toFixed(6):'—';
+const pxColor=s.status==='tp2'?'#14b8a6':s.status==='tp1'?'#84cc16':s.status==='stop'?'#f87171':'#e5e7eb';
+const tp1Str=s.tp1kalan!=null?(s.tp1kalan<=0?'<span style="color:#4ade80">✓ Geçti</span>':`%${{s.tp1kalan.toFixed(2)}} uzak`):'—';
+const karStr=s.sanalKar!==0?`<span style="color:${{s.sanalKar>0?'#4ade80':'#f87171'}}">${{s.sanalKar>=0?'+':''}}${{s.sanalKar.toFixed(1)}}$</span>`:'—';
+let rowBg='';
+if(s.status==='tp2')rowBg='background:rgba(20,184,166,0.12);border-left:3px solid #14b8a6;';
+else if(s.status==='tp1')rowBg='background:rgba(132,204,22,0.08);border-left:3px solid #84cc16;';
+else if(s.status==='stop')rowBg='background:rgba(239,68,68,0.08);border-left:3px solid #f87171;';
+return`<tr style="${{rowBg}}">
+<td><a href="javascript:void(0)" onclick="openTV('${{s.ticker}}')" style="color:#60a5fa;text-decoration:none">${{s.ticker}}</a> 🔗</td>
 <td>${{s.marj}}$ (${{s.lev}}x)</td>
 <td>${{s.giris.toFixed(6)}}</td>
-<td>${{s.stop.toFixed(6)}}</td>
-<td>${{s.tp1.toFixed(6)}}</td>
-<td>${{s.tp2.toFixed(6)}}</td>
-<td>${{rr}}</td>
+<td style="color:${{pxColor}}">${{pxStr}}</td>
+<td style="color:${{s.statusColor}};font-weight:bold">${{s.statusTxt}}</td>
+<td>${{tp1Str}}</td>
+<td>${{karStr}}</td>
+<td>${{s.rr}}</td>
 <td>${{(s.atr_skor||1).toFixed(2)}}x</td>
-<td style="color:#f97316">${{s.sebep}}</td>
 <td>${{s.zaman.slice(5)}}</td>
 </tr>`}}).join('')}}
 
-async function clearSkipped(){{if(!confirm('Kaçırılan sinyal kayıtlarını temizlemek istiyor musun?'))return;try{{await fetch('/api/clear_skipped',{{method:'POST'}});skippedSignals=[];renderSkipped();toast('✓ Temizlendi')}}catch(e){{toast('Hata',true)}}}}
+async function clearSkipped(){{if(!confirm('Kaçırılan sinyal kayıtlarını temizlemek istiyor musun?'))return;try{{await fetch('/api/clear_skipped',{{method:'POST'}});skippedSignals=[];skippedPrices={{}};renderSkipped();toast('✓ Temizlendi')}}catch(e){{toast('Hata',true)}}}}
 
 function renderStats(){{
 const tk=closedPositions.reduce((s,c)=>s+c.kar,0),ts=closedPositions.length,ws=closedPositions.filter(c=>c.kar>0).length,wr=ts>0?(ws/ts*100).toFixed(1):0;
@@ -1248,7 +1307,7 @@ function updateSortArrows(w){{const tid=w==='open'?'openTable':'closedTable',s=s
 
 function exportCSV(type){{let rows,fn;if(type==='open'){{rows=Object.entries(openPositions).map(([t,p])=>({{Coin:t,Marjin:p.marj,Lev:p.lev,Giris:p.giris,Stop:p.stop,TP1:p.tp1,TP2:p.tp2,HH:p.hh_pct||0,ATR:p.atr_skor||1.0,Kapat:p.kapat_oran||60,Durum:p.durum||'',Zaman:p.zaman_full||''}}));fn='acik_'+now_tr().slice(0,10)+'.csv'}}else{{rows=closedPositions.map(c=>({{Coin:c.ticker,Marjin:c.marj,Lev:c.lev||10,Giris:c.giris,Sonuc:c.sonuc,Kar:c.kar,HH:c.hh_pct||0,Acilis:c.acilis,Kapanis:c.kapanis}}));fn='kapanan_'+now_tr().slice(0,10)+'.csv'}}if(!rows.length){{toast('Veri yok',true);return}}const h=Object.keys(rows[0]),csv=[h.join(','),...rows.map(r=>h.map(k=>r[k]).join(','))].join('\\n');const b=new Blob(['\\ufeff'+csv],{{type:'text/csv'}});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=fn;a.click();toast('✓ '+fn)}}
 
-async function init(){{setupSort();await loadData();lastOpenState=JSON.parse(JSON.stringify(openPositions));if(Object.keys(openPositions).length>0)updatePrices();else setInterval(async()=>{{await loadData();document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8)}},10000);setTimeout(()=>location.reload(),20000)}}
+async function init(){{setupSort();await loadData();lastOpenState=JSON.parse(JSON.stringify(openPositions));if(Object.keys(openPositions).length>0){{updatePrices()}}else{{if(skippedSignals.length>0)updateSkippedPrices();setInterval(async()=>{{await loadData();if(skippedSignals.length>0)updateSkippedPrices();document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8)}},10000)}}setTimeout(()=>location.reload(),20000)}}
 init();
 </script>
 </body></html>"""
