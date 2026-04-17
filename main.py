@@ -273,6 +273,23 @@ def execute_entry(ticker, parsed):
     actual_qty = result["filled_qty"]
     actual_price = result["avg_price"]
 
+    # 3b. Gerçek giriş fiyatını Binance pozisyon bilgisinden al
+    if actual_price == 0 or actual_price < 0.0000001:
+        try:
+            positions = client.get_position_risk(symbol=symbol)
+            for p in positions:
+                if p["symbol"] == symbol and float(p.get("positionAmt", 0)) != 0:
+                    actual_price = float(p.get("entryPrice", 0))
+                    print(f"[TRADE] {symbol} entryPrice from position: {actual_price}")
+                    break
+        except Exception as e:
+            print(f"[TRADE WARN] entryPrice fetch failed: {e}")
+    
+    # 3c. Hala 0 ise Pine fiyatını kullan (son çare)
+    if actual_price == 0 or actual_price < 0.0000001:
+        actual_price = giris_px
+        print(f"[TRADE WARN] {symbol} avgPrice=0, Pine fiyatı kullanıldı: {actual_price}")
+
     # 4. Stop loss koy
     sl_result = binance_stop_loss(symbol, actual_qty, stop_px, info)
     sl_order_id = sl_result.get("order_id") if sl_result["success"] else None
@@ -575,21 +592,21 @@ async def fix_giris(req: Request):
 
 @app.get("/api/fix_zero_giris")
 async def fix_zero_giris():
-    """Giriş fiyatı 0 olan tüm pozisyonları Binance'ten düzelt"""
+    """Tüm açık pozisyonların giriş fiyatını Binance'ten güncelle"""
     fixed = []
     for ticker, pos in data["open_positions"].items():
-        if pos["giris"] == 0 or pos["giris"] < 0.0000001:
-            try:
-                positions = client.get_position_risk(symbol=ticker)
-                for p in positions:
-                    if p["symbol"] == ticker and float(p.get("positionAmt", 0)) != 0:
-                        entry_price = float(p.get("entryPrice", 0))
-                        if entry_price > 0:
-                            pos["giris"] = entry_price
-                            fixed.append({"ticker": ticker, "giris": entry_price})
-                            print(f"[FIX] {ticker} giris: 0 → {entry_price}")
-            except Exception as e:
-                print(f"[FIX ERR] {ticker}: {e}")
+        try:
+            positions = client.get_position_risk(symbol=ticker)
+            for p in positions:
+                if p["symbol"] == ticker and float(p.get("positionAmt", 0)) != 0:
+                    entry_price = float(p.get("entryPrice", 0))
+                    if entry_price > 0 and entry_price != pos["giris"]:
+                        old = pos["giris"]
+                        pos["giris"] = entry_price
+                        fixed.append({"ticker": ticker, "old": old, "new": entry_price})
+                        print(f"[FIX] {ticker} giris: {old} → {entry_price}")
+        except Exception as e:
+            print(f"[FIX ERR] {ticker}: {e}")
     if fixed:
         save_data(data)
     return {"fixed": fixed, "count": len(fixed)}
