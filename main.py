@@ -645,7 +645,12 @@ async def webhook(req: Request):
         print(f"[PARSE] {parsed}")
         ticker = parsed["ticker"]
 
-        if len(data["open_positions"]) >= MAX_POSITIONS:
+        # Sadece TP1 vurmamış (aktif risk taşıyan) pozisyonları say
+        # TP1 vurmuş olanlar BE stopta - risksiz, slot saymazlar
+        aktif_risk = sum(1 for p in data["open_positions"].values() if not p.get("tp1_hit"))
+        garantili = len(data["open_positions"]) - aktif_risk
+
+        if aktif_risk >= MAX_POSITIONS:
             # Kaçırılan sinyali kaydet
             if "skipped_signals" not in data:
                 data["skipped_signals"] = []
@@ -661,13 +666,13 @@ async def webhook(req: Request):
                 "kapat_oran": parsed["kapat_oran"],
                 "atr_skor": parsed["atr_skor"],
                 "zaman": now_tr(),
-                "sebep": f"Max {MAX_POSITIONS} poz dolu"
+                "sebep": f"Max {MAX_POSITIONS} aktif risk dolu (+{garantili} garantili)"
             })
             # Son 50 kaydı tut
             if len(data["skipped_signals"]) > 50:
                 data["skipped_signals"] = data["skipped_signals"][-50:]
             save_data(data)
-            print(f"[LIMIT] Max {MAX_POSITIONS} — {ticker} atlandı (kaydedildi)")
+            print(f"[LIMIT] Aktif risk {aktif_risk}/{MAX_POSITIONS} (+{garantili} TP1'li) — {ticker} atlandı (kaydedildi)")
             return {"status": "limit"}
         if ticker in data["open_positions"]:
             print(f"[DUP] {ticker} zaten açık")
@@ -1113,7 +1118,9 @@ async function fp(sym){{try{{const r=await fetch('https://fapi.binance.com/fapi/
 
 let skippedUpdateCounter=0;
 async function updatePrices(){{for(const sym of Object.keys(openPositions)){{const px=await fp(sym);if(px===null)continue;openPrices[sym]=px;try{{await fetch('/update_hh',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ticker:sym,price:px}})}})}}catch(e){{}}}}renderOpen();
-skippedUpdateCounter++;if(skippedUpdateCounter%6===0)updateSkippedPrices();
+// İlk çalışmada hemen, sonra her 6 döngü (30sn) bir güncelle
+if(skippedUpdateCounter===0||skippedUpdateCounter%6===0){{if(skippedSignals.length>0)updateSkippedPrices()}}
+skippedUpdateCounter++;
 document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8);setTimeout(updatePrices,5000)}}
 
 function now_tr(){{return new Date().toISOString().replace('T',' ').slice(0,16)}}
@@ -1128,9 +1135,9 @@ function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();
 
 let skippedPrices={{}};
 async function updateSkippedPrices(){{
-for(const s of skippedSignals){{
-const px=await fp(s.ticker);
-if(px!==null)skippedPrices[s.ticker]=px}}
+// Paralel fetch - tüm semboller aynı anda çekilir
+const promises=skippedSignals.map(async s=>{{const px=await fp(s.ticker);if(px!==null)skippedPrices[s.ticker]=px;return{{sym:s.ticker,px}}}});
+try{{await Promise.all(promises)}}catch(e){{console.error('[skipped fetch err]',e)}}
 renderSkipped()}}
 
 function renderSkipped(){{
@@ -1201,8 +1208,11 @@ const tk=closedPositions.reduce((s,c)=>s+c.kar,0),ts=closedPositions.length,ws=c
 const today=now_tr().slice(0,10),bg=closedPositions.filter(c=>c.kapanis.startsWith(today)),bk=bg.reduce((s,c)=>s+c.kar,0),bt=bg.filter(c=>c.kar>0).length,bs=bg.filter(c=>c.kar<=0).length,bw=bg.length>0?(bt/bg.length*100).toFixed(1):0;
 const su=closedPositions.map(sureDk),os=su.length>0?su.reduce((a,b)=>a+b,0)/su.length:0,oss=os===0?'—':sureFmt(Math.round(os));
 const nr=tk>0?'#4ade80':(tk<0?'#f87171':'#e5e7eb'),wrr=wr>=50?'#4ade80':(ts>0?'#f87171':'#e5e7eb'),bkr=bk>0?'#4ade80':(bk<0?'#f87171':'#e5e7eb'),bwr=bw>=50?'#4ade80':(bg.length>0?'#f87171':'#e5e7eb');
+const aktifRisk=Object.values(openPositions).filter(p=>!p.tp1_hit).length;
+const garantili=Object.keys(openPositions).length-aktifRisk;
+const openLbl=garantili>0?`${{aktifRisk}}+${{garantili}}★`:`${{aktifRisk}}`;
 document.getElementById('statsBar').innerHTML=
-`<div class="stat"><div class="stat-val">${{Object.keys(openPositions).length}}</div><div class="stat-lbl">Açık</div></div>`+
+`<div class="stat"><div class="stat-val">${{openLbl}}</div><div class="stat-lbl">${{garantili>0?'Aktif+TP1':'Açık'}}</div></div>`+
 `<div class="stat"><div class="stat-val">${{ts}}</div><div class="stat-lbl">Kapanan</div></div>`+
 `<div class="stat"><div class="stat-val" style="color:${{nr}}">${{tk>=0?'+':''}}${{tk.toFixed(1)}}$</div><div class="stat-lbl">Net Kar</div></div>`+
 `<div class="stat"><div class="stat-val" style="color:${{wrr}}">${{wr}}%</div><div class="stat-lbl">Win Rate</div></div>`+
@@ -1307,7 +1317,10 @@ function updateSortArrows(w){{const tid=w==='open'?'openTable':'closedTable',s=s
 
 function exportCSV(type){{let rows,fn;if(type==='open'){{rows=Object.entries(openPositions).map(([t,p])=>({{Coin:t,Marjin:p.marj,Lev:p.lev,Giris:p.giris,Stop:p.stop,TP1:p.tp1,TP2:p.tp2,HH:p.hh_pct||0,ATR:p.atr_skor||1.0,Kapat:p.kapat_oran||60,Durum:p.durum||'',Zaman:p.zaman_full||''}}));fn='acik_'+now_tr().slice(0,10)+'.csv'}}else{{rows=closedPositions.map(c=>({{Coin:c.ticker,Marjin:c.marj,Lev:c.lev||10,Giris:c.giris,Sonuc:c.sonuc,Kar:c.kar,HH:c.hh_pct||0,Acilis:c.acilis,Kapanis:c.kapanis}}));fn='kapanan_'+now_tr().slice(0,10)+'.csv'}}if(!rows.length){{toast('Veri yok',true);return}}const h=Object.keys(rows[0]),csv=[h.join(','),...rows.map(r=>h.map(k=>r[k]).join(','))].join('\\n');const b=new Blob(['\\ufeff'+csv],{{type:'text/csv'}});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=fn;a.click();toast('✓ '+fn)}}
 
-async function init(){{setupSort();await loadData();lastOpenState=JSON.parse(JSON.stringify(openPositions));if(Object.keys(openPositions).length>0){{updatePrices()}}else{{if(skippedSignals.length>0)updateSkippedPrices();setInterval(async()=>{{await loadData();if(skippedSignals.length>0)updateSkippedPrices();document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8)}},10000)}}setTimeout(()=>location.reload(),20000)}}
+async function init(){{setupSort();await loadData();lastOpenState=JSON.parse(JSON.stringify(openPositions));
+// updatePrices her zaman çalışsın — hem açık poz hem kaçırılan sinyaller için
+if(Object.keys(openPositions).length>0||skippedSignals.length>0){{updatePrices()}}else{{setInterval(async()=>{{await loadData();document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8)}},10000)}}
+setTimeout(()=>location.reload(),20000)}}
 init();
 </script>
 </body></html>"""
