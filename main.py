@@ -125,9 +125,19 @@ def binance_market_buy(symbol, qty):
         result = client.new_order(
             symbol=symbol, side="BUY", type="MARKET", quantity=qty
         )
-        avg_price = float(result.get("avgPrice", 0))
         filled_qty = float(result.get("executedQty", 0))
-        print(f"[BINANCE] MARKET BUY {symbol} qty:{filled_qty} avgPx:{avg_price} ✓")
+        # avgPrice genelde 0 döner, cumQuote/executedQty ile hesapla
+        avg_price = float(result.get("avgPrice", 0))
+        if avg_price == 0 and filled_qty > 0:
+            cum_quote = float(result.get("cumQuote", result.get("cumQty", 0)))
+            if cum_quote > 0:
+                avg_price = cum_quote / filled_qty
+        # Hala 0 ise fills array'inden al
+        if avg_price == 0 and result.get("fills"):
+            prices = [float(f["price"]) for f in result["fills"] if float(f.get("qty", 0)) > 0]
+            if prices:
+                avg_price = sum(prices) / len(prices)
+        print(f"[BINANCE] MARKET BUY {symbol} qty:{filled_qty} avgPx:{avg_price} ✓ (raw:{json.dumps(result)[:200]})")
         return {"success": True, "avg_price": avg_price, "filled_qty": filled_qty, "order": result}
     except ClientError as e:
         print(f"[BINANCE ERR] Market buy {symbol}: {e}")
@@ -139,8 +149,16 @@ def binance_market_sell(symbol, qty):
         result = client.new_order(
             symbol=symbol, side="SELL", type="MARKET", quantity=qty, reduceOnly="true"
         )
-        avg_price = float(result.get("avgPrice", 0))
         filled_qty = float(result.get("executedQty", 0))
+        avg_price = float(result.get("avgPrice", 0))
+        if avg_price == 0 and filled_qty > 0:
+            cum_quote = float(result.get("cumQuote", result.get("cumQty", 0)))
+            if cum_quote > 0:
+                avg_price = cum_quote / filled_qty
+        if avg_price == 0 and result.get("fills"):
+            prices = [float(f["price"]) for f in result["fills"] if float(f.get("qty", 0)) > 0]
+            if prices:
+                avg_price = sum(prices) / len(prices)
         print(f"[BINANCE] MARKET SELL {symbol} qty:{filled_qty} avgPx:{avg_price} ✓")
         return {"success": True, "avg_price": avg_price, "filled_qty": filled_qty}
     except ClientError as e:
@@ -543,6 +561,39 @@ async def update_hh(req: Request):
 async def api_data():
     return JSONResponse(load_data())
 
+@app.post("/api/fix_giris")
+async def fix_giris(req: Request):
+    """Giriş fiyatı 0 olan pozisyonları düzelt"""
+    body = await req.json()
+    ticker = body.get("ticker")
+    new_giris = body.get("giris")
+    if ticker and new_giris and ticker in data["open_positions"]:
+        data["open_positions"][ticker]["giris"] = float(new_giris)
+        save_data(data)
+        return {"status": "fixed", "ticker": ticker, "giris": new_giris}
+    return {"status": "not_found"}
+
+@app.get("/api/fix_zero_giris")
+async def fix_zero_giris():
+    """Giriş fiyatı 0 olan tüm pozisyonları Binance'ten düzelt"""
+    fixed = []
+    for ticker, pos in data["open_positions"].items():
+        if pos["giris"] == 0 or pos["giris"] < 0.0000001:
+            try:
+                positions = client.get_position_risk(symbol=ticker)
+                for p in positions:
+                    if p["symbol"] == ticker and float(p.get("positionAmt", 0)) != 0:
+                        entry_price = float(p.get("entryPrice", 0))
+                        if entry_price > 0:
+                            pos["giris"] = entry_price
+                            fixed.append({"ticker": ticker, "giris": entry_price})
+                            print(f"[FIX] {ticker} giris: 0 → {entry_price}")
+            except Exception as e:
+                print(f"[FIX ERR] {ticker}: {e}")
+    if fixed:
+        save_data(data)
+    return {"fixed": fixed, "count": len(fixed)}
+
 @app.post("/api/clear_old")
 async def api_clear_old(req: Request):
     body = await req.json()
@@ -586,7 +637,7 @@ async def webhook(req: Request):
                 return {"status": "trade_failed"}
 
         data["open_positions"][ticker] = {
-            "giris": trade_result["avg_price"] if trade_result else parsed["giris"],
+            "giris": trade_result["avg_price"] if (trade_result and trade_result["avg_price"] > 0) else parsed["giris"],
             "stop": parsed["stop"],
             "tp1": parsed["tp1"], "tp2": parsed["tp2"],
             "marj": parsed["marj"], "lev": parsed["lev"],
