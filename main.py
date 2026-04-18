@@ -11,7 +11,9 @@ app = FastAPI()
 TEST_MODE = False  # 🟢 CANLI MOD
 MAX_POSITIONS = 7  # v6.1: 5 → 7 (akıllı slot ile pratikte daha fazla açık olabilir)
 DATA_FILE = os.environ.get("DATA_FILE", "/tmp/cab_data.json")
-TIMEOUT_HOURS = 12  # pozisyon timeout süresi
+TIMEOUT_HOURS = 12  # pozisyon timeout süresi (asgari)
+TIMEOUT_ABSOLUTE_HOURS = 24  # v6.4: mutlak limit — slot baskısı olmasa bile zorla kapat
+TIMEOUT_PRESSURE_THRESHOLD = 5  # v6.4: aktif_risk bu eşikten azsa timeout pas geç (slot bol)
 TIMEOUT_CHECK_INTERVAL_SEC = 300  # her 5 dakika
 
 client = UMFutures(
@@ -73,6 +75,7 @@ def count_active_risk():
 
 # ============ BINANCE HELPERS ============
 lot_cache = {}
+invalid_symbols_cache = set()  # v6.4: Geçersiz sembolleri cache'le (USDTTRY gibi futures'ta olmayan)
 
 def get_symbol_info(symbol):
     """Sembol için lot step ve price precision al, cache'le"""
@@ -219,36 +222,53 @@ def binance_get_position_qty(symbol):
     return 0
 
 def binance_close_position(symbol):
-    """v6.2: closePosition=true kullanarak lot rounding kalıntısı bırakmadan TAM kapatma"""
+    """v6.4: Pozisyonu tamamen kapat. closePosition=true MARKET emirde çalışmıyor (-4136),
+    bu yüzden gerçek positionAmt'i alıp DOĞRU precision ile market sell yapıyoruz.
+    Lot kalıntısı bırakmamak için 2 sell denemesi:
+      1. Tam qty market sell
+      2. Eğer kalıntı varsa ikinci tur sell
+    """
     qty = binance_get_position_qty(symbol)
     if qty <= 0:
         return {"success": True, "msg": "no position"}
 
+    info = get_symbol_info(symbol)
     binance_cancel_all(symbol)
 
-    try:
-        # closePosition=true → quantity yoksayılır, Binance pozisyonun TAMAMINI kapatır
-        # Lot rounding kalıntısı bırakmaz, "Partially Closed" anomalisi olmaz
-        result = client.new_order(
-            symbol=symbol, side="SELL", type="MARKET",
-            closePosition="true"
-        )
-        filled_qty = float(result.get("executedQty", 0))
-        avg_price = float(result.get("avgPrice", 0))
-        if avg_price == 0 and filled_qty > 0:
-            cum_quote = float(result.get("cumQuote", result.get("cumQty", 0)))
-            if cum_quote > 0:
-                avg_price = cum_quote / filled_qty
-        print(f"[BINANCE] CLOSE_POSITION {symbol} qty:{filled_qty} avgPx:{avg_price} ✓ (full close, no remainder)")
-        return {"success": True, "avg_price": avg_price, "filled_qty": filled_qty}
-    except ClientError as e:
-        # Fallback: closePosition başarısız olursa eski yöntemle dene
-        print(f"[BINANCE WARN] closePosition fail {symbol}: {e}, fallback market sell")
-        info = get_symbol_info(symbol)
-        qty = round_qty(qty, info)
-        if qty > 0:
-            return binance_market_sell(symbol, qty)
-        return {"success": False, "error": str(e)}
+    # 1. Tur: tam miktarı sat (precision'a yuvarla)
+    qty_rounded = round_qty(qty, info)
+    if qty_rounded <= 0:
+        print(f"[BINANCE WARN] {symbol} qty {qty} → rounded 0, kapatma başarısız")
+        return {"success": False, "error": "qty rounded to 0"}
+
+    result = binance_market_sell(symbol, qty_rounded)
+    if not result["success"]:
+        return result
+
+    # 2. Tur kontrol: kalıntı kaldı mı?
+    time.sleep(0.5)  # Binance'in pozisyonu güncellemesi için kısa bekleme
+    remaining = binance_get_position_qty(symbol)
+    if remaining > 0:
+        # Kalıntı için ikinci tur — hassas precision ile dene
+        precision = info["qty_precision"]
+        # Lot step'in altındaki kalıntıyı yakalamak için bir alt precision dene
+        remaining_str = f"{remaining:.{precision + 2}f}".rstrip('0').rstrip('.')
+        try:
+            remaining_qty = float(remaining_str)
+            # Yine round_qty ile dene
+            remaining_rounded = round_qty(remaining_qty, info)
+            if remaining_rounded > 0:
+                print(f"[BINANCE] {symbol} kalıntı {remaining} → 2. tur sell {remaining_rounded}")
+                result2 = binance_market_sell(symbol, remaining_rounded)
+                if result2["success"]:
+                    print(f"[BINANCE] {symbol} 2. tur sell başarılı, pozisyon temiz ✓")
+            else:
+                # Kalıntı lot step'in altında — toz miktar, görmezden gel
+                print(f"[BINANCE] {symbol} ihmal edilebilir kalıntı: {remaining} (lot step altı)")
+        except Exception as e:
+            print(f"[BINANCE WARN] {symbol} kalıntı temizleme hatası: {e}")
+
+    return result
 
 def binance_get_mark_price(symbol):
     """v6.1: Sembol için mark price çek (timeout kontrolü için)"""
@@ -260,19 +280,27 @@ def binance_get_mark_price(symbol):
         return None
 
 def binance_get_klines(symbol, interval="1m", limit=60):
-    """v6.3: Geçmiş bar verilerini çek (high/low takibi için)
+    """v6.4: Geçmiş bar verilerini çek (high/low takibi için)
     Public endpoint, auth gerekmez.
     Dönen: [[time, open, high, low, close, volume, ...], ...]
+    v6.4: Geçersiz semboller cache'lenir, tekrar denenmez (USDTTRY gibi)
     """
+    if symbol in invalid_symbols_cache:
+        return None
     try:
         klines = client.klines(symbol=symbol, interval=interval, limit=limit)
         return klines
     except Exception as e:
-        print(f"[KLINES ERR] {symbol} {interval}: {e}")
+        err_str = str(e)
+        if "Invalid symbol" in err_str or "-1121" in err_str:
+            invalid_symbols_cache.add(symbol)
+            print(f"[KLINES] {symbol} geçersiz sembol — cache'lendi, tekrar denenmeyecek")
+        else:
+            print(f"[KLINES ERR] {symbol} {interval}: {e}")
         return None
 
 def get_high_low_since(symbol, since_ms, interval="1m"):
-    """v6.3: Belirli bir zamandan beri görülen MAX high ve MIN low'u döndür.
+    """v6.4: Belirli bir zamandan beri görülen MAX high ve MIN low'u döndür.
     since_ms: milisaniye cinsinden timestamp
     """
     # Şu anki zamandan since_ms'e olan farkı dakikaya çevir
@@ -613,7 +641,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.3 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.4 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -1048,7 +1076,23 @@ async def timeout_scan_once():
             if age_hours < TIMEOUT_HOURS:
                 continue
 
-            print(f"[TIMEOUT] {ticker} {age_hours:.1f}s açık (limit:{TIMEOUT_HOURS}s) — akıllı kapama")
+            # v6.4: KOŞULLU TIMEOUT — slot baskısına göre karar ver
+            # MUTLAK LİMİT (24s+) → ne olursa olsun timeout
+            # 12s ≤ yaş < 24s arası → slot baskısı varsa timeout, yoksa skip
+            aktif_risk, gar_tp1, gar_to = count_active_risk()
+            slot_doluluk_pct = (aktif_risk / MAX_POSITIONS) * 100
+
+            if age_hours < TIMEOUT_ABSOLUTE_HOURS:
+                # Henüz mutlak limite gelmedi → slot baskısına bak
+                if aktif_risk < TIMEOUT_PRESSURE_THRESHOLD:
+                    # Slot baskısı yok → pozisyona şans tanı, timeout YAPMA
+                    if scanned == 1:  # İlk kontrol için log yaz, spam etmeyelim
+                        print(f"[TIMEOUT-SKIP] {ticker} {age_hours:.1f}s açık ama aktif_risk:{aktif_risk}/{MAX_POSITIONS} (eşik:{TIMEOUT_PRESSURE_THRESHOLD}) — bekle")
+                    continue
+                else:
+                    print(f"[TIMEOUT] {ticker} {age_hours:.1f}s açık | aktif_risk:{aktif_risk}/{MAX_POSITIONS} (eşik:{TIMEOUT_PRESSURE_THRESHOLD}) — slot baskısı, akıllı kapama")
+            else:
+                print(f"[TIMEOUT] {ticker} {age_hours:.1f}s açık (MUTLAK limit:{TIMEOUT_ABSOLUTE_HOURS}s) — zorla akıllı kapama")
 
             try:
                 action, kar = execute_smart_timeout(ticker, pos)
@@ -1111,7 +1155,7 @@ async def check_timeouts():
             print(f"[TIMEOUT TASK ERR] {e}")
 
 
-# ============ HIGH/LOW TRACKER (v6.3) ============
+# ============ HIGH/LOW TRACKER (v6.4) ============
 HIGH_LOW_CHECK_INTERVAL_SEC = 60  # Her 1 dakikada bir tarama
 
 def parse_zaman_to_ms(zaman_str):
@@ -1127,7 +1171,7 @@ def parse_zaman_to_ms(zaman_str):
 
 async def update_position_highs_lows():
     """
-    v6.3: Açık pozisyonlar için HH güncelle, kaçırılan sinyaller için max_seen/min_seen güncelle.
+    v6.4: Açık pozisyonlar için HH güncelle, kaçırılan sinyaller için max_seen/min_seen güncelle.
     Klines API'den geçmiş bar verilerini çekerek browser bağımsız çalışır.
     """
     while True:
@@ -1216,7 +1260,7 @@ async def update_position_highs_lows():
 async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
-    print(f"[BOOT] CAB Bot v6.3 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s | Check:{TIMEOUT_CHECK_INTERVAL_SEC}s | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s")
+    print(f"[BOOT] CAB Bot v6.4 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s")
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -1230,7 +1274,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.3 Dashboard</title>
+<title>CAB Bot v6.4 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box}}
@@ -1284,10 +1328,10 @@ small{{color:#9ca3af}}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.3 Dashboard</h1>
+<h1>🤖 CAB Bot v6.4 Dashboard</h1>
 <div>
   <span class="badge">{mod_badge}</span>
-  <small style="color:#9ca3af">MAX:{MAX_POSITIONS} aktif | Timeout:{TIMEOUT_HOURS}s (akıllı: kâr→BE, zarar→kapat)</small>
+  <small style="color:#9ca3af">MAX:{MAX_POSITIONS} aktif | Timeout:{TIMEOUT_HOURS}s→{TIMEOUT_ABSOLUTE_HOURS}s (koşullu: aktif≥{TIMEOUT_PRESSURE_THRESHOLD} ise akıllı kapama)</small>
   <button class="btn btn-warn" style="margin-left:8px;padding:3px 8px;font-size:10px" onclick="requestNotif()">🔔 Bildirim İzni</button>
   <button class="btn" style="padding:3px 8px;font-size:10px" onclick="manualTimeoutCheck()">⏰ Timeout Kontrol</button>
 </div>
@@ -1431,7 +1475,7 @@ let status='active',statusTxt='⏳ Aktif',statusColor='#fbbf24';
 let sanalKar=0;
 const posSize=s.marj*s.lev;
 
-// v6.3: Önce backend flag'leri kontrol et (stateful — geri dönse bile işaretli kalır)
+// v6.4: Önce backend flag'leri kontrol et (stateful — geri dönse bile işaretli kalır)
 const tp2HitSeen=s.tp2_hit_seen===true;
 const tp1HitSeen=s.tp1_hit_seen===true;
 const stopHitSeen=s.stop_hit_seen===true;
@@ -1601,7 +1645,7 @@ function closeModal(){{document.getElementById('analysisModal').classList.remove
 
 async function clearOld(){{if(!confirm('30 günden eski kapanan pozisyonları silmek istiyor musun?'))return;try{{const r=await fetch('/api/clear_old',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{days:30}})}});const j=await r.json();toast(`✓ ${{j.removed}} kayıt silindi`);loadData()}}catch(e){{toast('Hata',true)}}}}
 
-function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6.3',{{body:'TP1/TP2/STOP bildirimlerini alacaksın!'}})}}}})}}
+function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6.4',{{body:'TP1/TP2/STOP bildirimlerini alacaksın!'}})}}}})}}
 
 function detectChanges(){{
 for(const[t,p]of Object.entries(openPositions)){{const prev=lastOpenState[t];if(prev){{if(p.tp1_hit&&!prev.tp1_hit)notify('🎯 TP1 Vurdu!',t+' TP1 alındı +'+((p.tp1_kar||0).toFixed(1))+'$');if(p.tp2_hit&&!prev.tp2_hit)notify('🎯🎯 TP2!',t+' TP2 alındı!');if(p.timeout_be&&!prev.timeout_be)notify('⏰ Timeout-BE',t+' BE\\'ye çekildi (+'+(p.timeout_kar_initial||0).toFixed(1)+'$)')}}else if(Object.keys(lastOpenState).length>0)notify('🆕 Yeni Pozisyon',t+' açıldı')}}
