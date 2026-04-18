@@ -9,9 +9,10 @@ app = FastAPI()
 
 # ============ KONFIGÜRASYON ============
 TEST_MODE = False  # 🟢 CANLI MOD
-MAX_POSITIONS = 5
+MAX_POSITIONS = 7  # v6.1: 5 → 7 (akıllı slot ile pratikte daha fazla açık olabilir)
 DATA_FILE = os.environ.get("DATA_FILE", "/tmp/cab_data.json")
 TIMEOUT_HOURS = 12  # pozisyon timeout süresi
+TIMEOUT_CHECK_INTERVAL_SEC = 300  # her 5 dakika
 
 client = UMFutures(
     key=os.environ.get("BINANCE_API_KEY"),
@@ -40,11 +41,35 @@ def save_data(data):
 
 data = load_data()
 
+# v6.1: Skipped_signals key'i eski verilerde olmayabilir, garanti et
+if "skipped_signals" not in data:
+    data["skipped_signals"] = []
+    save_data(data)
+
 def now_tr():
     return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
 
 def now_tr_short():
     return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M")
+
+def now_tr_dt():
+    """v6.1: Naive datetime olarak TR saatini döndür (parse edilen değerle uyumlu olsun)"""
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
+
+# ============ AKILLI SLOT SAYIMI ============
+def count_active_risk():
+    """v6.1: Aktif risk taşıyan pozisyonları say (TP1 vurmuş VE timeout-BE'liler exempt)"""
+    aktif = 0
+    garantili_tp1 = 0
+    garantili_timeout = 0
+    for p in data["open_positions"].values():
+        if p.get("tp1_hit"):
+            garantili_tp1 += 1
+        elif p.get("timeout_be"):
+            garantili_timeout += 1
+        else:
+            aktif += 1
+    return aktif, garantili_tp1, garantili_timeout
 
 # ============ BINANCE HELPERS ============
 lot_cache = {}
@@ -63,7 +88,6 @@ def get_symbol_info(symbol):
                 for f in s.get("filters", []):
                     if f["filterType"] == "LOT_SIZE":
                         lot_step = float(f["stepSize"])
-                        # precision hesapla
                         step_str = f["stepSize"].rstrip('0')
                         if '.' in step_str:
                             qty_precision = len(step_str.split('.')[1])
@@ -83,18 +107,15 @@ def get_symbol_info(symbol):
     return {"lot_step": 1.0, "qty_precision": 0, "price_precision": 2}
 
 def round_qty(qty, info):
-    """Miktarı lot step'e yuvarla"""
     step = info["lot_step"]
     precision = info["qty_precision"]
     rounded = math.floor(qty / step) * step
     return round(rounded, precision)
 
 def round_price(price, info):
-    """Fiyatı tick size'a yuvarla"""
     return round(price, info["price_precision"])
 
 def binance_set_leverage(symbol, lev):
-    """Kaldıracı ayarla"""
     try:
         result = client.change_leverage(symbol=symbol, leverage=lev)
         print(f"[BINANCE] Leverage {symbol} → {lev}x ✓")
@@ -107,7 +128,6 @@ def binance_set_leverage(symbol, lev):
         return False
 
 def binance_set_margin_type(symbol, margin_type="ISOLATED"):
-    """Marjin tipini ayarla"""
     try:
         result = client.change_margin_type(symbol=symbol, marginType=margin_type)
         print(f"[BINANCE] Margin type {symbol} → {margin_type} ✓")
@@ -120,31 +140,27 @@ def binance_set_margin_type(symbol, margin_type="ISOLATED"):
         return False
 
 def binance_market_buy(symbol, qty):
-    """Market buy emri"""
     try:
         result = client.new_order(
             symbol=symbol, side="BUY", type="MARKET", quantity=qty
         )
         filled_qty = float(result.get("executedQty", 0))
-        # avgPrice genelde 0 döner, cumQuote/executedQty ile hesapla
         avg_price = float(result.get("avgPrice", 0))
         if avg_price == 0 and filled_qty > 0:
             cum_quote = float(result.get("cumQuote", result.get("cumQty", 0)))
             if cum_quote > 0:
                 avg_price = cum_quote / filled_qty
-        # Hala 0 ise fills array'inden al
         if avg_price == 0 and result.get("fills"):
             prices = [float(f["price"]) for f in result["fills"] if float(f.get("qty", 0)) > 0]
             if prices:
                 avg_price = sum(prices) / len(prices)
-        print(f"[BINANCE] MARKET BUY {symbol} qty:{filled_qty} avgPx:{avg_price} ✓ (raw:{json.dumps(result)[:200]})")
+        print(f"[BINANCE] MARKET BUY {symbol} qty:{filled_qty} avgPx:{avg_price} ✓")
         return {"success": True, "avg_price": avg_price, "filled_qty": filled_qty, "order": result}
     except ClientError as e:
         print(f"[BINANCE ERR] Market buy {symbol}: {e}")
         return {"success": False, "error": str(e)}
 
 def binance_market_sell(symbol, qty):
-    """Market sell (reduceOnly) — kısmi veya tam kapama"""
     try:
         result = client.new_order(
             symbol=symbol, side="SELL", type="MARKET", quantity=qty, reduceOnly="true"
@@ -166,7 +182,6 @@ def binance_market_sell(symbol, qty):
         return {"success": False, "error": str(e)}
 
 def binance_stop_loss(symbol, qty, stop_price, info):
-    """Stop loss emri koy"""
     try:
         sp = round_price(stop_price, info)
         result = client.new_order(
@@ -182,7 +197,6 @@ def binance_stop_loss(symbol, qty, stop_price, info):
         return {"success": False, "error": str(e)}
 
 def binance_cancel_all(symbol):
-    """Semboldeki tüm açık emirleri iptal et"""
     try:
         result = client.cancel_open_orders(symbol=symbol)
         print(f"[BINANCE] Cancel all orders {symbol} ✓")
@@ -194,7 +208,6 @@ def binance_cancel_all(symbol):
         return False
 
 def binance_get_position_qty(symbol):
-    """Binance'teki gerçek pozisyon miktarını al"""
     try:
         positions = client.get_position_risk(symbol=symbol)
         for p in positions:
@@ -206,7 +219,6 @@ def binance_get_position_qty(symbol):
     return 0
 
 def binance_close_position(symbol):
-    """Pozisyonu tamamen kapat"""
     qty = binance_get_position_qty(symbol)
     if qty > 0:
         info = get_symbol_info(symbol)
@@ -215,6 +227,15 @@ def binance_close_position(symbol):
             binance_cancel_all(symbol)
             return binance_market_sell(symbol, qty)
     return {"success": True, "msg": "no position"}
+
+def binance_get_mark_price(symbol):
+    """v6.1: Sembol için mark price çek (timeout kontrolü için)"""
+    try:
+        result = client.mark_price(symbol=symbol)
+        return float(result.get("markPrice", 0))
+    except Exception as e:
+        print(f"[BINANCE ERR] Mark price {symbol}: {e}")
+        return None
 
 # ============ KAR HESAPLAMA ============
 def calc_tp1_kar(pos, tp1_px=None):
@@ -242,7 +263,6 @@ def is_recently_closed(ticker, n=20):
 
 # ============ TRADE EXECUTION ============
 def execute_entry(ticker, parsed):
-    """Yeni pozisyon aç — gerçek Binance emri"""
     symbol = ticker
     lev = parsed["lev"]
     marj = parsed["marj"]
@@ -258,14 +278,10 @@ def execute_entry(ticker, parsed):
         print(f"[TRADE ERR] {symbol} qty=0, pos_size:{pos_size} px:{giris_px}")
         return False
 
-    # 1. Leverage ayarla
     if not binance_set_leverage(symbol, lev):
         return False
-
-    # 2. Margin type ayarla
     binance_set_margin_type(symbol, "ISOLATED")
 
-    # 3. Market buy
     result = binance_market_buy(symbol, qty)
     if not result["success"]:
         return False
@@ -273,7 +289,6 @@ def execute_entry(ticker, parsed):
     actual_qty = result["filled_qty"]
     actual_price = result["avg_price"]
 
-    # 3b. Gerçek giriş fiyatını Binance pozisyon bilgisinden al
     if actual_price == 0 or actual_price < 0.0000001:
         try:
             positions = client.get_position_risk(symbol=symbol)
@@ -284,26 +299,22 @@ def execute_entry(ticker, parsed):
                     break
         except Exception as e:
             print(f"[TRADE WARN] entryPrice fetch failed: {e}")
-    
-    # 3c. Hala 0 ise Pine fiyatını kullan (son çare)
+
     if actual_price == 0 or actual_price < 0.0000001:
         actual_price = giris_px
         print(f"[TRADE WARN] {symbol} avgPrice=0, Pine fiyatı kullanıldı: {actual_price}")
 
-    # 4. Stop loss koy
     sl_result = binance_stop_loss(symbol, actual_qty, stop_px, info)
     sl_order_id = sl_result.get("order_id") if sl_result["success"] else None
 
-    print(f"[TRADE] GIRIS OK: {symbol} | qty:{actual_qty} | px:{actual_price} | SL:{stop_px} | SL_ID:{sl_order_id}")
+    print(f"[TRADE] GIRIS OK: {symbol} | qty:{actual_qty} | px:{actual_price} | SL:{stop_px}")
     return {"qty": actual_qty, "avg_price": actual_price, "sl_order_id": sl_order_id}
 
 def execute_tp1_close(ticker, pos):
-    """TP1'de kısmi kapama"""
     symbol = ticker
     info = get_symbol_info(symbol)
     kapat_oran = pos.get("kapat_oran", 60)
 
-    # Binance'teki gerçek miktarı al
     total_qty = binance_get_position_qty(symbol)
     if total_qty <= 0:
         print(f"[TRADE WARN] TP1 ama {symbol} pozisyon yok")
@@ -314,15 +325,11 @@ def execute_tp1_close(ticker, pos):
         print(f"[TRADE WARN] TP1 close_qty=0 for {symbol}")
         return False
 
-    # 1. Mevcut SL iptal et
     binance_cancel_all(symbol)
-
-    # 2. Kısmi kapat
     result = binance_market_sell(symbol, close_qty)
     if not result["success"]:
         return False
 
-    # 3. Kalan miktar için yeni SL (BE = giriş fiyatı)
     remaining_qty = round_qty(total_qty - close_qty, info)
     if remaining_qty > 0:
         be_price = pos["giris"]
@@ -332,7 +339,6 @@ def execute_tp1_close(ticker, pos):
     return True
 
 def execute_tp2_close(ticker, pos):
-    """TP2'de %25 kapat"""
     symbol = ticker
     info = get_symbol_info(symbol)
 
@@ -341,10 +347,6 @@ def execute_tp2_close(ticker, pos):
         print(f"[TRADE WARN] TP2 ama {symbol} pozisyon yok")
         return False
 
-    close_qty = round_qty(total_qty * 0.25 / (1.0 - pos.get("kapat_oran", 60) / 100.0), info)
-    # Alternatif basit hesap: kalan miktarın ~%62.5'ini kapat (%25 orijinalden)
-    # Aslında: TP1'de %60 kapandı, kalan %40. TP2'de %25 kapatmak = kalan'ın %62.5'i
-    # Daha güvenli: kalan miktarın yarısından fazlasını kapat
     close_qty = round_qty(total_qty * 0.625, info)
     if close_qty <= 0 or close_qty > total_qty:
         close_qty = round_qty(total_qty * 0.5, info)
@@ -366,17 +368,65 @@ def execute_tp2_close(ticker, pos):
     return True
 
 def execute_full_close(ticker, reason="TRAIL"):
-    """Pozisyonu tamamen kapat"""
     symbol = ticker
     binance_cancel_all(symbol)
     result = binance_close_position(symbol)
     print(f"[TRADE] {reason} CLOSE: {symbol} | {result}")
     return result.get("success", False)
 
-def execute_timeout_close(ticker, pos):
-    """18 saat sonra timeout kapama"""
-    print(f"[TIMEOUT] {ticker} {TIMEOUT_HOURS}s+ açık, kapatılıyor...")
-    return execute_full_close(ticker, "TIMEOUT")
+# ============ AKILLI TIMEOUT ============
+def execute_smart_timeout(ticker, pos):
+    """
+    v6.1: Akıllı timeout — pozisyonun durumuna göre karar ver
+    - Mark price çek → şu anki kar/zarar hesapla
+    - Kârda → BE stop'a çek (slot serbest, poz devam)
+    - Zardada → market kapat (slot serbest, poz biter)
+    - Geri dönüş: ('be', kar) veya ('close', kar)
+    """
+    symbol = ticker
+    giris = pos["giris"]
+    pos_size = pos["marj"] * pos["lev"]
+
+    # 1. Şu anki fiyatı çek
+    current_px = binance_get_mark_price(symbol)
+    if current_px is None or current_px <= 0:
+        print(f"[TIMEOUT WARN] {symbol} mark price alınamadı, full close yapılacak")
+        if not TEST_MODE:
+            execute_full_close(ticker, "TIMEOUT_FALLBACK")
+        return ('close', 0)
+
+    # 2. Kar/zarar hesapla
+    pct = (current_px - giris) / giris * 100.0
+    unrealized = pos_size * (current_px - giris) / giris
+
+    print(f"[TIMEOUT] {symbol} mark:{current_px} giris:{giris} pct:{pct:.2f}% unreal:{unrealized:+.1f}$")
+
+    # 3. Karar ver
+    if unrealized > 0:
+        # KÂRDA → BE stop'a çek, pozisyon devam
+        if not TEST_MODE:
+            info = get_symbol_info(symbol)
+            qty = binance_get_position_qty(symbol)
+            if qty > 0:
+                qty = round_qty(qty, info)
+                # Mevcut SL iptal et, yeni SL = giriş fiyatı
+                binance_cancel_all(symbol)
+                sl_result = binance_stop_loss(symbol, qty, giris, info)
+                if not sl_result["success"]:
+                    print(f"[TIMEOUT ERR] {symbol} BE stop koyulamadı, full close yapılıyor")
+                    execute_full_close(ticker, "TIMEOUT_BE_FAIL")
+                    return ('close', round(unrealized, 2))
+            else:
+                print(f"[TIMEOUT WARN] {symbol} qty=0, pozisyon zaten kapalı?")
+                return ('close', 0)
+        print(f"[TIMEOUT] {symbol} → BE stop'a çekildi (kârda +{unrealized:.1f}$, slot serbest)")
+        return ('be', round(unrealized, 2))
+    else:
+        # ZARARDA → kapat
+        if not TEST_MODE:
+            execute_full_close(ticker, "TIMEOUT_LOSS")
+        print(f"[TIMEOUT] {symbol} → kapatıldı (zararda {unrealized:.1f}$)")
+        return ('close', round(unrealized, 2))
 
 # ============ PARSE ============
 def parse_giris(msg):
@@ -489,7 +539,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS}</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a></p>"
+    return f"<h3>🤖 CAB Bot v6.1 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS} | TIMEOUT: {TIMEOUT_HOURS}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -502,9 +552,7 @@ async def get_ip():
 
 @app.get("/test_binance")
 async def test_binance():
-    """Binance bağlantı testi — gerçek emir VERMEZ"""
     results = {}
-    # 1. Hesap bakiyesi
     try:
         balance = client.balance()
         usdt_balance = None
@@ -521,7 +569,6 @@ async def test_binance():
         results["balance"] = str(e)
         results["balance_status"] = "❌ HATA"
 
-    # 2. Açık pozisyonlar
     try:
         positions = client.get_position_risk()
         open_pos = [p for p in positions if float(p.get("positionAmt", 0)) != 0]
@@ -531,7 +578,6 @@ async def test_binance():
         results["open_positions"] = str(e)
         results["positions_status"] = "❌ HATA"
 
-    # 3. Exchange info (lot size test)
     try:
         info = get_symbol_info("BTCUSDT")
         results["exchange_info"] = info
@@ -540,7 +586,6 @@ async def test_binance():
         results["exchange_info"] = str(e)
         results["exchange_info_status"] = "❌ HATA"
 
-    # 4. Son trade kontrolü
     try:
         orders = client.get_orders(symbol="BTCUSDT", limit=1)
         results["orders_api"] = "erişilebilir"
@@ -553,6 +598,7 @@ async def test_binance():
     results["SONUC"] = "🟢 TÜM TESTLER BAŞARILI — Gerçek mod için hazır!" if all_ok else "🔴 BAZI TESTLER BAŞARISIZ — Kontrol et!"
     results["test_mode"] = TEST_MODE
     results["max_positions"] = MAX_POSITIONS
+    results["timeout_hours"] = TIMEOUT_HOURS
 
     return JSONResponse(results)
 
@@ -580,7 +626,6 @@ async def api_data():
 
 @app.post("/api/fix_giris")
 async def fix_giris(req: Request):
-    """Giriş fiyatı 0 olan pozisyonları düzelt"""
     body = await req.json()
     ticker = body.get("ticker")
     new_giris = body.get("giris")
@@ -592,7 +637,6 @@ async def fix_giris(req: Request):
 
 @app.get("/api/fix_zero_giris")
 async def fix_zero_giris():
-    """Tüm açık pozisyonların giriş fiyatını Binance'ten güncelle"""
     fixed = []
     for ticker, pos in data["open_positions"].items():
         try:
@@ -630,6 +674,12 @@ async def api_clear_skipped():
         save_data(data)
     return {"status": "ok"}
 
+@app.get("/api/timeout_check")
+async def manual_timeout_check():
+    """v6.1: Manuel timeout taraması — debugging için"""
+    result = await timeout_scan_once()
+    return JSONResponse(result)
+
 # ============ WEBHOOK ============
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -645,13 +695,11 @@ async def webhook(req: Request):
         print(f"[PARSE] {parsed}")
         ticker = parsed["ticker"]
 
-        # Sadece TP1 vurmamış (aktif risk taşıyan) pozisyonları say
-        # TP1 vurmuş olanlar BE stopta - risksiz, slot saymazlar
-        aktif_risk = sum(1 for p in data["open_positions"].values() if not p.get("tp1_hit"))
-        garantili = len(data["open_positions"]) - aktif_risk
+        # v6.1: Akıllı slot — TP1 vurmuş VE timeout-BE'liler exempt
+        aktif_risk, gar_tp1, gar_to = count_active_risk()
+        garantili = gar_tp1 + gar_to
 
         if aktif_risk >= MAX_POSITIONS:
-            # Kaçırılan sinyali kaydet
             if "skipped_signals" not in data:
                 data["skipped_signals"] = []
             data["skipped_signals"].append({
@@ -668,17 +716,15 @@ async def webhook(req: Request):
                 "zaman": now_tr(),
                 "sebep": f"Max {MAX_POSITIONS} aktif risk dolu (+{garantili} garantili)"
             })
-            # Son 50 kaydı tut
             if len(data["skipped_signals"]) > 50:
                 data["skipped_signals"] = data["skipped_signals"][-50:]
             save_data(data)
-            print(f"[LIMIT] Aktif risk {aktif_risk}/{MAX_POSITIONS} (+{garantili} TP1'li) — {ticker} atlandı (kaydedildi)")
+            print(f"[LIMIT] Aktif risk {aktif_risk}/{MAX_POSITIONS} (+{gar_tp1} TP1 +{gar_to} TO-BE) — {ticker} atlandı (kaydedildi)")
             return {"status": "limit"}
         if ticker in data["open_positions"]:
             print(f"[DUP] {ticker} zaten açık")
             return {"status": "duplicate"}
 
-        # Gerçek emir
         trade_result = None
         if not TEST_MODE:
             trade_result = execute_entry(ticker, parsed)
@@ -694,6 +740,7 @@ async def webhook(req: Request):
             "risk": parsed["risk"], "kapat_oran": parsed["kapat_oran"],
             "atr_skor": parsed["atr_skor"], "durum": "Açık",
             "hh_pct": 0.0, "tp1_hit": False, "tp2_hit": False,
+            "timeout_be": False,  # v6.1: yeni flag
             "tp1_kar": 0.0, "tp2_kar": 0.0,
             "qty": trade_result["qty"] if trade_result else 0,
             "sl_order_id": trade_result.get("sl_order_id") if trade_result else None,
@@ -729,7 +776,6 @@ async def webhook(req: Request):
 
         pos = data["open_positions"][ticker]
 
-        # Gerçek kısmi kapama
         if not TEST_MODE:
             execute_tp1_close(ticker, pos)
 
@@ -742,6 +788,8 @@ async def webhook(req: Request):
         pos["durum"] = "✓ TP1 Alındı"
         pos["kapat_oran"] = parsed["kapat_oran"]
         pos["tp1_zaman"] = now_tr()
+        # v6.1: TP1 vurursa timeout-BE flag'i temizle (zaten geçildi)
+        pos["timeout_be"] = False
         save_data(data)
         print(f"{mode_tag} TP1: {ticker} | +{parsed['tp1_kar']}$")
         return {"status": "tp1"}
@@ -774,7 +822,6 @@ async def webhook(req: Request):
 
         pos = data["open_positions"][ticker]
 
-        # Gerçek kısmi kapama
         if not TEST_MODE:
             execute_tp2_close(ticker, pos)
 
@@ -804,7 +851,6 @@ async def webhook(req: Request):
 
         pos = data["open_positions"][ticker]
 
-        # Gerçek tam kapama
         if not TEST_MODE:
             execute_full_close(ticker, "TRAIL")
 
@@ -847,7 +893,6 @@ async def webhook(req: Request):
 
         pos = data["open_positions"][ticker]
 
-        # Stop loss Binance'te zaten tetiklenmiş olmalı — doğrula
         if not TEST_MODE:
             remaining = binance_get_position_qty(ticker)
             if remaining > 0:
@@ -869,6 +914,10 @@ async def webhook(req: Request):
             kalan = 100 - kapat_oran
             stop_kar = pos_size * (kalan / 100.0) * ((stop_px - giris) / giris)
             sonuc = "~ TP1+BE Stop"
+        elif pos.get("timeout_be"):
+            # v6.1: Timeout-BE pozisyonu — BE stopta bekliyordu, şimdi tetiklendi
+            stop_kar = pos_size * ((stop_px - giris) / giris)
+            sonuc = "⏰ Timeout-BE Stop"
         else:
             stop_kar = pos_size * ((stop_px - giris) / giris)
             sonuc = "✗ Stop"
@@ -894,59 +943,107 @@ async def webhook(req: Request):
         print(f"[UNKNOWN] {msg[:80]}")
         return {"status": "unknown"}
 
-# ============ TIMEOUT BACKGROUND TASK ============
-async def check_timeouts():
-    """Her 5 dakikada açık pozisyonları kontrol et, 18+ saat olanları kapat"""
-    while True:
-        await asyncio.sleep(300)  # 5 dakika
-        try:
-            now = datetime.now(timezone.utc) + timedelta(hours=3)
-            for ticker in list(data["open_positions"].keys()):
-                pos = data["open_positions"][ticker]
-                if pos.get("tp1_hit"):
-                    continue  # TP1 vurmuş, trailing beklesin
+# ============ TIMEOUT BACKGROUND TASK (v6.1: FIX EDİLDİ) ============
+async def timeout_scan_once():
+    """v6.1: Tek seferlik timeout taraması — manuel ve background task tarafından çağrılır"""
+    scanned = 0
+    actioned = []
+    errors = []
 
-                try:
-                    acilis = datetime.strptime(pos.get("zaman_full", ""), "%Y-%m-%d %H:%M")
-                    age_hours = (now - acilis).total_seconds() / 3600
-                except:
+    try:
+        now = now_tr_dt()  # v6.1: NAIVE datetime — strptime ile uyumlu
+        for ticker in list(data["open_positions"].keys()):
+            pos = data["open_positions"][ticker]
+
+            # TP1 vurmuş veya zaten timeout-BE → atla
+            if pos.get("tp1_hit") or pos.get("timeout_be"):
+                continue
+
+            scanned += 1
+
+            try:
+                zaman_str = pos.get("zaman_full", "")
+                if not zaman_str:
                     continue
+                acilis = datetime.strptime(zaman_str, "%Y-%m-%d %H:%M")  # naive
+                age_hours = (now - acilis).total_seconds() / 3600
+            except Exception as e:
+                errors.append(f"{ticker}: zaman parse hatası: {e}")
+                continue
 
-                if age_hours >= TIMEOUT_HOURS:
-                    print(f"[TIMEOUT] {ticker} {age_hours:.1f}s açık (limit:{TIMEOUT_HOURS}s)")
+            if age_hours < TIMEOUT_HOURS:
+                continue
 
-                    if not TEST_MODE:
-                        execute_timeout_close(ticker, pos)
+            print(f"[TIMEOUT] {ticker} {age_hours:.1f}s açık (limit:{TIMEOUT_HOURS}s) — akıllı kapama")
 
-                    # Kapanan olarak kaydet
-                    giris = pos["giris"]
-                    pos_size = pos["marj"] * pos["lev"]
-                    # Yaklaşık kar (son bilinen fiyat yok, 0 varsay)
-                    timeout_kar = 0  # TODO: son fiyatla hesapla
+            try:
+                action, kar = execute_smart_timeout(ticker, pos)
+            except Exception as e:
+                errors.append(f"{ticker}: smart timeout hatası: {e}")
+                print(f"[TIMEOUT ERR] {ticker}: {e}")
+                continue
 
-                    closed = {
-                        "ticker": ticker, "giris": giris, "marj": pos["marj"], "lev": pos["lev"],
-                        "sonuc": "⏰ Timeout", "kar": timeout_kar,
-                        "tp1_kar": 0, "tp2_kar": 0, "trail_kar": 0,
-                        "tp1_kar_added": False, "tp2_kar_added": False,
-                        "hh_pct": pos.get("hh_pct", 0), "atr_skor": pos.get("atr_skor", 1.0),
-                        "kapat_oran": pos.get("kapat_oran", 60),
-                        "acilis": pos.get("zaman_full", ""), "kapanis": now_tr(),
-                    }
-                    data["closed_positions"].append(closed)
-                    del data["open_positions"][ticker]
-                    save_data(data)
-                    print(f"[TIMEOUT] {ticker} kapatıldı")
+            if action == 'be':
+                # KÂRDA → BE stop'a çekildi, pozisyon devam, slot serbest
+                pos["timeout_be"] = True
+                pos["timeout_zaman"] = now_tr()
+                pos["timeout_kar_initial"] = kar
+                pos["stop"] = pos["giris"]  # BE
+                pos["durum"] = f"⏰ Timeout-BE (+{kar:.1f}$)"
+                save_data(data)
+                actioned.append({"ticker": ticker, "action": "BE", "unrealized_kar": kar, "age_hours": round(age_hours, 1)})
+                print(f"[TIMEOUT-BE] {ticker} → slot serbest, pozisyon BE'de bekliyor (kâr +{kar:.1f}$)")
+
+            elif action == 'close':
+                # ZARARDA veya hata → kapat, kapanan tabloya ekle
+                closed = {
+                    "ticker": ticker, "giris": pos["giris"], "marj": pos["marj"], "lev": pos["lev"],
+                    "sonuc": "⏰ Timeout", "kar": round(kar, 2),
+                    "tp1_kar": 0, "tp2_kar": 0, "trail_kar": round(kar, 2),
+                    "tp1_kar_added": False, "tp2_kar_added": False,
+                    "hh_pct": pos.get("hh_pct", 0), "atr_skor": pos.get("atr_skor", 1.0),
+                    "kapat_oran": pos.get("kapat_oran", 60),
+                    "acilis": pos.get("zaman_full", ""), "kapanis": now_tr(),
+                }
+                data["closed_positions"].append(closed)
+                del data["open_positions"][ticker]
+                save_data(data)
+                actioned.append({"ticker": ticker, "action": "CLOSE", "kar": kar, "age_hours": round(age_hours, 1)})
+                print(f"[TIMEOUT-CLOSE] {ticker} → kapatıldı ({kar:+.1f}$)")
+
+    except Exception as e:
+        errors.append(f"global: {e}")
+        print(f"[TIMEOUT GLOBAL ERR] {e}")
+
+    return {
+        "scanned": scanned,
+        "actioned": actioned,
+        "actioned_count": len(actioned),
+        "errors": errors,
+        "now_tr": now_tr(),
+        "timeout_hours": TIMEOUT_HOURS
+    }
+
+
+async def check_timeouts():
+    """v6.1: Background task — sürekli çalışır"""
+    while True:
+        await asyncio.sleep(TIMEOUT_CHECK_INTERVAL_SEC)
+        try:
+            result = await timeout_scan_once()
+            if result["actioned_count"] > 0 or result["errors"]:
+                print(f"[TIMEOUT-SCAN] scanned:{result['scanned']} actioned:{result['actioned_count']} errors:{len(result['errors'])}")
         except Exception as e:
-            print(f"[TIMEOUT ERR] {e}")
+            print(f"[TIMEOUT TASK ERR] {e}")
+
 
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(check_timeouts())
-    print(f"[BOOT] CAB Bot v6 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s")
+    print(f"[BOOT] CAB Bot v6.1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s | Check:{TIMEOUT_CHECK_INTERVAL_SEC}s")
 
 
-# ============ DASHBOARD v6 PRO ============
+# ============ DASHBOARD v6.1 PRO ============
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     mod_badge = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
@@ -957,7 +1054,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6 Dashboard</title>
+<title>CAB Bot v6.1 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box}}
@@ -1011,11 +1108,12 @@ small{{color:#9ca3af}}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6 Dashboard</h1>
+<h1>🤖 CAB Bot v6.1 Dashboard</h1>
 <div>
   <span class="badge">{mod_badge}</span>
-  <small style="color:#9ca3af">MAX:{MAX_POSITIONS} poz | Timeout:{TIMEOUT_HOURS}s</small>
+  <small style="color:#9ca3af">MAX:{MAX_POSITIONS} aktif | Timeout:{TIMEOUT_HOURS}s (akıllı: kâr→BE, zarar→kapat)</small>
   <button class="btn btn-warn" style="margin-left:8px;padding:3px 8px;font-size:10px" onclick="requestNotif()">🔔 Bildirim İzni</button>
+  <button class="btn" style="padding:3px 8px;font-size:10px" onclick="manualTimeoutCheck()">⏰ Timeout Kontrol</button>
 </div>
 <div class="subtitle">⟳ Son güncelleme: <span id="lastUpdate">—</span> <small>(5sn fiyat / 20sn sayfa)</small></div>
 
@@ -1072,7 +1170,7 @@ small{{color:#9ca3af}}
   </div>
 </div>
 
-<!-- KAÇIRILAN SİNYALLER — Canlı Takip -->
+<!-- KAÇIRILAN SİNYALLER -->
 <div class="section" id="skippedSection" style="display:none">
   <div class="section-head">
     <h2>⏭ Kaçırılan Sinyaller <small id="skippedCount"></small></h2>
@@ -1097,7 +1195,6 @@ small{{color:#9ca3af}}
   </div>
 </div>
 
-<!-- ANALIZ MODAL -->
 <div class="modal-overlay" id="analysisModal" onclick="if(event.target.id=='analysisModal')closeModal()">
   <div class="modal">
     <div class="modal-head"><h2>📊 Performans Analizi</h2><button class="modal-close" onclick="closeModal()">×</button></div>
@@ -1118,7 +1215,6 @@ async function fp(sym){{try{{const r=await fetch('https://fapi.binance.com/fapi/
 
 let skippedUpdateCounter=0;
 async function updatePrices(){{for(const sym of Object.keys(openPositions)){{const px=await fp(sym);if(px===null)continue;openPrices[sym]=px;try{{await fetch('/update_hh',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ticker:sym,price:px}})}})}}catch(e){{}}}}renderOpen();
-// İlk çalışmada hemen, sonra her 6 döngü (30sn) bir güncelle
 if(skippedUpdateCounter===0||skippedUpdateCounter%6===0){{if(skippedSignals.length>0)updateSkippedPrices()}}
 skippedUpdateCounter++;
 document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8);setTimeout(updatePrices,5000)}}
@@ -1131,11 +1227,17 @@ function resultMatches(s,f){{if(f==='all')return true;if(f==='stop')return s==='
 function openTV(t){{window.open('https://www.tradingview.com/chart/?symbol=BINANCE:'+t+'.P','_blank')}}
 function toast(msg,err){{const t=document.getElementById('toast');t.textContent=msg;t.className='toast show'+(err?' err':'');setTimeout(()=>t.classList.remove('show'),2500)}}
 
+async function manualTimeoutCheck(){{
+toast('Timeout taraması başlatıldı...');
+try{{const r=await fetch('/api/timeout_check');const j=await r.json();
+if(j.actioned_count>0){{const summary=j.actioned.map(a=>`${{a.ticker}}: ${{a.action}}`).join(', ');toast(`✓ ${{j.actioned_count}} aksiyon: ${{summary}}`);loadData()}}
+else{{toast(`✓ Tarandı: ${{j.scanned}} poz, hiçbiri timeout aşmadı`)}}
+}}catch(e){{toast('Hata: '+e.message,true)}}}}
+
 function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();checkWarnings()}}
 
 let skippedPrices={{}};
 async function updateSkippedPrices(){{
-// Paralel fetch - tüm semboller aynı anda çekilir
 const promises=skippedSignals.map(async s=>{{const px=await fp(s.ticker);if(px!==null)skippedPrices[s.ticker]=px;return{{sym:s.ticker,px}}}});
 try{{await Promise.all(promises)}}catch(e){{console.error('[skipped fetch err]',e)}}
 renderSkipped()}}
@@ -1163,12 +1265,10 @@ const rr=stop>0?((tp1-giris)/(giris-stop)).toFixed(1):'—';
 const tp1kalan=px?((tp1-px)/px*100):null;
 return{{...s,px,status,statusTxt,statusColor,sanalKar:Math.round(sanalKar*100)/100,rr,tp1kalan}}}});
 
-// Filtre
 if(filter==='tp')rows=rows.filter(r=>r.status==='tp1'||r.status==='tp2');
 else if(filter==='stop')rows=rows.filter(r=>r.status==='stop');
 else if(filter==='active')rows=rows.filter(r=>r.status==='active');
 
-// Özet
 const tpCount=rows.filter(r=>r.status==='tp1'||r.status==='tp2').length;
 const stopCount=rows.filter(r=>r.status==='stop').length;
 const activeCount=rows.filter(r=>r.status==='active').length;
@@ -1208,11 +1308,14 @@ const tk=closedPositions.reduce((s,c)=>s+c.kar,0),ts=closedPositions.length,ws=c
 const today=now_tr().slice(0,10),bg=closedPositions.filter(c=>c.kapanis.startsWith(today)),bk=bg.reduce((s,c)=>s+c.kar,0),bt=bg.filter(c=>c.kar>0).length,bs=bg.filter(c=>c.kar<=0).length,bw=bg.length>0?(bt/bg.length*100).toFixed(1):0;
 const su=closedPositions.map(sureDk),os=su.length>0?su.reduce((a,b)=>a+b,0)/su.length:0,oss=os===0?'—':sureFmt(Math.round(os));
 const nr=tk>0?'#4ade80':(tk<0?'#f87171':'#e5e7eb'),wrr=wr>=50?'#4ade80':(ts>0?'#f87171':'#e5e7eb'),bkr=bk>0?'#4ade80':(bk<0?'#f87171':'#e5e7eb'),bwr=bw>=50?'#4ade80':(bg.length>0?'#f87171':'#e5e7eb');
-const aktifRisk=Object.values(openPositions).filter(p=>!p.tp1_hit).length;
-const garantili=Object.keys(openPositions).length-aktifRisk;
-const openLbl=garantili>0?`${{aktifRisk}}+${{garantili}}★`:`${{aktifRisk}}`;
+// v6.1: Akıllı slot — TP1 vurmuş VE timeout-BE'liler exempt
+let aktifRisk=0,gar_tp1=0,gar_to=0;
+for(const p of Object.values(openPositions)){{if(p.tp1_hit)gar_tp1++;else if(p.timeout_be)gar_to++;else aktifRisk++}}
+const garantili=gar_tp1+gar_to;
+const openLbl=garantili>0?`${{aktifRisk}}+${{gar_tp1}}★${{gar_to>0?'+'+gar_to+'⏰':''}}`:`${{aktifRisk}}`;
+const openSubLbl=garantili>0?`Aktif+TP1${{gar_to>0?'+TO':''}}`:'Açık';
 document.getElementById('statsBar').innerHTML=
-`<div class="stat"><div class="stat-val">${{openLbl}}</div><div class="stat-lbl">${{garantili>0?'Aktif+TP1':'Açık'}}</div></div>`+
+`<div class="stat"><div class="stat-val">${{openLbl}}</div><div class="stat-lbl">${{openSubLbl}}</div></div>`+
 `<div class="stat"><div class="stat-val">${{ts}}</div><div class="stat-lbl">Kapanan</div></div>`+
 `<div class="stat"><div class="stat-val" style="color:${{nr}}">${{tk>=0?'+':''}}${{tk.toFixed(1)}}$</div><div class="stat-lbl">Net Kar</div></div>`+
 `<div class="stat"><div class="stat-val" style="color:${{wrr}}">${{wr}}%</div><div class="stat-lbl">Win Rate</div></div>`+
@@ -1232,11 +1335,11 @@ if(!rows.length){{body.innerHTML='<tr><td colspan="13" style="text-align:center;
 else{{body.innerHTML=rows.map(r=>{{const p=r.pos,t=r.ticker,ps=p.marj*p.lev,sz=ps*(p.stop-p.giris)/p.giris,k=p.kapat_oran||60,t1k=ps*(k/100)*(p.tp1-p.giris)/p.giris,t2k=ps*0.25*(p.tp2-p.giris)/p.giris;
 let pxS='—',pxC='#e5e7eb',pcS='—';if(r.px){{const pr=ps*r.pct/100;pxS=r.px.toFixed(6);if(r.pct>0){{pxC='#4ade80';pcS=`<span style="color:#4ade80">▲ +${{pr.toFixed(1)}}$ (+${{r.pct.toFixed(2)}}%)</span>`}}else{{pxC='#f87171';pcS=`<span style="color:#f87171">▼ ${{pr.toFixed(1)}}$ (${{r.pct.toFixed(2)}}%)</span>`}}}}
 const tkS=r.tp1kalan!=null?(r.tp1kalan<=0?'<span style="color:#4ade80">✓ Geçildi</span>':`%${{r.tp1kalan.toFixed(2)}} uzak`):'—';
-let trS='—';if(p.tp2_hit)trS=`✓ TP2+ (+${{((p.tp1_kar||0)+(p.tp2_kar||0)).toFixed(1)}}$)`;else if(p.tp1_hit)trS=`✓ TP1+ (+${{(p.tp1_kar||0).toFixed(1)}}$)`;
-let rb='';if(p.tp2_hit)rb='background:rgba(20,184,166,0.15);border-left:3px solid #14b8a6;';else if(p.tp1_hit)rb='background:rgba(132,204,22,0.12);border-left:3px solid #84cc16;';
-let wc='';try{{const ac=new Date(p.zaman_full.replace(' ','T')+':00+03:00');if((Date.now()-ac.getTime())/3600000>6)wc='warn-row'}}catch(e){{}}
+let trS='—';if(p.tp2_hit)trS=`✓ TP2+ (+${{((p.tp1_kar||0)+(p.tp2_kar||0)).toFixed(1)}}$)`;else if(p.tp1_hit)trS=`✓ TP1+ (+${{(p.tp1_kar||0).toFixed(1)}}$)`;else if(p.timeout_be)trS=`⏰ TO-BE (+${{(p.timeout_kar_initial||0).toFixed(1)}}$)`;
+let rb='';if(p.tp2_hit)rb='background:rgba(20,184,166,0.15);border-left:3px solid #14b8a6;';else if(p.tp1_hit)rb='background:rgba(132,204,22,0.12);border-left:3px solid #84cc16;';else if(p.timeout_be)rb='background:rgba(249,115,22,0.12);border-left:3px solid #f97316;';
+let wc='';try{{const ac=new Date(p.zaman_full.replace(' ','T')+':00+03:00');if((Date.now()-ac.getTime())/3600000>6&&!p.tp1_hit&&!p.timeout_be)wc='warn-row'}}catch(e){{}}
 const hd=(p.hh_pct||0)>0?`%${{p.hh_pct.toFixed(2)}}`:'—',ad=`${{(p.atr_skor||1.0).toFixed(2)}}x (${{k}}%)`;
-return`<tr class="${{wc}}" style="${{rb}}"><td><a href="javascript:void(0)" onclick="openTV('${{t}}')" style="color:#60a5fa;text-decoration:none;">${{t}}</a> 🔗</td><td>${{p.marj.toFixed(0)}}$ <small>(${{p.lev}}x)</small></td><td>${{p.giris.toFixed(6)}}</td><td style="color:${{pxC}}">${{pxS}}</td><td>${{tkS}}</td><td>${{p.durum&&p.durum.includes('TP')?p.durum:pcS}}</td><td>${{hd}}</td><td>${{ad}}</td><td>${{trS}}</td><td>${{p.stop.toFixed(6)}} <small style="color:#f87171">(${{sz>=0?'+':''}}${{sz.toFixed(1)}}$)</small></td><td>${{p.tp1.toFixed(6)}} <small style="color:#4ade80">(+${{t1k.toFixed(1)}}$)</small></td><td>${{p.tp2.toFixed(6)}} <small style="color:#4ade80">(+${{t2k.toFixed(1)}}$)</small></td><td>${{p.zaman||''}}</td></tr>`}}).join('')}}
+return`<tr class="${{wc}}" style="${{rb}}"><td><a href="javascript:void(0)" onclick="openTV('${{t}}')" style="color:#60a5fa;text-decoration:none;">${{t}}</a> 🔗</td><td>${{p.marj.toFixed(0)}}$ <small>(${{p.lev}}x)</small></td><td>${{p.giris.toFixed(6)}}</td><td style="color:${{pxC}}">${{pxS}}</td><td>${{tkS}}</td><td>${{p.durum&&(p.durum.includes('TP')||p.durum.includes('Timeout'))?p.durum:pcS}}</td><td>${{hd}}</td><td>${{ad}}</td><td>${{trS}}</td><td>${{p.stop.toFixed(6)}} <small style="color:#f87171">(${{sz>=0?'+':''}}${{sz.toFixed(1)}}$)</small></td><td>${{p.tp1.toFixed(6)}} <small style="color:#4ade80">(+${{t1k.toFixed(1)}}$)</small></td><td>${{p.tp2.toFixed(6)}} <small style="color:#4ade80">(+${{t2k.toFixed(1)}}$)</small></td><td>${{p.zaman||''}}</td></tr>`}}).join('')}}
 document.getElementById('openCount').textContent=`(${{rows.length}})`;updateSortArrows('open')}}
 
 function renderClosed(){{
@@ -1247,14 +1350,15 @@ const body=document.getElementById('closedBody');
 if(!rows.length){{body.innerHTML='<tr><td colspan="9" style="text-align:center;color:#9ca3af">Veri yok</td></tr>'}}
 else{{body.innerHTML=rows.map(c=>{{const rk=c.kar>0?'#4ade80':'#f87171',ks=(c.kar>=0?'+':'')+c.kar.toFixed(1)+'$',hd=(c.hh_pct||0)>0?`%${{c.hh_pct.toFixed(2)}}`:'—',ad=`${{(c.atr_skor||1.0).toFixed(2)}}x/${{c.kapat_oran||60}}%`,su=sureFmt(c.sure_dk),zm=c.acilis.slice(5)+'→'+c.kapanis.slice(11);
 let wc='';if(c.sonuc==='✗ Stop'&&(c.hh_pct||0)>=5)wc='warn-row';
-return`<tr class="${{wc}}"><td><a href="javascript:void(0)" onclick="openTV('${{c.ticker}}')" style="color:#60a5fa;text-decoration:none;">${{c.ticker}}</a> 🔗</td><td>${{c.marj.toFixed(0)}}$</td><td>${{c.giris.toFixed(6)}}</td><td style="color:${{rk}}">${{c.sonuc}}</td><td style="color:${{rk}};font-weight:bold">${{ks}}</td><td>${{hd}}</td><td>${{ad}}</td><td>${{su}}</td><td>${{zm}}</td></tr>`}}).join('')}}
+let scolor=rk;if(c.sonuc.includes('Timeout'))scolor='#f97316';
+return`<tr class="${{wc}}"><td><a href="javascript:void(0)" onclick="openTV('${{c.ticker}}')" style="color:#60a5fa;text-decoration:none;">${{c.ticker}}</a> 🔗</td><td>${{c.marj.toFixed(0)}}$</td><td>${{c.giris.toFixed(6)}}</td><td style="color:${{scolor}}">${{c.sonuc}}</td><td style="color:${{rk}};font-weight:bold">${{ks}}</td><td>${{hd}}</td><td>${{ad}}</td><td>${{su}}</td><td>${{zm}}</td></tr>`}}).join('')}}
 const tk=rows.filter(c=>c.kar>0).reduce((s,c)=>s+c.kar,0),tz=rows.filter(c=>c.kar<0).reduce((s,c)=>s+c.kar,0),nt=tk+tz,nc=nt>0?'#4ade80':(nt<0?'#f87171':'#e5e7eb');
 document.getElementById('closedOzet').innerHTML=rows.length>0?`<b>${{rows.length}}</b> poz | <span style="color:#4ade80">Kar:+${{tk.toFixed(1)}}$</span> | <span style="color:#f87171">Zarar:${{tz.toFixed(1)}}$</span> | <span style="color:${{nc}}">NET:${{nt>=0?'+':''}}${{nt.toFixed(1)}}$</span>`:'Veri yok';
 document.getElementById('closedCount').textContent=`(${{rows.length}}/${{closedPositions.length}})`;updateSortArrows('closed')}}
 
 function checkWarnings(){{
 const warns=[];
-for(const[t,p]of Object.entries(openPositions)){{try{{const ac=new Date(p.zaman_full.replace(' ','T')+':00+03:00');const h=((Date.now()-ac.getTime())/3600000).toFixed(1);if(h>6)warns.push(`⏰ <b>${{t}}</b> ${{sureFmt(Math.round(h*60))}}'dir açık`)}}catch(e){{}}}}
+for(const[t,p]of Object.entries(openPositions)){{if(p.tp1_hit||p.timeout_be)continue;try{{const ac=new Date(p.zaman_full.replace(' ','T')+':00+03:00');const h=((Date.now()-ac.getTime())/3600000).toFixed(1);if(h>6)warns.push(`⏰ <b>${{t}}</b> ${{sureFmt(Math.round(h*60))}}'dir açık`)}}catch(e){{}}}}
 const son5=closedPositions.slice(-5);if(son5.length===5&&son5.every(c=>c.sonuc==='✗ Stop'))warns.push('🚨 <b>Son 5 pozisyon üst üste STOP!</b> Piyasa riskli');
 const hh_stop=closedPositions.slice(-15).filter(c=>c.sonuc==='✗ Stop'&&(c.hh_pct||0)>=5);
 if(hh_stop.length>=2)warns.push(`⚠️ <b>${{hh_stop.length}} poz</b> TP1'e yaklaşıp stop yedi — trailing/stop ayarını incele`);
@@ -1303,10 +1407,10 @@ function closeModal(){{document.getElementById('analysisModal').classList.remove
 
 async function clearOld(){{if(!confirm('30 günden eski kapanan pozisyonları silmek istiyor musun?'))return;try{{const r=await fetch('/api/clear_old',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{days:30}})}});const j=await r.json();toast(`✓ ${{j.removed}} kayıt silindi`);loadData()}}catch(e){{toast('Hata',true)}}}}
 
-function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6',{{body:'TP1/TP2/STOP bildirimlerini alacaksın!'}})}}}})}}
+function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6.1',{{body:'TP1/TP2/STOP bildirimlerini alacaksın!'}})}}}})}}
 
 function detectChanges(){{
-for(const[t,p]of Object.entries(openPositions)){{const prev=lastOpenState[t];if(prev){{if(p.tp1_hit&&!prev.tp1_hit)notify('🎯 TP1 Vurdu!',t+' TP1 alındı +'+((p.tp1_kar||0).toFixed(1))+'$');if(p.tp2_hit&&!prev.tp2_hit)notify('🎯🎯 TP2!',t+' TP2 alındı!')}}else if(Object.keys(lastOpenState).length>0)notify('🆕 Yeni Pozisyon',t+' açıldı')}}
+for(const[t,p]of Object.entries(openPositions)){{const prev=lastOpenState[t];if(prev){{if(p.tp1_hit&&!prev.tp1_hit)notify('🎯 TP1 Vurdu!',t+' TP1 alındı +'+((p.tp1_kar||0).toFixed(1))+'$');if(p.tp2_hit&&!prev.tp2_hit)notify('🎯🎯 TP2!',t+' TP2 alındı!');if(p.timeout_be&&!prev.timeout_be)notify('⏰ Timeout-BE',t+' BE\\'ye çekildi (+'+(p.timeout_kar_initial||0).toFixed(1)+'$)')}}else if(Object.keys(lastOpenState).length>0)notify('🆕 Yeni Pozisyon',t+' açıldı')}}
 for(const t of Object.keys(lastOpenState)){{if(!openPositions[t]){{const c=closedPositions.find(x=>x.ticker===t);if(c){{if(c.kar>0)notify('✓ KAR',t+': '+c.sonuc+' +'+c.kar.toFixed(1)+'$');else notify('✗ ZARAR',t+': '+c.sonuc+' '+c.kar.toFixed(1)+'$')}}}}}}
 lastOpenState=JSON.parse(JSON.stringify(openPositions))}}
 
@@ -1318,7 +1422,6 @@ function updateSortArrows(w){{const tid=w==='open'?'openTable':'closedTable',s=s
 function exportCSV(type){{let rows,fn;if(type==='open'){{rows=Object.entries(openPositions).map(([t,p])=>({{Coin:t,Marjin:p.marj,Lev:p.lev,Giris:p.giris,Stop:p.stop,TP1:p.tp1,TP2:p.tp2,HH:p.hh_pct||0,ATR:p.atr_skor||1.0,Kapat:p.kapat_oran||60,Durum:p.durum||'',Zaman:p.zaman_full||''}}));fn='acik_'+now_tr().slice(0,10)+'.csv'}}else{{rows=closedPositions.map(c=>({{Coin:c.ticker,Marjin:c.marj,Lev:c.lev||10,Giris:c.giris,Sonuc:c.sonuc,Kar:c.kar,HH:c.hh_pct||0,Acilis:c.acilis,Kapanis:c.kapanis}}));fn='kapanan_'+now_tr().slice(0,10)+'.csv'}}if(!rows.length){{toast('Veri yok',true);return}}const h=Object.keys(rows[0]),csv=[h.join(','),...rows.map(r=>h.map(k=>r[k]).join(','))].join('\\n');const b=new Blob(['\\ufeff'+csv],{{type:'text/csv'}});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=fn;a.click();toast('✓ '+fn)}}
 
 async function init(){{setupSort();await loadData();lastOpenState=JSON.parse(JSON.stringify(openPositions));
-// updatePrices her zaman çalışsın — hem açık poz hem kaçırılan sinyaller için
 if(Object.keys(openPositions).length>0||skippedSignals.length>0){{updatePrices()}}else{{setInterval(async()=>{{await loadData();document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8)}},10000)}}
 setTimeout(()=>location.reload(),20000)}}
 init();
