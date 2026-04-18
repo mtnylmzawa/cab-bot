@@ -259,6 +259,58 @@ def binance_get_mark_price(symbol):
         print(f"[BINANCE ERR] Mark price {symbol}: {e}")
         return None
 
+def binance_get_klines(symbol, interval="1m", limit=60):
+    """v6.3: Geçmiş bar verilerini çek (high/low takibi için)
+    Public endpoint, auth gerekmez.
+    Dönen: [[time, open, high, low, close, volume, ...], ...]
+    """
+    try:
+        klines = client.klines(symbol=symbol, interval=interval, limit=limit)
+        return klines
+    except Exception as e:
+        print(f"[KLINES ERR] {symbol} {interval}: {e}")
+        return None
+
+def get_high_low_since(symbol, since_ms, interval="1m"):
+    """v6.3: Belirli bir zamandan beri görülen MAX high ve MIN low'u döndür.
+    since_ms: milisaniye cinsinden timestamp
+    """
+    # Şu anki zamandan since_ms'e olan farkı dakikaya çevir
+    now_ms = int(time.time() * 1000)
+    minutes_passed = max(1, (now_ms - since_ms) // 60000 + 5)  # +5 buffer
+
+    # 1m bar için max 1500 limit, daha uzunsa 5m'ye geçelim
+    if minutes_passed > 1000:
+        interval = "5m"
+        limit = min(1500, max(50, minutes_passed // 5 + 5))
+    elif minutes_passed > 500:
+        interval = "5m"
+        limit = max(100, minutes_passed // 5 + 5)
+    else:
+        interval = "1m"
+        limit = max(50, minutes_passed)
+
+    klines = binance_get_klines(symbol, interval=interval, limit=int(limit))
+    if not klines:
+        return None, None
+
+    max_high = 0
+    min_low = float('inf')
+    for k in klines:
+        bar_time = int(k[0])
+        if bar_time < since_ms:
+            continue
+        high = float(k[2])
+        low = float(k[3])
+        if high > max_high:
+            max_high = high
+        if low < min_low:
+            min_low = low
+
+    if max_high == 0 or min_low == float('inf'):
+        return None, None
+    return max_high, min_low
+
 # ============ KAR HESAPLAMA ============
 def calc_tp1_kar(pos, tp1_px=None):
     giris = pos["giris"]
@@ -561,7 +613,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.2 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS} | TIMEOUT: {TIMEOUT_HOURS}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.3 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -1059,10 +1111,112 @@ async def check_timeouts():
             print(f"[TIMEOUT TASK ERR] {e}")
 
 
+# ============ HIGH/LOW TRACKER (v6.3) ============
+HIGH_LOW_CHECK_INTERVAL_SEC = 60  # Her 1 dakikada bir tarama
+
+def parse_zaman_to_ms(zaman_str):
+    """'2026-04-18 10:30' formatını TR saati varsayıp UTC ms'e çevir"""
+    try:
+        # zaman_full TR saati (UTC+3)
+        dt = datetime.strptime(zaman_str, "%Y-%m-%d %H:%M")
+        # TR saati → UTC
+        dt_utc = dt - timedelta(hours=3)
+        return int(dt_utc.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    except Exception:
+        return None
+
+async def update_position_highs_lows():
+    """
+    v6.3: Açık pozisyonlar için HH güncelle, kaçırılan sinyaller için max_seen/min_seen güncelle.
+    Klines API'den geçmiş bar verilerini çekerek browser bağımsız çalışır.
+    """
+    while True:
+        await asyncio.sleep(HIGH_LOW_CHECK_INTERVAL_SEC)
+        try:
+            updated_open = 0
+            updated_skipped = 0
+
+            # Açık pozisyonlar için
+            for ticker in list(data["open_positions"].keys()):
+                pos = data["open_positions"][ticker]
+                zaman_ms = parse_zaman_to_ms(pos.get("zaman_full", ""))
+                if not zaman_ms:
+                    continue
+
+                max_high, min_low = get_high_low_since(ticker, zaman_ms)
+                if max_high is None:
+                    continue
+
+                giris = pos["giris"]
+                if giris <= 0:
+                    continue
+
+                # HH% güncelle
+                hh_pct = (max_high - giris) / giris * 100.0
+                old_hh = pos.get("hh_pct", 0)
+                if hh_pct > old_hh:
+                    pos["hh_pct"] = round(hh_pct, 2)
+                    updated_open += 1
+
+                # max_seen ve min_seen kaydet (gerçek poz için, ekstra bilgi)
+                pos["max_seen"] = max_high
+                pos["min_seen"] = min_low
+
+            # Kaçırılan sinyaller için
+            if "skipped_signals" in data:
+                for s in data["skipped_signals"]:
+                    zaman_ms = parse_zaman_to_ms(s.get("zaman", ""))
+                    if not zaman_ms:
+                        continue
+
+                    ticker = s.get("ticker")
+                    if not ticker:
+                        continue
+
+                    max_high, min_low = get_high_low_since(ticker, zaman_ms)
+                    if max_high is None:
+                        continue
+
+                    # max_seen ve min_seen güncelle
+                    old_max = s.get("max_seen", 0)
+                    old_min = s.get("min_seen", float('inf'))
+
+                    if max_high > old_max:
+                        s["max_seen"] = max_high
+                        updated_skipped += 1
+                    if min_low < old_min:
+                        s["min_seen"] = min_low
+
+                    # Stateful TP/Stop tespiti
+                    tp1 = s.get("tp1", 0)
+                    tp2 = s.get("tp2", 0)
+                    stop = s.get("stop", 0)
+                    cur_max = s.get("max_seen", max_high)
+                    cur_min = s.get("min_seen", min_low)
+
+                    if not s.get("tp1_hit_seen") and tp1 > 0 and cur_max >= tp1:
+                        s["tp1_hit_seen"] = True
+                    if not s.get("tp2_hit_seen") and tp2 > 0 and cur_max >= tp2:
+                        s["tp2_hit_seen"] = True
+                    if not s.get("stop_hit_seen") and stop > 0 and cur_min <= stop:
+                        s["stop_hit_seen"] = True
+
+            if updated_open > 0 or updated_skipped > 0:
+                save_data(data)
+                if updated_open > 0:
+                    print(f"[HIGH-LOW] Açık poz güncellendi: {updated_open}")
+                if updated_skipped > 0:
+                    print(f"[HIGH-LOW] Kaçırılan güncellendi: {updated_skipped}")
+
+        except Exception as e:
+            print(f"[HIGH-LOW TASK ERR] {e}")
+
+
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(check_timeouts())
-    print(f"[BOOT] CAB Bot v6.2 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s | Check:{TIMEOUT_CHECK_INTERVAL_SEC}s")
+    asyncio.create_task(update_position_highs_lows())
+    print(f"[BOOT] CAB Bot v6.3 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s | Check:{TIMEOUT_CHECK_INTERVAL_SEC}s | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s")
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -1076,7 +1230,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.2 Dashboard</title>
+<title>CAB Bot v6.3 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box}}
@@ -1130,7 +1284,7 @@ small{{color:#9ca3af}}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.2 Dashboard</h1>
+<h1>🤖 CAB Bot v6.3 Dashboard</h1>
 <div>
   <span class="badge">{mod_badge}</span>
   <small style="color:#9ca3af">MAX:{MAX_POSITIONS} aktif | Timeout:{TIMEOUT_HOURS}s (akıllı: kâr→BE, zarar→kapat)</small>
@@ -1277,7 +1431,25 @@ let status='active',statusTxt='⏳ Aktif',statusColor='#fbbf24';
 let sanalKar=0;
 const posSize=s.marj*s.lev;
 
-if(px){{
+// v6.3: Önce backend flag'leri kontrol et (stateful — geri dönse bile işaretli kalır)
+const tp2HitSeen=s.tp2_hit_seen===true;
+const tp1HitSeen=s.tp1_hit_seen===true;
+const stopHitSeen=s.stop_hit_seen===true;
+const maxSeen=s.max_seen||null;
+
+if(tp2HitSeen){{
+status='tp2';statusTxt='★ TP2 Vurmuş!';statusColor='#14b8a6';
+const cur=px||maxSeen||tp2;
+sanalKar=posSize*0.5*((tp1-giris)/giris)+posSize*0.25*((tp2-giris)/giris)+posSize*0.25*((cur-giris)/giris);
+}}else if(tp1HitSeen){{
+status='tp1';statusTxt='✓ TP1 Vurmuş';statusColor='#84cc16';
+const cur=px||maxSeen||tp1;
+sanalKar=posSize*0.5*((tp1-giris)/giris)+posSize*0.5*((cur-giris)/giris);
+}}else if(stopHitSeen){{
+status='stop';statusTxt='✗ Stop Olmuş';statusColor='#f87171';
+sanalKar=posSize*((stop-giris)/giris);
+}}else if(px){{
+// Backend henüz işaretlemediyse anlık fiyatla kontrol (geçici)
 if(px<=stop){{status='stop';statusTxt='✗ Stop Olmuş';statusColor='#f87171';sanalKar=posSize*((stop-giris)/giris)}}
 else if(px>=tp2){{status='tp2';statusTxt='★ TP2 Vurmuş!';statusColor='#14b8a6';sanalKar=posSize*0.5*((tp1-giris)/giris)+posSize*0.25*((tp2-giris)/giris)+posSize*0.25*((px-giris)/giris)}}
 else if(px>=tp1){{status='tp1';statusTxt='✓ TP1 Vurmuş';statusColor='#84cc16';sanalKar=posSize*0.5*((tp1-giris)/giris)+posSize*0.5*((px-giris)/giris)}}
@@ -1285,7 +1457,7 @@ else{{sanalKar=posSize*((px-giris)/giris);if(sanalKar>0)statusTxt='📈 Kârda';
 }}
 const rr=stop>0?((tp1-giris)/(giris-stop)).toFixed(1):'—';
 const tp1kalan=px?((tp1-px)/px*100):null;
-return{{...s,px,status,statusTxt,statusColor,sanalKar:Math.round(sanalKar*100)/100,rr,tp1kalan}}}});
+return{{...s,px,status,statusTxt,statusColor,sanalKar:Math.round(sanalKar*100)/100,rr,tp1kalan,maxSeen}}}});
 
 if(filter==='tp')rows=rows.filter(r=>r.status==='tp1'||r.status==='tp2');
 else if(filter==='stop')rows=rows.filter(r=>r.status==='stop');
@@ -1429,7 +1601,7 @@ function closeModal(){{document.getElementById('analysisModal').classList.remove
 
 async function clearOld(){{if(!confirm('30 günden eski kapanan pozisyonları silmek istiyor musun?'))return;try{{const r=await fetch('/api/clear_old',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{days:30}})}});const j=await r.json();toast(`✓ ${{j.removed}} kayıt silindi`);loadData()}}catch(e){{toast('Hata',true)}}}}
 
-function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6.2',{{body:'TP1/TP2/STOP bildirimlerini alacaksın!'}})}}}})}}
+function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6.3',{{body:'TP1/TP2/STOP bildirimlerini alacaksın!'}})}}}})}}
 
 function detectChanges(){{
 for(const[t,p]of Object.entries(openPositions)){{const prev=lastOpenState[t];if(prev){{if(p.tp1_hit&&!prev.tp1_hit)notify('🎯 TP1 Vurdu!',t+' TP1 alındı +'+((p.tp1_kar||0).toFixed(1))+'$');if(p.tp2_hit&&!prev.tp2_hit)notify('🎯🎯 TP2!',t+' TP2 alındı!');if(p.timeout_be&&!prev.timeout_be)notify('⏰ Timeout-BE',t+' BE\\'ye çekildi (+'+(p.timeout_kar_initial||0).toFixed(1)+'$)')}}else if(Object.keys(lastOpenState).length>0)notify('🆕 Yeni Pozisyon',t+' açıldı')}}
