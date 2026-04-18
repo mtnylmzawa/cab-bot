@@ -219,14 +219,36 @@ def binance_get_position_qty(symbol):
     return 0
 
 def binance_close_position(symbol):
+    """v6.2: closePosition=true kullanarak lot rounding kalıntısı bırakmadan TAM kapatma"""
     qty = binance_get_position_qty(symbol)
-    if qty > 0:
+    if qty <= 0:
+        return {"success": True, "msg": "no position"}
+
+    binance_cancel_all(symbol)
+
+    try:
+        # closePosition=true → quantity yoksayılır, Binance pozisyonun TAMAMINI kapatır
+        # Lot rounding kalıntısı bırakmaz, "Partially Closed" anomalisi olmaz
+        result = client.new_order(
+            symbol=symbol, side="SELL", type="MARKET",
+            closePosition="true"
+        )
+        filled_qty = float(result.get("executedQty", 0))
+        avg_price = float(result.get("avgPrice", 0))
+        if avg_price == 0 and filled_qty > 0:
+            cum_quote = float(result.get("cumQuote", result.get("cumQty", 0)))
+            if cum_quote > 0:
+                avg_price = cum_quote / filled_qty
+        print(f"[BINANCE] CLOSE_POSITION {symbol} qty:{filled_qty} avgPx:{avg_price} ✓ (full close, no remainder)")
+        return {"success": True, "avg_price": avg_price, "filled_qty": filled_qty}
+    except ClientError as e:
+        # Fallback: closePosition başarısız olursa eski yöntemle dene
+        print(f"[BINANCE WARN] closePosition fail {symbol}: {e}, fallback market sell")
         info = get_symbol_info(symbol)
         qty = round_qty(qty, info)
         if qty > 0:
-            binance_cancel_all(symbol)
             return binance_market_sell(symbol, qty)
-    return {"success": True, "msg": "no position"}
+        return {"success": False, "error": str(e)}
 
 def binance_get_mark_price(symbol):
     """v6.1: Sembol için mark price çek (timeout kontrolü için)"""
@@ -539,7 +561,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.1 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS} | TIMEOUT: {TIMEOUT_HOURS}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.2 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS} | TIMEOUT: {TIMEOUT_HOURS}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -1040,7 +1062,7 @@ async def check_timeouts():
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(check_timeouts())
-    print(f"[BOOT] CAB Bot v6.1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s | Check:{TIMEOUT_CHECK_INTERVAL_SEC}s")
+    print(f"[BOOT] CAB Bot v6.2 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s | Check:{TIMEOUT_CHECK_INTERVAL_SEC}s")
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -1054,7 +1076,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.1 Dashboard</title>
+<title>CAB Bot v6.2 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box}}
@@ -1108,7 +1130,7 @@ small{{color:#9ca3af}}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.1 Dashboard</h1>
+<h1>🤖 CAB Bot v6.2 Dashboard</h1>
 <div>
   <span class="badge">{mod_badge}</span>
   <small style="color:#9ca3af">MAX:{MAX_POSITIONS} aktif | Timeout:{TIMEOUT_HOURS}s (akıllı: kâr→BE, zarar→kapat)</small>
@@ -1407,7 +1429,7 @@ function closeModal(){{document.getElementById('analysisModal').classList.remove
 
 async function clearOld(){{if(!confirm('30 günden eski kapanan pozisyonları silmek istiyor musun?'))return;try{{const r=await fetch('/api/clear_old',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{days:30}})}});const j=await r.json();toast(`✓ ${{j.removed}} kayıt silindi`);loadData()}}catch(e){{toast('Hata',true)}}}}
 
-function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6.1',{{body:'TP1/TP2/STOP bildirimlerini alacaksın!'}})}}}})}}
+function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6.2',{{body:'TP1/TP2/STOP bildirimlerini alacaksın!'}})}}}})}}
 
 function detectChanges(){{
 for(const[t,p]of Object.entries(openPositions)){{const prev=lastOpenState[t];if(prev){{if(p.tp1_hit&&!prev.tp1_hit)notify('🎯 TP1 Vurdu!',t+' TP1 alındı +'+((p.tp1_kar||0).toFixed(1))+'$');if(p.tp2_hit&&!prev.tp2_hit)notify('🎯🎯 TP2!',t+' TP2 alındı!');if(p.timeout_be&&!prev.timeout_be)notify('⏰ Timeout-BE',t+' BE\\'ye çekildi (+'+(p.timeout_kar_initial||0).toFixed(1)+'$)')}}else if(Object.keys(lastOpenState).length>0)notify('🆕 Yeni Pozisyon',t+' açıldı')}}
