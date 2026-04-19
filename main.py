@@ -22,7 +22,10 @@ client = UMFutures(
     base_url="https://fapi.binance.com"
 )
 
-INITIAL_DATA = {"open_positions": {}, "closed_positions": [], "skipped_signals": []}
+INITIAL_DATA = {
+    "open_positions": {}, "closed_positions": [], "skipped_signals": [],
+    "shadow_positions": {}, "shadow_closed": [], "shadow_skipped": []  # v6.5: RAM Shadow Mode
+}
 
 # ============ VERİ YÖNETİMİ ============
 def load_data():
@@ -46,6 +49,13 @@ data = load_data()
 # v6.1: Skipped_signals key'i eski verilerde olmayabilir, garanti et
 if "skipped_signals" not in data:
     data["skipped_signals"] = []
+# v6.5: Shadow Mode alanları
+if "shadow_positions" not in data:
+    data["shadow_positions"] = {}
+if "shadow_closed" not in data:
+    data["shadow_closed"] = []
+if "shadow_skipped" not in data:
+    data["shadow_skipped"] = []
     save_data(data)
 
 def now_tr():
@@ -549,6 +559,7 @@ def parse_giris(msg):
             "risk": float(kv.get("Risk", 0)),
             "kapat_oran": int(float(kv.get("Kapat", 60))),
             "atr_skor": float(kv.get("ATR", 100)) / 100.0,
+            "rs_spread": float(kv.get("RS", 0)),  # v6.5: RAM için göreceli güç spread
         }
     except Exception as e:
         print(f"[PARSE ERR GIRIS] {e}")
@@ -641,7 +652,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.4 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.5 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -776,18 +787,230 @@ async def api_clear_skipped():
         save_data(data)
     return {"status": "ok"}
 
+@app.post("/api/clear_shadow")
+async def api_clear_shadow():
+    """v6.5: Tüm RAM Shadow verilerini temizle"""
+    cleared = 0
+    if "shadow_positions" in data:
+        cleared += len(data["shadow_positions"])
+        data["shadow_positions"] = {}
+    if "shadow_closed" in data:
+        cleared += len(data["shadow_closed"])
+        data["shadow_closed"] = []
+    if "shadow_skipped" in data:
+        data["shadow_skipped"] = []
+    save_data(data)
+    print(f"[SHADOW] Temizlendi ({cleared} kayıt)")
+    return {"status": "ok", "cleared": cleared}
+
 @app.get("/api/timeout_check")
 async def manual_timeout_check():
     """v6.1: Manuel timeout taraması — debugging için"""
     result = await timeout_scan_once()
     return JSONResponse(result)
 
-# ============ WEBHOOK ============
+# ============ SHADOW MODE HANDLERS (v6.5 — RAM v14 için) ============
+# Shadow pozisyonlar: Binance'e emir göndermez, sadece sanal takip
+# Amaç: Yeni stratejileri canlı piyasada risksiz test etmek
+
+SHADOW_FEE_PCT = 0.1  # Taker fee (0.05 giriş + 0.05 çıkış = toplam 0.1%)
+SHADOW_SLIPPAGE_PCT = 0.05  # Yaklaşık slippage
+
+def shadow_calc_kar(marj, lev, giris, exit_px, oran_pct):
+    """Shadow pozisyon için kar/zarar hesapla (fee + slippage dahil)"""
+    if giris <= 0:
+        return 0.0
+    pos_size = marj * lev
+    kapatilan = pos_size * (oran_pct / 100.0)
+    ham_kar = kapatilan * (exit_px - giris) / giris
+    # Fee ve slippage düş
+    fee_cost = kapatilan * (SHADOW_FEE_PCT / 100.0)
+    slip_cost = kapatilan * (SHADOW_SLIPPAGE_PCT / 100.0)
+    net_kar = ham_kar - fee_cost - slip_cost
+    return round(net_kar, 2)
+
+def shadow_handle_giris(msg, system_tag):
+    """RAM v14 GIRIS mesajını işle — sanal pozisyon aç"""
+    parsed = parse_giris(msg)
+    if not parsed:
+        return {"status": "parse_error", "shadow": True}
+    print(f"[SHADOW PARSE] {parsed}")
+    ticker = parsed["ticker"]
+
+    if ticker in data["shadow_positions"]:
+        print(f"[SHADOW DUP] {ticker} zaten shadow'da açık")
+        return {"status": "duplicate", "shadow": True}
+
+    # Sanal pozisyon kaydı
+    data["shadow_positions"][ticker] = {
+        "ticker": ticker,
+        "system": system_tag,  # "RAM v14" etc
+        "giris": parsed["giris"],
+        "stop": parsed["stop"],
+        "tp1": parsed["tp1"],
+        "tp2": parsed["tp2"],
+        "marj": parsed["marj"],
+        "lev": parsed["lev"],
+        "risk": parsed["risk"],
+        "kapat_oran": parsed["kapat_oran"],
+        "atr_skor": parsed["atr_skor"],
+        "rs_spread": parsed.get("rs_spread", 0),
+        "zaman": now_tr(),
+        "zaman_full": now_tr(),
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "hh_pct": 0,
+        "max_seen": 0,
+        "min_seen": 0,
+        "current_stop": parsed["stop"],
+        "tp1_kar": 0,
+        "tp2_kar": 0,
+    }
+    save_data(data)
+    print(f"[SHADOW GIRIS] {system_tag} | {ticker} @ {parsed['giris']} | Stop:{parsed['stop']} TP1:{parsed['tp1']} TP2:{parsed['tp2']} | Marj:{parsed['marj']}$ Lev:{parsed['lev']}x")
+    return {"status": "shadow_opened", "shadow": True, "ticker": ticker}
+
+def shadow_handle_tp1(msg, system_tag):
+    """RAM v14 TP1 mesajını işle — sanal kısmi kapama + stop BE"""
+    parsed = parse_tp1(msg)
+    if not parsed:
+        return {"status": "parse_error", "shadow": True}
+    ticker = parsed["ticker"]
+
+    if ticker not in data["shadow_positions"]:
+        print(f"[SHADOW] TP1 geldi ama {ticker} shadow'da yok")
+        return {"status": "not_found", "shadow": True}
+
+    pos = data["shadow_positions"][ticker]
+    if pos.get("tp1_hit"):
+        print(f"[SHADOW] TP1 duplicate {ticker}")
+        return {"status": "tp1_duplicate", "shadow": True}
+
+    tp1_px = parsed.get("tp1") or pos["tp1"]
+    yeni_stop = parsed.get("stop") or pos["giris"]  # Genelde BE = giris
+    kapat_oran = parsed.get("kapat_oran", pos.get("kapat_oran", 50))
+
+    # Sanal kar hesapla
+    tp1_kar = shadow_calc_kar(pos["marj"], pos["lev"], pos["giris"], tp1_px, kapat_oran)
+    pos["tp1_hit"] = True
+    pos["tp1_kar"] = tp1_kar
+    pos["current_stop"] = yeni_stop
+    pos["tp1_time"] = now_tr()
+
+    save_data(data)
+    print(f"[SHADOW TP1] {system_tag} | {ticker} @ {tp1_px} | %{kapat_oran} kapat → +{tp1_kar}$ | Stop→{yeni_stop}")
+    return {"status": "shadow_tp1", "shadow": True, "kar": tp1_kar}
+
+def shadow_handle_tp2(msg, system_tag):
+    """RAM v14 TP2 mesajını işle — sanal kısmi kapama"""
+    parsed = parse_tp2(msg)
+    if not parsed:
+        return {"status": "parse_error", "shadow": True}
+    ticker = parsed["ticker"]
+
+    if ticker not in data["shadow_positions"]:
+        print(f"[SHADOW] TP2 geldi ama {ticker} shadow'da yok")
+        return {"status": "not_found", "shadow": True}
+
+    pos = data["shadow_positions"][ticker]
+    if pos.get("tp2_hit"):
+        print(f"[SHADOW] TP2 duplicate {ticker}")
+        return {"status": "tp2_duplicate", "shadow": True}
+
+    tp2_px = parsed.get("tp2") or pos["tp2"]
+    kapat_oran = parsed.get("kapat_oran", 25)
+
+    tp2_kar = shadow_calc_kar(pos["marj"], pos["lev"], pos["giris"], tp2_px, kapat_oran)
+    pos["tp2_hit"] = True
+    pos["tp2_kar"] = tp2_kar
+    pos["current_stop"] = pos["tp1"]  # RAM v14 mantığı: TP2 sonrası stop→TP1 seviyesine
+    pos["tp2_time"] = now_tr()
+
+    save_data(data)
+    print(f"[SHADOW TP2] {system_tag} | {ticker} @ {tp2_px} | %{kapat_oran} kapat → +{tp2_kar}$ | Stop→{pos['tp1']}")
+    return {"status": "shadow_tp2", "shadow": True, "kar": tp2_kar}
+
+def shadow_handle_stop_or_trail(msg, system_tag, kind="STOP"):
+    """RAM v14 STOP/TRAIL mesajını işle — sanal tam kapama"""
+    # STOP ve TRAIL aynı mantık: kalan pozisyonu kapat
+    try:
+        parts = [p.strip() for p in msg.split("|")]
+        ticker = parts[1].strip()
+    except Exception as e:
+        print(f"[SHADOW PARSE ERR {kind}] {e}")
+        return {"status": "parse_error", "shadow": True}
+
+    if ticker not in data["shadow_positions"]:
+        print(f"[SHADOW] {kind} geldi ama {ticker} shadow'da yok")
+        return {"status": "not_found", "shadow": True}
+
+    pos = data["shadow_positions"][ticker]
+    # Kapanış fiyatı: current_stop (TP1/TP2 sonrası BE/TP1'e çekilmiş olabilir)
+    exit_px = pos.get("current_stop", pos["stop"])
+
+    # Kalan pozisyon oranı
+    kapat_oran = 100
+    if pos.get("tp2_hit"):
+        kapat_oran = 100 - pos.get("kapat_oran", 50) - 25  # tp1 sonra tp2 sonra kalan
+    elif pos.get("tp1_hit"):
+        kapat_oran = 100 - pos.get("kapat_oran", 50)
+    # Tp hiç vurmamışsa 100 (tamamını kapat)
+
+    # Kalan pozisyonun kar/zararı (fee+slippage dahil)
+    remaining_kar = shadow_calc_kar(pos["marj"], pos["lev"], pos["giris"], exit_px, kapat_oran)
+
+    # Toplam kar: tp1 + tp2 + kalan
+    total_kar = round(pos.get("tp1_kar", 0) + pos.get("tp2_kar", 0) + remaining_kar, 2)
+
+    # Sonuç tag (TP2 sonrası stop = trailing kapama mantığında)
+    if pos.get("tp2_hit"):
+        sonuc = "TP1+TP2+Trail"
+        kind = "TRAIL"  # otomatik düzelt — TP2 sonrası stop = trailing
+    elif pos.get("tp1_hit"):
+        sonuc = "TP1+" + ("Trail" if kind == "TRAIL" else "Stop")
+    else:
+        sonuc = kind
+
+    closed_rec = {
+        **pos,
+        "sonuc": sonuc,
+        "kar": total_kar,
+        "trail_kar": remaining_kar,
+        "exit_px": exit_px,
+        "kapanis": now_tr(),
+        "kind": kind,
+    }
+    data["shadow_closed"].append(closed_rec)
+    del data["shadow_positions"][ticker]
+
+    # Rolling limit — son 200 kapalı shadow pozisyon
+    if len(data["shadow_closed"]) > 200:
+        data["shadow_closed"] = data["shadow_closed"][-200:]
+
+    save_data(data)
+    print(f"[SHADOW {kind}] {system_tag} | {ticker} | {sonuc} | Toplam:{total_kar}$ (tp1:{pos.get('tp1_kar',0)} tp2:{pos.get('tp2_kar',0)} kalan:{remaining_kar})")
+    return {"status": "shadow_closed", "shadow": True, "kar": total_kar, "sonuc": sonuc}
+
+
+
 @app.post("/webhook")
 async def webhook(req: Request):
     msg = (await req.body()).decode()
     print(f"[ALERT] {msg}")
     mode_tag = "[CANLI]" if not TEST_MODE else "[TEST]"
+
+    # === v6.5: RAM v14 SHADOW MODE ===
+    # RAM v14 mesajları Binance'e gitmez, sadece sanal takip
+    if msg.startswith("RAM v14 |"):
+        return shadow_handle_giris(msg, "RAM v14")
+    if msg.startswith("RAM v14 TP1 |"):
+        return shadow_handle_tp1(msg, "RAM v14")
+    if msg.startswith("RAM v14 TP2 |"):
+        return shadow_handle_tp2(msg, "RAM v14")
+    if msg.startswith("RAM v14 STOP |"):
+        # TP2 sonrası stop'sa kind=TRAIL olarak işaretle (handler içinde algılanır)
+        # Diğer durumlarda STOP olarak işle
+        return shadow_handle_stop_or_trail(msg, "RAM v14", "STOP")
 
     # === GIRIS ===
     if msg.startswith("CAB v13 |"):
@@ -1245,12 +1468,42 @@ async def update_position_highs_lows():
                     if not s.get("stop_hit_seen") and stop > 0 and cur_min <= stop:
                         s["stop_hit_seen"] = True
 
-            if updated_open > 0 or updated_skipped > 0:
+            # v6.5: SHADOW POZİSYONLARI için HH ve otomatik TP/Stop tespiti
+            # (Pine alert göndermezse bile high/low'a bakıp durum güncelle)
+            shadow_updated = 0
+            if "shadow_positions" in data:
+                for ticker in list(data["shadow_positions"].keys()):
+                    sp = data["shadow_positions"][ticker]
+                    zaman_ms = parse_zaman_to_ms(sp.get("zaman_full", ""))
+                    if not zaman_ms:
+                        continue
+
+                    max_high, min_low = get_high_low_since(ticker, zaman_ms)
+                    if max_high is None:
+                        continue
+
+                    giris = sp.get("giris", 0)
+                    if giris <= 0:
+                        continue
+
+                    # HH% güncelle
+                    hh_pct = (max_high - giris) / giris * 100.0
+                    old_hh = sp.get("hh_pct", 0)
+                    if hh_pct > old_hh:
+                        sp["hh_pct"] = round(hh_pct, 2)
+                        shadow_updated += 1
+
+                    sp["max_seen"] = max_high
+                    sp["min_seen"] = min_low
+
+            if updated_open > 0 or updated_skipped > 0 or shadow_updated > 0:
                 save_data(data)
                 if updated_open > 0:
                     print(f"[HIGH-LOW] Açık poz güncellendi: {updated_open}")
                 if updated_skipped > 0:
                     print(f"[HIGH-LOW] Kaçırılan güncellendi: {updated_skipped}")
+                if shadow_updated > 0:
+                    print(f"[HIGH-LOW] Shadow poz güncellendi: {shadow_updated}")
 
         except Exception as e:
             print(f"[HIGH-LOW TASK ERR] {e}")
@@ -1260,7 +1513,7 @@ async def update_position_highs_lows():
 async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
-    print(f"[BOOT] CAB Bot v6.4 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s")
+    print(f"[BOOT] CAB Bot v6.5 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -1274,7 +1527,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.4 Dashboard</title>
+<title>CAB Bot v6.5 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box}}
@@ -1328,7 +1581,7 @@ small{{color:#9ca3af}}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.4 Dashboard</h1>
+<h1>🤖 CAB Bot v6.5 Dashboard</h1>
 <div>
   <span class="badge">{mod_badge}</span>
   <small style="color:#9ca3af">MAX:{MAX_POSITIONS} aktif | Timeout:{TIMEOUT_HOURS}s→{TIMEOUT_ABSOLUTE_HOURS}s (koşullu: aktif≥{TIMEOUT_PRESSURE_THRESHOLD} ise akıllı kapama)</small>
@@ -1415,6 +1668,33 @@ small{{color:#9ca3af}}
   </div>
 </div>
 
+<!-- v6.5: RAM SHADOW MODE -->
+<div class="section" id="shadowSection">
+  <div class="section-head">
+    <h2>🌓 RAM v14 Shadow <small id="shadowCount" style="color:#fb923c"></small></h2>
+    <div class="toolbar">
+      <button class="btn" onclick="switchShadowTab('open')" id="shadowTabOpen">Açık</button>
+      <button class="btn" onclick="switchShadowTab('closed')" id="shadowTabClosed">Kapanan</button>
+      <button class="btn btn-danger" onclick="clearShadow()">🗑 Temizle</button>
+    </div>
+  </div>
+  <div class="ozet" id="shadowOzet" style="background:#431407;border-left:3px solid #fb923c"></div>
+  <div id="shadowOpenView" style="overflow-x:auto;">
+    <table id="shadowOpenTable"><thead><tr>
+      <th>Coin</th><th>Giriş</th><th>Şu An</th><th>HH%</th>
+      <th>Stop</th><th>TP1 / TP2</th><th>Durum</th>
+      <th>Sanal Kar</th><th>RS%</th><th>Zaman</th>
+    </tr></thead><tbody id="shadowOpenBody"><tr><td colspan="10" style="text-align:center;color:#9ca3af">Henüz RAM sinyali gelmedi</td></tr></tbody></table>
+  </div>
+  <div id="shadowClosedView" style="overflow-x:auto;display:none">
+    <table id="shadowClosedTable"><thead><tr>
+      <th>Coin</th><th>Sonuç</th><th>Giriş</th><th>Çıkış</th>
+      <th>Sanal Kar</th><th>TP1$ / TP2$ / Trail$</th>
+      <th>RS%</th><th>Açılış</th><th>Kapanış</th>
+    </tr></thead><tbody id="shadowClosedBody"><tr><td colspan="9" style="text-align:center;color:#9ca3af">Henüz kapalı shadow pozisyonu yok</td></tr></tbody></table>
+  </div>
+</div>
+
 <div class="modal-overlay" id="analysisModal" onclick="if(event.target.id=='analysisModal')closeModal()">
   <div class="modal">
     <div class="modal-head"><h2>📊 Performans Analizi</h2><button class="modal-close" onclick="closeModal()">×</button></div>
@@ -1427,15 +1707,16 @@ small{{color:#9ca3af}}
 <script>
 const MODE="{mod_text}",MC="{mod_color}";
 let openPositions={{}},closedPositions=[],skippedSignals=[],openPrices={{}},lastOpenState={{}};
+let shadowPositions={{}},shadowClosed=[],shadowPrices={{}};let shadowTab='open';
 let sortState={{open:{{col:null,dir:'asc'}},closed:{{col:'kapanis',dir:'desc'}}}};
 
-async function loadData(){{try{{const r=await fetch('/api/data');const d=await r.json();openPositions=d.open_positions||{{}};closedPositions=d.closed_positions||[];skippedSignals=d.skipped_signals||[];renderAll();detectChanges()}}catch(e){{console.error(e)}}}}
+async function loadData(){{try{{const r=await fetch('/api/data');const d=await r.json();openPositions=d.open_positions||{{}};closedPositions=d.closed_positions||[];skippedSignals=d.skipped_signals||[];shadowPositions=d.shadow_positions||{{}};shadowClosed=d.shadow_closed||[];renderAll();detectChanges()}}catch(e){{console.error(e)}}}}
 
 async function fp(sym){{try{{const r=await fetch('https://fapi.binance.com/fapi/v1/ticker/price?symbol='+sym);if(!r.ok)return null;return parseFloat((await r.json()).price)}}catch(e){{return null}}}}
 
 let skippedUpdateCounter=0;
 async function updatePrices(){{for(const sym of Object.keys(openPositions)){{const px=await fp(sym);if(px===null)continue;openPrices[sym]=px;try{{await fetch('/update_hh',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ticker:sym,price:px}})}})}}catch(e){{}}}}renderOpen();
-if(skippedUpdateCounter===0||skippedUpdateCounter%6===0){{if(skippedSignals.length>0)updateSkippedPrices()}}
+if(skippedUpdateCounter===0||skippedUpdateCounter%6===0){{if(skippedSignals.length>0)updateSkippedPrices();if(Object.keys(shadowPositions).length>0)updateShadowPrices()}}
 skippedUpdateCounter++;
 document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8);setTimeout(updatePrices,5000)}}
 
@@ -1454,7 +1735,7 @@ if(j.actioned_count>0){{const summary=j.actioned.map(a=>`${{a.ticker}}: ${{a.act
 else{{toast(`✓ Tarandı: ${{j.scanned}} poz, hiçbiri timeout aşmadı`)}}
 }}catch(e){{toast('Hata: '+e.message,true)}}}}
 
-function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();checkWarnings()}}
+function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();renderShadow();checkWarnings()}}
 
 let skippedPrices={{}};
 async function updateSkippedPrices(){{
@@ -1540,6 +1821,52 @@ return`<tr style="${{rowBg}}">
 </tr>`}}).join('')}}
 
 async function clearSkipped(){{if(!confirm('Kaçırılan sinyal kayıtlarını temizlemek istiyor musun?'))return;try{{await fetch('/api/clear_skipped',{{method:'POST'}});skippedSignals=[];skippedPrices={{}};renderSkipped();toast('✓ Temizlendi')}}catch(e){{toast('Hata',true)}}}}
+
+// === v6.5: SHADOW MODE FONKSIYONLARI ===
+function switchShadowTab(tab){{shadowTab=tab;document.getElementById('shadowTabOpen').style.background=tab==='open'?'#ea580c':'#1e40af';document.getElementById('shadowTabClosed').style.background=tab==='closed'?'#ea580c':'#1e40af';document.getElementById('shadowOpenView').style.display=tab==='open'?'block':'none';document.getElementById('shadowClosedView').style.display=tab==='closed'?'block':'none';renderShadow()}}
+
+async function clearShadow(){{if(!confirm('TÜM Shadow (RAM v14) kayıtlarını temizlemek istiyor musun? Açık sanal pozlar dahil!'))return;try{{await fetch('/api/clear_shadow',{{method:'POST'}});shadowPositions={{}};shadowClosed=[];shadowPrices={{}};renderShadow();toast('✓ Shadow temizlendi')}}catch(e){{toast('Hata',true)}}}}
+
+async function updateShadowPrices(){{const tickers=Object.keys(shadowPositions);if(tickers.length===0)return;const promises=tickers.map(async sym=>{{const px=await fp(sym);if(px!==null)shadowPrices[sym]=px;return{{sym,px}}}});await Promise.all(promises);renderShadow()}}
+
+function renderShadow(){{
+const openCount=Object.keys(shadowPositions).length;
+const closedCount=shadowClosed.length;
+document.getElementById('shadowCount').textContent=`(${{openCount}} açık / ${{closedCount}} kapalı)`;
+
+// Özet
+let totalSanalKar=0;let tp1Count=0;let tp2Count=0;let stopCount=0;let trailCount=0;
+shadowClosed.forEach(c=>{{totalSanalKar+=parseFloat(c.kar||0);if(c.sonuc&&c.sonuc.includes('TP2'))tp2Count++;else if(c.sonuc&&c.sonuc.includes('TP1'))tp1Count++;else if(c.sonuc==='STOP')stopCount++;if(c.kind==='TRAIL')trailCount++}});
+let openSanalKar=0;
+Object.entries(shadowPositions).forEach(([sym,p])=>{{const px=shadowPrices[sym];if(px&&p.giris){{const posSize=p.marj*p.lev;const ham=posSize*((px-p.giris)/p.giris);openSanalKar+=ham}}}});
+const karColor=totalSanalKar>=0?'#4ade80':'#f87171';
+const openColor=openSanalKar>=0?'#4ade80':'#f87171';
+document.getElementById('shadowOzet').innerHTML=`<b>Açık Sanal Kar:</b> <span style="color:${{openColor}}">${{openSanalKar>=0?'+':''}}${{openSanalKar.toFixed(1)}}$</span> | <b>Kapanan Toplam:</b> <span style="color:${{karColor}}">${{totalSanalKar>=0?'+':''}}${{totalSanalKar.toFixed(1)}}$</span> | TP1:${{tp1Count}} TP2:${{tp2Count}} Stop:${{stopCount}} Trail:${{trailCount}}`;
+
+if(shadowTab==='open'){{
+const tb=document.getElementById('shadowOpenBody');
+if(openCount===0){{tb.innerHTML='<tr><td colspan="10" style="text-align:center;color:#9ca3af">Henüz RAM sinyali gelmedi (Pine\\'da alarm kurulmuş mu?)</td></tr>';return}}
+const rows=Object.entries(shadowPositions).map(([sym,p])=>{{
+const px=shadowPrices[sym]||p.max_seen||p.giris;
+const giris=p.giris;
+const posSize=p.marj*p.lev;
+let durum='⏳ Aktif';let durumColor='#fbbf24';
+if(p.tp2_hit){{durum='★ TP2 Vurmuş';durumColor='#14b8a6'}}else if(p.tp1_hit){{durum='✓ TP1 Vurmuş';durumColor='#84cc16'}}
+const sanalKar=p.tp1_hit||p.tp2_hit?(p.tp1_kar||0)+(p.tp2_kar||0)+posSize*(1-((p.kapat_oran||50)/100)-(p.tp2_hit?0.25:0))*((px-giris)/giris):posSize*((px-giris)/giris);
+const stopShow=p.current_stop||p.stop;
+return{{sym,giris,px,hh:p.hh_pct||0,stop:stopShow,tp1:p.tp1,tp2:p.tp2,durum,durumColor,sanalKar:Math.round(sanalKar*100)/100,rs:p.rs_spread||0,zaman:p.zaman||'-'}};
+}});
+tb.innerHTML=rows.map(r=>`<tr><td><b>${{r.sym}}</b> <a href="https://www.tradingview.com/chart/?symbol=BINANCE:${{r.sym}}.P" target="_blank" style="color:#60a5fa;text-decoration:none">🔗</a></td><td>${{r.giris}}</td><td>${{r.px}}</td><td style="color:${{r.hh>0?'#4ade80':'#9ca3af'}}">${{r.hh.toFixed(2)}}%</td><td style="color:#f87171">${{r.stop}}</td><td>${{r.tp1}} / ${{r.tp2}}</td><td style="color:${{r.durumColor}}">${{r.durum}}</td><td style="color:${{r.sanalKar>=0?'#4ade80':'#f87171'}}"><b>${{r.sanalKar>=0?'+':''}}${{r.sanalKar.toFixed(1)}}$</b></td><td style="color:#fb923c">${{r.rs.toFixed(1)}}%</td><td style="font-size:11px;color:#9ca3af">${{r.zaman}}</td></tr>`).join('')}}else{{
+const tb=document.getElementById('shadowClosedBody');
+if(closedCount===0){{tb.innerHTML='<tr><td colspan="9" style="text-align:center;color:#9ca3af">Henüz kapalı shadow pozisyonu yok</td></tr>';return}}
+const sorted=[...shadowClosed].reverse();
+tb.innerHTML=sorted.map(c=>{{
+const karColor=c.kar>=0?'#4ade80':'#f87171';
+let sonucColor='#fbbf24';
+if(c.sonuc&&c.sonuc.includes('TP2'))sonucColor='#14b8a6';else if(c.sonuc&&c.sonuc.includes('TP1'))sonucColor='#84cc16';else if(c.sonuc==='STOP')sonucColor='#f87171';
+return`<tr><td><b>${{c.ticker}}</b></td><td style="color:${{sonucColor}}">${{c.sonuc||'-'}}</td><td>${{c.giris}}</td><td>${{c.exit_px||'-'}}</td><td style="color:${{karColor}}"><b>${{c.kar>=0?'+':''}}${{c.kar}}$</b></td><td style="font-size:11px">${{c.tp1_kar||0}} / ${{c.tp2_kar||0}} / ${{c.trail_kar||0}}</td><td style="color:#fb923c">${{(c.rs_spread||0).toFixed(1)}}%</td><td style="font-size:11px;color:#9ca3af">${{c.zaman||'-'}}</td><td style="font-size:11px;color:#9ca3af">${{c.kapanis||'-'}}</td></tr>`;
+}}).join('')}}
+}}
 
 function renderStats(){{
 const tk=closedPositions.reduce((s,c)=>s+c.kar,0),ts=closedPositions.length,ws=closedPositions.filter(c=>c.kar>0).length,wr=ts>0?(ws/ts*100).toFixed(1):0;
@@ -1645,7 +1972,7 @@ function closeModal(){{document.getElementById('analysisModal').classList.remove
 
 async function clearOld(){{if(!confirm('30 günden eski kapanan pozisyonları silmek istiyor musun?'))return;try{{const r=await fetch('/api/clear_old',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{days:30}})}});const j=await r.json();toast(`✓ ${{j.removed}} kayıt silindi`);loadData()}}catch(e){{toast('Hata',true)}}}}
 
-function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6.4',{{body:'TP1/TP2/STOP bildirimlerini alacaksın!'}})}}}})}}
+function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6.5',{{body:'TP1/TP2/STOP bildirimlerini alacaksın!'}})}}}})}}
 
 function detectChanges(){{
 for(const[t,p]of Object.entries(openPositions)){{const prev=lastOpenState[t];if(prev){{if(p.tp1_hit&&!prev.tp1_hit)notify('🎯 TP1 Vurdu!',t+' TP1 alındı +'+((p.tp1_kar||0).toFixed(1))+'$');if(p.tp2_hit&&!prev.tp2_hit)notify('🎯🎯 TP2!',t+' TP2 alındı!');if(p.timeout_be&&!prev.timeout_be)notify('⏰ Timeout-BE',t+' BE\\'ye çekildi (+'+(p.timeout_kar_initial||0).toFixed(1)+'$)')}}else if(Object.keys(lastOpenState).length>0)notify('🆕 Yeni Pozisyon',t+' açıldı')}}
