@@ -1032,11 +1032,13 @@ async def migrate_old_pnl(req: Request):
     dry_run = body.get("dry_run", True)
     days = int(body.get("days", 30))
 
-    results = {"migrated": [], "skipped": [], "failed": [], "dry_run": dry_run, "method": "bulk"}
+    results = {"migrated": [], "skipped": [], "failed": [], "dry_run": dry_run, "method": "bulk", "closed_total": 0, "debug": []}
     closed_positions = data.get("closed_positions", [])
+    results["closed_total"] = len(closed_positions)
+    results["debug"].append(f"closed_positions sayısı: {len(closed_positions)}")
 
     if not closed_positions:
-        return JSONResponse({**results, "msg": "Kapanan pozisyon yok"})
+        return JSONResponse({**results, "msg": "Kapanan pozisyon yok (data.closed_positions boş!)"})
 
     # === 1) TEK İSTEKTE tüm hesabın income_history'sini çek ===
     start_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
@@ -1067,6 +1069,9 @@ async def migrate_old_pnl(req: Request):
             last_ms = int(page[-1].get("time", last_ms)) + 1
 
         print(f"[MIGRATE] Toplu çekim: {len(all_pnl)} PNL + {len(all_fees)} fee kaydı")
+        results["debug"].append(f"Binance'ten çekilen: {len(all_pnl)} REALIZED_PNL, {len(all_fees)} COMMISSION")
+        if len(all_pnl) == 0:
+            results["debug"].append("⚠️ Binance'te son 30 gün hiç realized PNL yok! (API key Futures trades izni?)")
     except Exception as e:
         return JSONResponse({**results, "msg": f"Binance income history çekilemedi: {e}", "error": str(e)})
 
@@ -2428,13 +2433,15 @@ async function migratePnl(){{
     const mig=j.migrated||[],skp=j.skipped||[],fail=j.failed||[];
     console.log('[MIGRATE-DRY]',j);
     let dbg='📊 Deneme Sonucu — Detaylı\\n\\n';
+    if(j.closed_total!==undefined)dbg+='Kapanan poz (veritabanında): '+j.closed_total+'\\n';
+    if(j.debug&&j.debug.length)dbg+='Debug:\\n'+j.debug.map(x=>'  • '+x).join('\\n')+'\\n\\n';
     dbg+='✓ Güncellenebilir: '+mig.length+'\\n';
     dbg+='⏭ Atlanan: '+skp.length+'\\n';
     dbg+='❌ Başarısız: '+fail.length+'\\n\\n';
     if(skp.length>0){{dbg+='Atlanma sebepleri (ilk 5):\\n';skp.slice(0,5).forEach(s=>{{dbg+='  '+s.ticker+': '+s.reason+'\\n'}});dbg+='\\n'}}
     if(fail.length>0){{dbg+='❌ Hatalar (ilk 5):\\n';fail.slice(0,5).forEach(f=>{{dbg+='  '+f.ticker+': '+f.reason+'\\n'}});dbg+='\\n'}}
     if(mig.length===0){{
-      dbg+='⚠ Hiçbir poz güncellenemedi.\\n\\nMuhtemel nedenler:\\n• API key Futures income izni yok\\n• Zaman parse hatası\\n• Binance IP kısıtı\\n\\nRailway log: [BINANCE ERR] get_income';
+      dbg+='⚠ Hiçbir poz güncellenemedi.\\n\\nMuhtemel nedenler:\\n• API key Futures income izni yok\\n• Zaman parse hatası\\n• Binance IP kısıtı\\n\\nRailway log: [MIGRATE] satırlarına bak';
       alert(dbg);return;
     }}
     dbg+='Güncellenecek (ilk 5):\\n';
