@@ -848,6 +848,127 @@ async def manual_timeout_check():
     return JSONResponse(result)
 
 
+@app.get("/api/binance_test_income")
+async def test_binance_income():
+    """
+    v6.6 Lite Patch: Binance API income izni test endpointi.
+    Son 24 saatteki realized PNL'leri çekmeye çalışır.
+    Migrate çalışmıyorsa önce buna bak.
+    """
+    result = {"status": "checking", "now_tr": now_tr()}
+    try:
+        start_ms = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp() * 1000)
+        incomes = client.get_income(incomeType="REALIZED_PNL", startTime=start_ms, limit=20)
+        result["api_ok"] = True
+        result["count"] = len(incomes) if incomes else 0
+        result["sample"] = incomes[:3] if incomes else []
+        result["msg"] = f"✓ API çalışıyor, son 24 saat {result['count']} kayıt bulundu"
+    except Exception as e:
+        result["api_ok"] = False
+        result["error"] = str(e)
+        result["msg"] = f"❌ Hata: {e}"
+        result["hint"] = "API key'de 'Enable Futures' iznini kontrol et. Income history için ek izin gerekmez ama IP whitelist olabilir."
+    return JSONResponse(result)
+
+
+@app.post("/api/force_reopen")
+async def force_reopen_position(req: Request):
+    """
+    v6.6 Lite Patch: Dashboard'da yanlışlıkla kapalı gözüken ama Binance'te hala açık olan pozu
+    geri açık listesine al. FLUXUSDT state divergence örneğinde kullanılır.
+    Body: {"ticker": "FLUXUSDT"}
+    """
+    body = {}
+    try:
+        body = await req.json()
+    except Exception:
+        pass
+    ticker = (body.get("ticker") or "").upper()
+    if not ticker:
+        return JSONResponse({"success": False, "error": "ticker boş"})
+
+    # Binance'te gerçekten açık mı kontrol et
+    try:
+        positions = client.get_position_risk(symbol=ticker)
+        binance_open = False
+        binance_qty = 0
+        binance_entry = 0
+        for p in positions:
+            if p["symbol"] == ticker:
+                amt = float(p.get("positionAmt", 0))
+                if abs(amt) > 0:
+                    binance_open = True
+                    binance_qty = abs(amt)
+                    binance_entry = float(p.get("entryPrice", 0))
+                    break
+    except Exception as e:
+        return JSONResponse({"success": False, "error": f"Binance kontrol hatası: {e}"})
+
+    if not binance_open:
+        return JSONResponse({"success": False, "error": f"{ticker} Binance'te zaten kapalı, işlem yapılmadı"})
+
+    # Dashboard'da açıksa bir şey yapma
+    if ticker in data.get("open_positions", {}):
+        return JSONResponse({"success": False, "error": f"{ticker} dashboard'da zaten açık"})
+
+    # Kapanan listesinde bul — en yenisini al, open_positions'a taşı
+    found_closed = None
+    for idx in range(len(data.get("closed_positions", [])) - 1, -1, -1):
+        if data["closed_positions"][idx].get("ticker") == ticker:
+            found_closed = data["closed_positions"][idx]
+            break
+
+    if not found_closed:
+        # Kapanan listesinde de yok, minimal bilgiyle yeni kayıt oluştur
+        reopened = {
+            "giris": binance_entry,
+            "stop": 0, "tp1": 0, "tp2": 0,
+            "marj": 100, "lev": 10, "risk": 5, "kapat_oran": 60, "atr_skor": 1.0,
+            "durum": "♻️ Reopen", "hh_pct": 0.0,
+            "tp1_hit": False, "tp2_hit": False, "timeout_be": False,
+            "tp1_kar": 0.0, "tp2_kar": 0.0, "qty": binance_qty,
+            "zaman": now_tr_short(), "zaman_full": now_tr(),
+            "reopened_manual": True,
+        }
+    else:
+        # Eski bilgilerle yeniden aç
+        reopened = {
+            "giris": found_closed.get("giris", binance_entry),
+            "stop": found_closed.get("stop_saved", 0),
+            "tp1": found_closed.get("tp1_saved", 0),
+            "tp2": found_closed.get("tp2_saved", 0),
+            "marj": found_closed.get("marj", 100),
+            "lev": found_closed.get("lev", 10),
+            "risk": 5,
+            "kapat_oran": found_closed.get("kapat_oran", 60),
+            "atr_skor": found_closed.get("atr_skor", 1.0),
+            "durum": "♻️ Reopen",
+            "hh_pct": found_closed.get("hh_pct", 0),
+            "tp1_hit": found_closed.get("tp1_kar_added", False),
+            "tp2_hit": found_closed.get("tp2_kar_added", False),
+            "timeout_be": False,
+            "tp1_kar": found_closed.get("tp1_kar", 0),
+            "tp2_kar": found_closed.get("tp2_kar", 0),
+            "qty": binance_qty,
+            "zaman": found_closed.get("acilis", now_tr())[-5:] if found_closed.get("acilis") else now_tr_short(),
+            "zaman_full": found_closed.get("acilis", now_tr()),
+            "reopened_manual": True,
+        }
+        # Kapanan listesinden sil
+        data["closed_positions"].remove(found_closed)
+
+    data["open_positions"][ticker] = reopened
+    save_data(data)
+    print(f"[FORCE-REOPEN] {ticker} tekrar açık listesine alındı (qty:{binance_qty}, entry:{binance_entry})")
+    return JSONResponse({
+        "success": True,
+        "ticker": ticker,
+        "binance_qty": binance_qty,
+        "binance_entry": binance_entry,
+        "restored_from_closed": found_closed is not None
+    })
+
+
 @app.post("/api/migrate_pnl")
 async def migrate_old_pnl(req: Request):
     """
@@ -1767,6 +1888,31 @@ small{{color:#9ca3af}}
   </button>
 </div>
 
+<!-- v6.6 Lite Patch: CAB vs RAM YAN YANA KARŞILAŞTIRMA -->
+<div id="compareBox" style="display:none;background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #475569;border-radius:8px;padding:12px 16px;margin-bottom:14px;font-size:12px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <b style="color:#a78bfa;font-size:13px">⚖️ CAB (Canlı) vs RAM (Shadow) — Karşılaştırma</b>
+    <small style="color:#9ca3af">bugün / son 7g</small>
+  </div>
+  <div id="compareContent" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+    <div style="background:rgba(22,163,74,0.1);border-left:3px solid #16a34a;padding:8px 12px;border-radius:4px">
+      <div style="color:#4ade80;font-weight:700;font-size:11px;margin-bottom:4px">🤖 CAB v13 — CANLI</div>
+      <div id="compareCabStats" style="line-height:1.8;color:#e5e7eb">Yükleniyor...</div>
+    </div>
+    <div style="background:rgba(168,139,250,0.1);border-left:3px solid #a78bfa;padding:8px 12px;border-radius:4px">
+      <div style="color:#c4b5fd;font-weight:700;font-size:11px;margin-bottom:4px">🌓 RAM v14 — SHADOW</div>
+      <div id="compareRamStats" style="line-height:1.8;color:#e5e7eb">Veri bekliyor...</div>
+    </div>
+  </div>
+  <div id="compareVerdict" style="margin-top:8px;padding:6px 10px;background:rgba(0,0,0,0.2);border-radius:4px;text-align:center;font-size:11px;color:#9ca3af"></div>
+</div>
+
+<!-- v6.6 Lite Patch: BINANCE DIVERGENCE UYARI -->
+<div id="divergenceAlert" style="display:none;background:rgba(239,68,68,0.15);border:1px solid #dc2626;border-left:4px solid #dc2626;border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:12px">
+  <b style="color:#fca5a5">⚠️ Binance Senkron Uyarısı</b>
+  <div id="divergenceContent" style="margin-top:6px;color:#e5e7eb"></div>
+</div>
+
 <!-- ============ CAB MODE (CANLI) ============ -->
 <div id="cabMode">
 
@@ -1937,7 +2083,96 @@ if(j.actioned_count>0){{const summary=j.actioned.map(a=>`${{a.ticker}}: ${{a.act
 else{{toast(`✓ Tarandı: ${{j.scanned}} poz, hiçbiri timeout aşmadı`)}}
 }}catch(e){{toast('Hata: '+e.message,true)}}}}
 
-function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();renderShadow();updateTabBadges();if(currentSystem==='ram')renderRamStatsBar();checkWarnings()}}
+function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();renderShadow();updateTabBadges();if(currentSystem==='ram')renderRamStatsBar();checkWarnings();renderCompare();detectDivergence()}}
+
+function renderCompare(){{
+  const box=document.getElementById('compareBox');
+  if(!box)return;
+  // Sadece veriler varsa göster
+  const cabOpen=Object.keys(openPositions||{{}}).length;
+  const ramOpen=Object.keys(shadowPositions||{{}}).length;
+  const cabClosedAll=closedPositions||[];
+  const ramClosedAll=shadowClosed||[];
+  if(cabClosedAll.length===0 && ramClosedAll.length===0 && cabOpen===0 && ramOpen===0){{box.style.display='none';return}}
+  box.style.display='block';
+
+  const today=now_tr().slice(0,10);
+  const cabBugun=cabClosedAll.filter(c=>c.kapanis&&c.kapanis.startsWith(today));
+  const ramBugun=ramClosedAll.filter(c=>c.kapanis&&c.kapanis.startsWith(today));
+
+  // Son 7 gün
+  const d7=new Date();d7.setDate(d7.getDate()-7);
+  const d7str=d7.toISOString().slice(0,16).replace('T',' ');
+  const cab7=cabClosedAll.filter(c=>c.kapanis&&c.kapanis>=d7str);
+  const ram7=ramClosedAll.filter(c=>c.kapanis&&c.kapanis>=d7str);
+
+  // CAB stats — Binance PNL varsa onu kullan
+  const cabKar=(arr)=>arr.reduce((s,c)=>s+(c.binance_pnl!=null?c.binance_pnl:c.kar),0);
+  const cabWR=(arr)=>arr.length?((arr.filter(c=>(c.binance_pnl!=null?c.binance_pnl:c.kar)>0).length/arr.length)*100).toFixed(0):0;
+
+  // RAM stats — shadow kar zaten net
+  const ramKar=(arr)=>arr.reduce((s,c)=>s+(c.kar||0),0);
+  const ramWR=(arr)=>arr.length?((arr.filter(c=>c.kar>0).length/arr.length)*100).toFixed(0):0;
+
+  const fmtKar=(v)=>{{const c=v>0?'#4ade80':(v<0?'#f87171':'#e5e7eb');return`<span style="color:${{c}};font-weight:700">${{v>=0?'+':''}}${{v.toFixed(1)}}$</span>`}};
+  const fmtWR=(v)=>{{const c=v>=50?'#4ade80':'#f87171';return`<span style="color:${{c}}">${{v}}%</span>`}};
+
+  const cabBugunKar=cabKar(cabBugun),cabBugunWR=cabWR(cabBugun);
+  const cab7Kar=cabKar(cab7),cab7WR=cabWR(cab7);
+  const ramBugunKar=ramKar(ramBugun),ramBugunWR=ramWR(ramBugun);
+  const ram7Kar=ramKar(ram7),ram7WR=ramWR(ram7);
+
+  document.getElementById('compareCabStats').innerHTML=
+    `<div>Açık: <b>${{cabOpen}}</b> poz</div>`+
+    `<div>Bugün: <b>${{cabBugun.length}}</b> kapandı | WR:${{fmtWR(cabBugunWR)}} | ${{fmtKar(cabBugunKar)}}</div>`+
+    `<div>Son 7g: <b>${{cab7.length}}</b> kapandı | WR:${{fmtWR(cab7WR)}} | ${{fmtKar(cab7Kar)}}</div>`;
+
+  document.getElementById('compareRamStats').innerHTML=ramClosedAll.length===0 && ramOpen===0
+    ? `<div style="color:#9ca3af">⏳ RAM v14 henüz sinyal göndermedi. Alarm aktif, bekleniyor...</div>`
+    : `<div>Açık: <b>${{ramOpen}}</b> sanal poz</div>`+
+      `<div>Bugün: <b>${{ramBugun.length}}</b> kapandı | WR:${{fmtWR(ramBugunWR)}} | ${{fmtKar(ramBugunKar)}}</div>`+
+      `<div>Son 7g: <b>${{ram7.length}}</b> kapandı | WR:${{fmtWR(ram7WR)}} | ${{fmtKar(ram7Kar)}}</div>`;
+
+  // Verdict
+  const v=document.getElementById('compareVerdict');
+  if(ramClosedAll.length<3){{
+    v.innerHTML=`<span style="color:#9ca3af">RAM için yeterli veri yok (${{ramClosedAll.length}} poz) — en az 10+ poz birikince anlamlı karşılaştırma yapılır</span>`;
+  }} else {{
+    const farkBugun=ramBugunKar-cabBugunKar;
+    const fark7=ram7Kar-cab7Kar;
+    const yonder=fark7>5?'🌓 RAM ÖNDE':(fark7<-5?'🤖 CAB ÖNDE':'⚖️ Başa baş');
+    const c=fark7>5?'#a78bfa':(fark7<-5?'#4ade80':'#9ca3af');
+    v.innerHTML=`Son 7g farkı: <b style="color:${{c}}">${{yonder}}</b> (RAM - CAB: ${{fark7>=0?'+':''}}${{fark7.toFixed(1)}}$)`;
+  }}
+}}
+
+function detectDivergence(){{
+  // Bu frontend-only heuristic bir tespit: son 2 saat içinde "Timeout +0.0$" olarak kapanmış bir poz var mı?
+  const alert=document.getElementById('divergenceAlert');
+  if(!alert)return;
+  const suspects=[];
+  const now=Date.now();
+  for(const c of (closedPositions||[]).slice(-15)){{
+    if(!c.kapanis)continue;
+    try{{
+      const kapanis=new Date(c.kapanis.replace(' ','T')+':00+03:00');
+      const hoursAgo=(now-kapanis.getTime())/3600000;
+      if(hoursAgo>24)continue;
+      // Şüpheli: Timeout sonuçlu + kar neredeyse 0 (+- 0.5$) + binance_pnl yok
+      if(c.sonuc&&c.sonuc.includes('Timeout')&&Math.abs(c.kar||0)<0.5&&c.binance_pnl==null){{
+        suspects.push(c.ticker);
+      }}
+    }}catch(e){{}}
+  }}
+  if(suspects.length===0){{alert.style.display='none';return}}
+  alert.style.display='block';
+  const uniqueList=[...new Set(suspects)];
+  document.getElementById('divergenceContent').innerHTML=
+    `Son 24 saatte <b>${{uniqueList.length}} pozisyon</b> "Timeout +0$" olarak kapanmış — Binance'te hala açık olabilir!<br>`+
+    `Şüpheli: ${{uniqueList.map(t=>`<code style="background:#0f172a;padding:2px 6px;border-radius:3px;margin:0 2px">${{t}}</code>`).join('')}}<br>`+
+    `<small style="color:#9ca3af">Binance'te kontrol et. Hala açıksa:</small> `+
+    uniqueList.map(t=>`<button class="btn" style="padding:3px 8px;font-size:10px;background:#dc2626;margin:2px" onclick="forceReopen('${{t}}')">♻️ ${{t}} Geri Aç</button>`).join('');
+}}
 
 let skippedPrices={{}};
 async function updateSkippedPrices(){{
@@ -2253,31 +2488,45 @@ async function clearOld(){{if(!confirm('30 günden eski kapanan pozisyonları si
 
 async function migratePnl(){{
   if(!confirm('Geçmiş kapanan pozların gerçek Binance PNL\\'ini çek?\\n(Önce DENEME yapılır, sonra onay istenir)'))return;
-  toast('Binance\\'ten veri çekiliyor, bekleyin...');
+  toast('Binance\\'ten veri çekiliyor, bekleyin 10-20sn...');
   try{{
-    // 1. Dry run
     const r=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dry_run:true}})}});
+    if(!r.ok){{toast('API yanıt vermedi: HTTP '+r.status,true);return}}
     const j=await r.json();
     const mig=j.migrated||[],skp=j.skipped||[],fail=j.failed||[];
-    if(mig.length===0){{toast('ℹ Yeni veri yok ('+skp.length+' zaten güncel, '+fail.length+' başarısız)');return}}
-    // Özet göster
-    let msg='📊 Deneme sonucu:\\n\\n';
-    msg+=mig.length+' pozisyon güncellenecek\\n';
+    console.log('[MIGRATE-DRY]',j);
+    let dbg='📊 Deneme Sonucu — Detaylı\\n\\n';
+    dbg+='✓ Güncellenebilir: '+mig.length+'\\n';
+    dbg+='⏭ Atlanan: '+skp.length+'\\n';
+    dbg+='❌ Başarısız: '+fail.length+'\\n\\n';
+    if(skp.length>0){{dbg+='Atlanma sebepleri (ilk 5):\\n';skp.slice(0,5).forEach(s=>{{dbg+='  '+s.ticker+': '+s.reason+'\\n'}});dbg+='\\n'}}
+    if(fail.length>0){{dbg+='❌ Hatalar (ilk 5):\\n';fail.slice(0,5).forEach(f=>{{dbg+='  '+f.ticker+': '+f.reason+'\\n'}});dbg+='\\n'}}
+    if(mig.length===0){{
+      dbg+='⚠ Hiçbir poz güncellenemedi.\\n\\nMuhtemel nedenler:\\n• API key Futures income izni yok\\n• Zaman parse hatası\\n• Binance IP kısıtı\\n\\nRailway log: [BINANCE ERR] get_income';
+      alert(dbg);return;
+    }}
+    dbg+='Güncellenecek (ilk 5):\\n';
+    mig.slice(0,5).forEach(m=>{{dbg+='  '+m.ticker+': '+(m.dashboard_kar||0).toFixed(1)+' → '+(m.binance_pnl||0).toFixed(2)+' (fark: '+(m.fark||0).toFixed(1)+')\\n'}});
     const sumOld=mig.reduce((s,m)=>s+(m.dashboard_kar||0),0);
     const sumNew=mig.reduce((s,m)=>s+(m.binance_pnl||0),0);
-    msg+='Dashboard toplam: '+sumOld.toFixed(2)+'$\\n';
-    msg+='Binance toplam: '+sumNew.toFixed(2)+'$\\n';
-    msg+='FARK: '+(sumNew-sumOld).toFixed(2)+'$\\n\\n';
-    msg+='Detay (ilk 5):\\n';
-    mig.slice(0,5).forEach(m=>{{msg+='  '+m.ticker+': '+m.dashboard_kar.toFixed(1)+' → '+m.binance_pnl.toFixed(2)+' (fark: '+m.fark.toFixed(1)+')\\n'}});
-    msg+='\\n\\nGerçek kayıt yapılsın mı?';
-    if(!confirm(msg))return;
-    // 2. Gerçek migrate
+    dbg+='\\nDashboard toplam: '+sumOld.toFixed(2)+'$\\nBinance toplam:    '+sumNew.toFixed(2)+'$\\nFARK: '+(sumNew-sumOld).toFixed(2)+'$\\n\\nGerçek kayıt yapılsın mı?';
+    if(!confirm(dbg))return;
     const r2=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dry_run:false}})}});
     const j2=await r2.json();
-    toast('✓ '+(j2.migrated||[]).length+' poz güncellendi, Binance PNL dashboard\\'a yazıldı');
+    console.log('[MIGRATE-REAL]',j2);
+    toast('✓ '+(j2.migrated||[]).length+' poz güncellendi');
     setTimeout(()=>loadData(),800);
-  }}catch(e){{toast('Hata: '+e.message,true)}}
+  }}catch(e){{console.error('[MIGRATE ERR]',e);alert('Hata: '+e.message+'\\nRailway log\\'una bak.')}}
+}}
+
+async function forceReopen(ticker){{
+  if(!confirm('Binance\\'te hala açık '+ticker+' dashboard\\'a geri alınsın mı?'))return;
+  try{{
+    const r=await fetch('/api/force_reopen',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ticker:ticker}})}});
+    const j=await r.json();
+    if(j.success){{toast('✓ '+ticker+' geri açıldı (qty:'+j.binance_qty.toFixed(2)+')');setTimeout(()=>loadData(),500)}}
+    else{{alert('İşlem yapılamadı: '+j.error)}}
+  }}catch(e){{alert('Hata: '+e.message)}}
 }}
 
 function requestNotif(){{if(!('Notification' in window)){{toast('Bildirim desteklenmiyor',true);return}}Notification.requestPermission().then(p=>{{if(p==='granted'){{toast('✓ Bildirimler açık');new Notification('CAB Bot v6.6 Lite',{{body:'v6.6 Lite — TP1/TP2/STOP + gerçek Binance PNL!'}})}}}})}}
