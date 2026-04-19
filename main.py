@@ -16,6 +16,12 @@ TIMEOUT_ABSOLUTE_HOURS = 24  # v6.4: mutlak limit — slot baskısı olmasa bile
 TIMEOUT_PRESSURE_THRESHOLD = 5  # v6.4: aktif_risk bu eşikten azsa timeout pas geç (slot bol)
 TIMEOUT_CHECK_INTERVAL_SEC = 300  # her 5 dakika
 
+# v6.6 Lite Patch 5: KILL SWITCH / PAUSE MODE ayarları
+KILL_SWITCH_ENABLED = True       # Otomatik durdurma açık mı?
+STOP_STREAK_WINDOW = 5           # Son kaç pozu kontrol et?
+STOP_STREAK_THRESHOLD = 4        # Bu sayıda stop varsa pause (5 pozda 4+ stop)
+DAILY_LOSS_LIMIT = -150.0        # Günlük net zarar bu eşiği geçerse pause (USDT)
+
 client = UMFutures(
     key=os.environ.get("BINANCE_API_KEY"),
     secret=os.environ.get("BINANCE_SECRET_KEY"),
@@ -24,7 +30,14 @@ client = UMFutures(
 
 INITIAL_DATA = {
     "open_positions": {}, "closed_positions": [], "skipped_signals": [],
-    "shadow_positions": {}, "shadow_closed": [], "shadow_skipped": []  # v6.5: RAM Shadow Mode
+    "shadow_positions": {}, "shadow_closed": [], "shadow_skipped": [],  # v6.5: RAM Shadow Mode
+    "pause_state": {  # v6.6 Lite Patch 5: Kill Switch
+        "paused": False,
+        "reason": None,          # manual / auto_stop_streak / auto_daily_loss
+        "reason_text": None,     # insan okuyabilir açıklama
+        "paused_at": None,       # TR saat string
+        "auto_triggered": False  # aynı gün içinde birden çok kez tetiklenmesin
+    }
 }
 
 # ============ VERİ YÖNETİMİ ============
@@ -32,7 +45,14 @@ def load_data():
     try:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, "r") as f:
-                return json.load(f)
+                loaded = json.load(f)
+            # v6.6 Lite Patch 5: Eski data'da pause_state yoksa ekle
+            if "pause_state" not in loaded:
+                loaded["pause_state"] = {
+                    "paused": False, "reason": None, "reason_text": None,
+                    "paused_at": None, "auto_triggered": False
+                }
+            return loaded
     except Exception as e:
         print(f"[LOAD ERR] {e}")
     return {k: (v.copy() if isinstance(v, (dict, list)) else v) for k, v in INITIAL_DATA.items()}
@@ -46,7 +66,83 @@ def save_data(data):
 
 data = load_data()
 
-# v6.1: Skipped_signals key'i eski verilerde olmayabilir, garanti et
+
+# ============ KILL SWITCH / PAUSE MANAGER (v6.6 Lite Patch 5) ============
+
+def is_paused():
+    """Bot şu anda pause modunda mı?"""
+    ps = data.get("pause_state", {})
+    return bool(ps.get("paused", False))
+
+
+def get_pause_info():
+    """Pause durumu hakkında bilgi (dashboard için)"""
+    return data.get("pause_state", {
+        "paused": False, "reason": None, "reason_text": None,
+        "paused_at": None, "auto_triggered": False
+    })
+
+
+def pause_bot(reason, reason_text):
+    """Bot'u pause moduna al. reason: manual / auto_stop_streak / auto_daily_loss"""
+    data["pause_state"] = {
+        "paused": True,
+        "reason": reason,
+        "reason_text": reason_text,
+        "paused_at": now_tr(),
+        "auto_triggered": reason.startswith("auto_"),
+    }
+    save_data(data)
+    print(f"[PAUSE] Bot durduruldu — {reason}: {reason_text}")
+
+
+def resume_bot():
+    """Bot'u tekrar aktif et"""
+    data["pause_state"] = {
+        "paused": False, "reason": None, "reason_text": None,
+        "paused_at": None, "auto_triggered": False,
+    }
+    save_data(data)
+    print("[PAUSE] Bot tekrar aktif")
+
+
+def check_auto_pause_triggers():
+    """
+    Pozisyon her kapandığında çağrılır.
+    Ardışık stop sayısı VEYA günlük zarar eşiği aşıldıysa otomatik pause.
+    """
+    if not KILL_SWITCH_ENABLED:
+        return
+    if is_paused():
+        return  # Zaten pause'da, tetikleme yok
+
+    closed = data.get("closed_positions", [])
+    if not closed:
+        return
+
+    # 1) Ardışık stop kontrolü — son N poz içinde K+ stop
+    recent = closed[-STOP_STREAK_WINDOW:]
+    stop_count = sum(1 for c in recent if c.get("kar", 0) < 0 and ("Stop" in c.get("sonuc", "") or "Timeout" in c.get("sonuc", "")))
+    if len(recent) >= STOP_STREAK_WINDOW and stop_count >= STOP_STREAK_THRESHOLD:
+        pause_bot(
+            "auto_stop_streak",
+            f"Son {STOP_STREAK_WINDOW} pozda {stop_count} stop/timeout — üst üste kayıp koruması"
+        )
+        return
+
+    # 2) Günlük zarar kontrolü — bugünün net karı eşik altında mı
+    today = now_tr()[:10]
+    bugun = [c for c in closed if c.get("kapanis", "").startswith(today)]
+    if bugun:
+        daily_net = sum(c.get("kar", 0) for c in bugun)
+        if daily_net <= DAILY_LOSS_LIMIT:
+            pause_bot(
+                "auto_daily_loss",
+                f"Günlük zarar ${daily_net:.1f} (limit: ${DAILY_LOSS_LIMIT}) — günlük kayıp koruması"
+            )
+
+
+# ============ VERİ YÖNETİMİ (devam) ============# v6.1: Skipped_signals key'i eski verilerde olmayabilir, garanti et
 if "skipped_signals" not in data:
     data["skipped_signals"] = []
 # v6.5: Shadow Mode alanları
@@ -919,6 +1015,48 @@ async def test_binance_income():
     return JSONResponse(result)
 
 
+@app.get("/api/pause_status")
+async def get_pause_status():
+    """v6.6 Lite Patch 5: Bot pause durumunu sorgula"""
+    return JSONResponse({
+        **get_pause_info(),
+        "kill_switch_enabled": KILL_SWITCH_ENABLED,
+        "stop_streak_window": STOP_STREAK_WINDOW,
+        "stop_streak_threshold": STOP_STREAK_THRESHOLD,
+        "daily_loss_limit": DAILY_LOSS_LIMIT,
+    })
+
+
+@app.post("/api/toggle_pause")
+async def toggle_pause(req: Request):
+    """
+    v6.6 Lite Patch 5: Manuel pause toggle.
+    Body: {"action": "pause" | "resume", "reason_text": "..." (opsiyonel)}
+    """
+    body = {}
+    try:
+        body = await req.json()
+    except Exception:
+        pass
+    action = body.get("action", "").lower()
+    reason_text = body.get("reason_text", "Manuel durdurma")
+
+    if action == "pause":
+        pause_bot("manual", reason_text)
+        return JSONResponse({"success": True, "state": get_pause_info(), "msg": "Bot durduruldu"})
+    elif action == "resume":
+        resume_bot()
+        return JSONResponse({"success": True, "state": get_pause_info(), "msg": "Bot tekrar aktif"})
+    else:
+        # toggle: mevcut durumun tersine geç
+        if is_paused():
+            resume_bot()
+            return JSONResponse({"success": True, "state": get_pause_info(), "msg": "Bot tekrar aktif"})
+        else:
+            pause_bot("manual", reason_text)
+            return JSONResponse({"success": True, "state": get_pause_info(), "msg": "Bot durduruldu"})
+
+
 @app.post("/api/force_reopen")
 async def force_reopen_position(req: Request):
     """
@@ -1020,10 +1158,11 @@ async def force_reopen_position(req: Request):
 @app.post("/api/migrate_pnl")
 async def migrate_old_pnl(req: Request):
     """
-    v6.6 Lite Patch 3: TOPLU çekim ile rate-limit güvenli migrate.
-    Symbol'süz tek istek → tüm hesabın son 30g income'ı → bot sembol bazında grupla.
-    Body: {"dry_run": true/false, "days": 30 (opsiyonel)}
+    v6.6 Lite Patch 5: HYBRID migrate.
+    1. Önce symbol'süz toplu çek (1-2 istek)
+    2. Boş dönerse, her sembol için TEK TEK + 250ms delay (rate limit safe)
     """
+    import asyncio
     body = {}
     try:
         body = await req.json()
@@ -1032,51 +1171,41 @@ async def migrate_old_pnl(req: Request):
     dry_run = body.get("dry_run", True)
     days = int(body.get("days", 30))
 
-    results = {"migrated": [], "skipped": [], "failed": [], "dry_run": dry_run, "method": "bulk", "closed_total": 0, "debug": []}
+    results = {
+        "migrated": [], "skipped": [], "failed": [],
+        "dry_run": dry_run, "method": None,
+        "closed_total": 0, "debug": []
+    }
     closed_positions = data.get("closed_positions", [])
     results["closed_total"] = len(closed_positions)
     results["debug"].append(f"closed_positions sayısı: {len(closed_positions)}")
 
     if not closed_positions:
-        return JSONResponse({**results, "msg": "Kapanan pozisyon yok (data.closed_positions boş!)"})
+        return JSONResponse({**results, "msg": "Kapanan pozisyon yok"})
 
-    # === 1) TEK İSTEKTE tüm hesabın income_history'sini çek ===
     start_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
 
+    # ==== YÖNTEM A: Toplu çek (tek istek) ====
+    all_pnl = []
+    all_fees = []
+    bulk_ok = False
     try:
-        # REALIZED_PNL — hepsi tek istekte
-        all_pnl = []
-        last_ms = start_ms
-        for _ in range(5):  # en fazla 5 sayfa (1000 limit × 5 = 5000 kayıt)
-            page = client.get_income_history(incomeType="REALIZED_PNL", startTime=last_ms, limit=1000)
-            if not page:
-                break
-            all_pnl.extend(page)
-            if len(page) < 1000:
-                break
-            last_ms = int(page[-1].get("time", last_ms)) + 1
-
-        # COMMISSION — hepsi tek istekte
-        all_fees = []
-        last_ms = start_ms
-        for _ in range(5):
-            page = client.get_income_history(incomeType="COMMISSION", startTime=last_ms, limit=1000)
-            if not page:
-                break
-            all_fees.extend(page)
-            if len(page) < 1000:
-                break
-            last_ms = int(page[-1].get("time", last_ms)) + 1
-
-        print(f"[MIGRATE] Toplu çekim: {len(all_pnl)} PNL + {len(all_fees)} fee kaydı")
-        results["debug"].append(f"Binance'ten çekilen: {len(all_pnl)} REALIZED_PNL, {len(all_fees)} COMMISSION")
-        if len(all_pnl) == 0:
-            results["debug"].append("⚠️ Binance'te son 30 gün hiç realized PNL yok! (API key Futures trades izni?)")
+        all_pnl = client.get_income_history(incomeType="REALIZED_PNL", startTime=start_ms, limit=1000) or []
+        all_fees = client.get_income_history(incomeType="COMMISSION", startTime=start_ms, limit=1000) or []
+        bulk_ok = True
+        results["debug"].append(f"Toplu: {len(all_pnl)} PNL + {len(all_fees)} fee kayıt")
     except Exception as e:
-        return JSONResponse({**results, "msg": f"Binance income history çekilemedi: {e}", "error": str(e)})
+        results["debug"].append(f"Toplu çekim fail: {e}")
 
-    # === 2) Sembol+zaman bazında grupla ===
-    # Her income kaydı {"symbol","income","time","incomeType"}
+    # Toplu boş döndüyse sembol bazlı deneyelim (fallback)
+    symbol_mode = bulk_ok and len(all_pnl) == 0
+    if symbol_mode:
+        results["debug"].append("⚠️ Toplu boş, sembol bazlı deneme yapılıyor (yavaş)...")
+        results["method"] = "per_symbol"
+    else:
+        results["method"] = "bulk"
+
+    # Sembol+zaman bazında grupla
     def group_by_symbol(rows):
         groups = {}
         for r in rows:
@@ -1089,7 +1218,7 @@ async def migrate_old_pnl(req: Request):
     pnl_by_sym = group_by_symbol(all_pnl)
     fee_by_sym = group_by_symbol(all_fees)
 
-    # === 3) Her kapanan poz için ilgili zaman penceresindeki kayıtları topla ===
+    # Her kapanan poz için
     for c in closed_positions:
         ticker = c.get("ticker")
         if c.get("binance_pnl") is not None:
@@ -1116,20 +1245,40 @@ async def migrate_old_pnl(req: Request):
                 except Exception:
                     pass
 
-            # Bu sembol + zaman penceresindeki tüm income'ları bul
-            sym_pnls = pnl_by_sym.get(ticker, [])
-            sym_fees = fee_by_sym.get(ticker, [])
-
-            def in_window(r):
-                t = int(r.get("time", 0))
-                if t < pos_start_ms:
-                    return False
-                if pos_end_ms and t > pos_end_ms:
-                    return False
-                return True
-
-            matching_pnls = [r for r in sym_pnls if in_window(r)]
-            matching_fees = [r for r in sym_fees if in_window(r)]
+            # Fallback modunda sembol bazlı çek
+            if symbol_mode:
+                try:
+                    await asyncio.sleep(0.25)  # 4 req/sec limit
+                    sym_pnls = client.get_income_history(
+                        symbol=ticker, incomeType="REALIZED_PNL",
+                        startTime=pos_start_ms,
+                        endTime=pos_end_ms or int(datetime.now(timezone.utc).timestamp()*1000),
+                        limit=20
+                    ) or []
+                    await asyncio.sleep(0.25)
+                    sym_fees = client.get_income_history(
+                        symbol=ticker, incomeType="COMMISSION",
+                        startTime=pos_start_ms,
+                        endTime=pos_end_ms or int(datetime.now(timezone.utc).timestamp()*1000),
+                        limit=20
+                    ) or []
+                except Exception as e:
+                    results["failed"].append({"ticker": ticker, "reason": f"symbol fetch: {e}"})
+                    continue
+                matching_pnls = sym_pnls
+                matching_fees = sym_fees
+            else:
+                sym_pnls = pnl_by_sym.get(ticker, [])
+                sym_fees = fee_by_sym.get(ticker, [])
+                def in_window(r):
+                    t = int(r.get("time", 0))
+                    if t < pos_start_ms:
+                        return False
+                    if pos_end_ms and t > pos_end_ms:
+                        return False
+                    return True
+                matching_pnls = [r for r in sym_pnls if in_window(r)]
+                matching_fees = [r for r in sym_fees if in_window(r)]
 
             if not matching_pnls:
                 results["skipped"].append({"ticker": ticker, "reason": "no_binance_record_in_window"})
@@ -1158,10 +1307,8 @@ async def migrate_old_pnl(req: Request):
 
     if not dry_run and results["migrated"]:
         save_data(data)
-        print(f"[MIGRATE] {len(results['migrated'])} pozisyon Binance PNL ile güncellendi (bulk)")
+        print(f"[MIGRATE] {len(results['migrated'])} pozisyon güncellendi ({results['method']})")
 
-    results["total_pnl_records"] = len(all_pnl)
-    results["total_fee_records"] = len(all_fees)
     return JSONResponse(results)
 
 
@@ -1191,6 +1338,31 @@ async def webhook(req: Request):
             return {"status": "parse_error"}
         print(f"[PARSE] {parsed}")
         ticker = parsed["ticker"]
+
+        # v6.6 Lite Patch 5: Pause kontrolü — bot pause'daysa yeni poz açma
+        if is_paused():
+            pi = get_pause_info()
+            if "skipped_signals" not in data:
+                data["skipped_signals"] = []
+            data["skipped_signals"].append({
+                "ticker": ticker,
+                "giris": parsed["giris"],
+                "stop": parsed["stop"],
+                "tp1": parsed["tp1"],
+                "tp2": parsed["tp2"],
+                "marj": parsed["marj"],
+                "lev": parsed["lev"],
+                "risk": parsed.get("risk", 0),
+                "kapat_oran": parsed.get("kapat_oran", 50),
+                "atr_skor": parsed.get("atr_skor", 1.0),
+                "zaman": now_tr(),
+                "sebep": f"🛑 BOT PAUSE: {pi.get('reason_text','manuel')}",
+                "max_seen": parsed["giris"], "min_seen": parsed["giris"],
+                "paused_skip": True,
+            })
+            save_data(data)
+            print(f"{mode_tag} PAUSE: {ticker} sinyali reddedildi — {pi.get('reason')}")
+            return {"status": "paused", "reason": pi.get("reason"), "ticker": ticker}
 
         # v6.1: Akıllı slot — TP1 vurmuş VE timeout-BE'liler exempt
         aktif_risk, gar_tp1, gar_to = count_active_risk()
@@ -1391,6 +1563,7 @@ async def webhook(req: Request):
         del data["open_positions"][ticker]
         save_data(data)
         print(f"{mode_tag} TRAIL({parsed['tp_type']}): {ticker} | {sonuc} | dashboard:+{total_kar}$ binance:{binance_pnl}$")
+        check_auto_pause_triggers()  # v6.6 Lite Patch 5
         return {"status": "trail_closed"}
 
     # === STOP ===
@@ -1470,6 +1643,7 @@ async def webhook(req: Request):
         del data["open_positions"][ticker]
         save_data(data)
         print(f"{mode_tag} STOP: {ticker} | {sonuc} | dashboard:{total_kar}$ binance:{binance_pnl}$")
+        check_auto_pause_triggers()  # v6.6 Lite Patch 5
         return {"status": "stopped"}
 
     else:
@@ -1576,6 +1750,7 @@ async def timeout_scan_once():
                 save_data(data)
                 actioned.append({"ticker": ticker, "action": "CLOSE", "kar": kar, "age_hours": round(age_hours, 1)})
                 print(f"[TIMEOUT-CLOSE] {ticker} → kapatıldı ({kar:+.1f}$)")
+                check_auto_pause_triggers()  # v6.6 Lite Patch 5
 
     except Exception as e:
         errors.append(f"global: {e}")
@@ -1812,8 +1987,22 @@ small{{color:#9ca3af}}
   <small style="color:#9ca3af">MAX:{MAX_POSITIONS} aktif | Timeout:{TIMEOUT_HOURS}s→{TIMEOUT_ABSOLUTE_HOURS}s (koşullu: aktif≥{TIMEOUT_PRESSURE_THRESHOLD} ise akıllı kapama)</small>
   <button class="btn btn-warn" style="margin-left:8px;padding:3px 8px;font-size:10px" onclick="requestNotif()">🔔 Bildirim İzni</button>
   <button class="btn" style="padding:3px 8px;font-size:10px" onclick="manualTimeoutCheck()">⏰ Timeout Kontrol</button>
+  <button id="pauseBtn" class="btn" style="padding:3px 8px;font-size:10px;background:#dc2626;margin-left:8px" onclick="togglePause()">🛑 BOT'U DURDUR</button>
 </div>
 <div class="subtitle">⟳ Son güncelleme: <span id="lastUpdate">—</span> <small>(5sn fiyat / 20sn sayfa)</small></div>
+
+<!-- v6.6 Lite Patch 5: PAUSE / KILL SWITCH BANNER -->
+<div id="pauseBanner" style="display:none;background:linear-gradient(90deg,#7f1d1d,#991b1b);border:2px solid #dc2626;border-radius:8px;padding:14px 18px;margin:14px 0;color:#fecaca;font-size:13px;box-shadow:0 0 20px rgba(220,38,38,0.3)">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+    <div>
+      <b style="color:#fff;font-size:15px">🛑 BOT DURDURULDU</b>
+      <div id="pauseBannerReason" style="margin-top:4px;color:#fecaca">—</div>
+      <small id="pauseBannerTime" style="color:#fca5a5">—</small>
+    </div>
+    <button class="btn" style="background:#16a34a;font-size:13px;padding:8px 16px" onclick="togglePause()">▶️ BOT'U BAŞLAT</button>
+  </div>
+  <small style="display:block;margin-top:8px;color:#fca5a5">💡 Mevcut açık pozisyonlar dokunulmadı. Sadece yeni sinyaller kabul edilmiyor.</small>
+</div>
 
 <!-- v6.5: SİSTEM SEKMELERI — CAB CANLI vs RAM SHADOW -->
 <div id="systemTabs" style="display:flex;gap:8px;margin:14px 0 18px;border-bottom:2px solid #334155">
@@ -1995,7 +2184,7 @@ let shadowPositions={{}},shadowClosed=[],shadowPrices={{}};let shadowTab='open';
 let currentSystem='cab'; // 'cab' veya 'ram' — aktif sekme
 let sortState={{open:{{col:null,dir:'asc'}},closed:{{col:'kapanis',dir:'desc'}}}};
 
-async function loadData(){{try{{const r=await fetch('/api/data');const d=await r.json();openPositions=d.open_positions||{{}};closedPositions=d.closed_positions||[];skippedSignals=d.skipped_signals||[];shadowPositions=d.shadow_positions||{{}};shadowClosed=d.shadow_closed||[];renderAll();detectChanges()}}catch(e){{console.error(e)}}}}
+async function loadData(){{loadPauseState();try{{const r=await fetch('/api/data');const d=await r.json();openPositions=d.open_positions||{{}};closedPositions=d.closed_positions||[];skippedSignals=d.skipped_signals||[];shadowPositions=d.shadow_positions||{{}};shadowClosed=d.shadow_closed||[];renderAll();detectChanges()}}catch(e){{console.error(e)}}}}
 
 async function fp(sym){{try{{const r=await fetch('https://fapi.binance.com/fapi/v1/ticker/price?symbol='+sym);if(!r.ok)return null;return parseFloat((await r.json()).price)}}catch(e){{return null}}}}
 
@@ -2020,7 +2209,7 @@ if(j.actioned_count>0){{const summary=j.actioned.map(a=>`${{a.ticker}}: ${{a.act
 else{{toast(`✓ Tarandı: ${{j.scanned}} poz, hiçbiri timeout aşmadı`)}}
 }}catch(e){{toast('Hata: '+e.message,true)}}}}
 
-function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();renderShadow();updateTabBadges();if(currentSystem==='ram')renderRamStatsBar();checkWarnings();renderCompare();detectDivergence()}}
+function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();renderShadow();updateTabBadges();if(currentSystem==='ram')renderRamStatsBar();checkWarnings();renderCompare();detectDivergence();renderPauseState()}}
 
 function renderCompare(){{
   const box=document.getElementById('compareBox');
@@ -2465,6 +2654,56 @@ async function forceReopen(ticker){{
     const j=await r.json();
     if(j.success){{toast('✓ '+ticker+' geri açıldı (qty:'+j.binance_qty.toFixed(2)+')');setTimeout(()=>loadData(),500)}}
     else{{alert('İşlem yapılamadı: '+j.error)}}
+  }}catch(e){{alert('Hata: '+e.message)}}
+}}
+
+// v6.6 Lite Patch 5: Pause / Kill Switch
+let pauseState = {{paused:false}};
+
+async function loadPauseState(){{
+  try{{
+    const r=await fetch('/api/pause_status');
+    const j=await r.json();
+    pauseState=j;
+    renderPauseState();
+  }}catch(e){{console.error('Pause state:',e)}}
+}}
+
+function renderPauseState(){{
+  const banner=document.getElementById('pauseBanner');
+  const btn=document.getElementById('pauseBtn');
+  if(!banner||!btn)return;
+  if(pauseState.paused){{
+    banner.style.display='block';
+    document.getElementById('pauseBannerReason').textContent=pauseState.reason_text||'Manuel durdurma';
+    document.getElementById('pauseBannerTime').textContent='Durdurulma: '+(pauseState.paused_at||'—')+' | Sebep: '+(pauseState.reason||'manual');
+    btn.textContent='▶️ BAŞLAT';
+    btn.style.background='#16a34a';
+  }}else{{
+    banner.style.display='none';
+    btn.textContent='🛑 BOT DURDUR';
+    btn.style.background='#dc2626';
+  }}
+}}
+
+async function togglePause(){{
+  const action=pauseState.paused?'resume':'pause';
+  let reason_text='Manuel durdurma';
+  if(action==='pause'){{
+    const r=prompt('Bot neden durduruluyor? (opsiyonel not)','Manuel — piyasa kontrolü');
+    if(r===null)return;
+    if(r.trim())reason_text=r.trim();
+  }}else{{
+    if(!confirm('Bot tekrar aktif edilsin mi?\\nYeni sinyaller kabul edilmeye başlayacak.'))return;
+  }}
+  try{{
+    const r=await fetch('/api/toggle_pause',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:action,reason_text:reason_text}})}});
+    const j=await r.json();
+    if(j.success){{
+      toast('✓ '+j.msg);
+      pauseState=j.state;
+      renderPauseState();
+    }}
   }}catch(e){{alert('Hata: '+e.message)}}
 }}
 
