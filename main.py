@@ -213,9 +213,7 @@ def binance_stop_loss(symbol, qty, stop_price, info, retry=STOP_RETRY_MAX):
                 type="STOP_MARKET",
                 closePosition="true",
                 stopPrice=sp,
-                workingType="MARK_PRICE",
-                priceProtect="true",
-                timeInForce="GTE_GTC"
+                workingType="MARK_PRICE"
             )
             order_id = result.get("orderId")
             print(f"[BINANCE] STOP_MARKET {symbol} closePos stop:{sp} orderId:{order_id} (attempt {attempt}) ✓")
