@@ -293,38 +293,66 @@ def binance_get_mark_price(symbol):
 def fetch_binance_realized_pnl(symbol, start_time_ms=None, end_time_ms=None):
     """
     v6.6 Lite: Binance'ten sembol için realized PNL çek (fee dahil).
-    Tek bir poz kapandığında çağrılır → gerçek kar/zarar net belli.
+    Önce get_income dener, fail olursa get_account_trades ile hesaplar.
     """
+    # === YÖNTEM 1: get_income (income history) ===
     try:
         kwargs = {"symbol": symbol, "incomeType": "REALIZED_PNL", "limit": 20}
         if start_time_ms:
             kwargs["startTime"] = int(start_time_ms)
         if end_time_ms:
             kwargs["endTime"] = int(end_time_ms)
-        incomes = client.get_income(**kwargs)
-        pnl_total = sum(float(i.get("income", 0)) for i in incomes) if incomes else 0
+        incomes = client.get_income_history(**kwargs)
+        if incomes is not None:
+            pnl_total = sum(float(i.get("income", 0)) for i in incomes)
 
-        # Fee de çek
-        fee_kwargs = {"symbol": symbol, "incomeType": "COMMISSION", "limit": 20}
-        if start_time_ms:
-            fee_kwargs["startTime"] = int(start_time_ms)
-        if end_time_ms:
-            fee_kwargs["endTime"] = int(end_time_ms)
-        fees = client.get_income(**fee_kwargs)
-        fee_total = sum(float(f.get("income", 0)) for f in fees) if fees else 0
+            fee_kwargs = {"symbol": symbol, "incomeType": "COMMISSION", "limit": 20}
+            if start_time_ms:
+                fee_kwargs["startTime"] = int(start_time_ms)
+            if end_time_ms:
+                fee_kwargs["endTime"] = int(end_time_ms)
+            fees = client.get_income_history(**fee_kwargs)
+            fee_total = sum(float(f.get("income", 0)) for f in fees) if fees else 0
 
-        # Binance fee income negatif olarak gelir (para çıkışı), o yüzden toplayalım
-        net_pnl = pnl_total + fee_total
-        return {
-            "success": True,
-            "realized_pnl": round(pnl_total, 2),
-            "fee": round(fee_total, 2),
-            "net_pnl": round(net_pnl, 2),
-            "count": len(incomes) if incomes else 0,
-        }
+            if len(incomes) > 0 or pnl_total != 0:
+                net_pnl = pnl_total + fee_total
+                return {
+                    "success": True, "method": "income",
+                    "realized_pnl": round(pnl_total, 2),
+                    "fee": round(fee_total, 2),
+                    "net_pnl": round(net_pnl, 2),
+                    "count": len(incomes),
+                }
     except Exception as e:
-        print(f"[BINANCE ERR] get_income {symbol}: {e}")
-        return {"success": False, "error": str(e)}
+        print(f"[BINANCE-PNL M1] get_income fail {symbol}: {e}")
+
+    # === YÖNTEM 2: get_account_trades (alternatif, bazen daha iyi izin) ===
+    try:
+        kwargs = {"symbol": symbol, "limit": 100}
+        if start_time_ms:
+            kwargs["startTime"] = int(start_time_ms)
+        if end_time_ms:
+            kwargs["endTime"] = int(end_time_ms)
+        trades = client.get_account_trades(**kwargs)
+        if trades:
+            realized_pnl = sum(float(t.get("realizedPnl", 0)) for t in trades)
+            commission = sum(float(t.get("commission", 0)) for t in trades)
+            # Binance commission pozitif döner (bot için gider), negatife çevir
+            fee_total = -commission
+            net_pnl = realized_pnl + fee_total
+            return {
+                "success": True, "method": "trades",
+                "realized_pnl": round(realized_pnl, 2),
+                "fee": round(fee_total, 2),
+                "net_pnl": round(net_pnl, 2),
+                "count": len(trades),
+            }
+    except Exception as e:
+        print(f"[BINANCE-PNL M2] get_account_trades fail {symbol}: {e}")
+        return {"success": False, "error": f"Her iki yöntem de fail: {e}"}
+
+    return {"success": False, "error": "Veri bulunamadı (ikisi de boş döndü)"}
+
 
 
 def binance_get_klines(symbol, interval="1m", limit=60):
@@ -851,23 +879,43 @@ async def manual_timeout_check():
 @app.get("/api/binance_test_income")
 async def test_binance_income():
     """
-    v6.6 Lite Patch: Binance API income izni test endpointi.
-    Son 24 saatteki realized PNL'leri çekmeye çalışır.
+    v6.6 Lite Patch: Binance API izin testi — İKİ YÖNTEM kontrol eder.
     Migrate çalışmıyorsa önce buna bak.
     """
-    result = {"status": "checking", "now_tr": now_tr()}
+    result = {"now_tr": now_tr(), "methods": {}}
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp() * 1000)
+
+    # Yöntem 1: get_income
     try:
-        start_ms = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp() * 1000)
-        incomes = client.get_income(incomeType="REALIZED_PNL", startTime=start_ms, limit=20)
-        result["api_ok"] = True
-        result["count"] = len(incomes) if incomes else 0
-        result["sample"] = incomes[:3] if incomes else []
-        result["msg"] = f"✓ API çalışıyor, son 24 saat {result['count']} kayıt bulundu"
+        incomes = client.get_income_history(incomeType="REALIZED_PNL", startTime=start_ms, limit=10)
+        result["methods"]["get_income"] = {
+            "ok": True,
+            "count": len(incomes) if incomes else 0,
+            "sample": incomes[:2] if incomes else []
+        }
     except Exception as e:
+        result["methods"]["get_income"] = {"ok": False, "error": str(e)}
+
+    # Yöntem 2: get_account_trades (BTCUSDT deneyelim, çoğu hesapta vardır)
+    try:
+        trades = client.get_account_trades(symbol="BTCUSDT", startTime=start_ms, limit=10)
+        result["methods"]["get_account_trades"] = {
+            "ok": True,
+            "count": len(trades) if trades else 0,
+        }
+    except Exception as e:
+        result["methods"]["get_account_trades"] = {"ok": False, "error": str(e)}
+
+    # Genel verdict
+    m1 = result["methods"]["get_income"].get("ok")
+    m2 = result["methods"]["get_account_trades"].get("ok")
+    if m1 or m2:
+        result["verdict"] = f"✓ Çalışıyor — method1:{m1}, method2:{m2}"
+        result["api_ok"] = True
+    else:
+        result["verdict"] = "❌ Her iki yöntem de fail — API key ayarlarına bak (Enable Futures + IP whitelist)"
         result["api_ok"] = False
-        result["error"] = str(e)
-        result["msg"] = f"❌ Hata: {e}"
-        result["hint"] = "API key'de 'Enable Futures' iznini kontrol et. Income history için ek izin gerekmez ama IP whitelist olabilir."
+
     return JSONResponse(result)
 
 
