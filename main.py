@@ -2499,10 +2499,15 @@ return`<tr><td><b>${{c.ticker}}</b></td><td style="color:${{sonucColor}}">${{c.s
 }}
 
 function renderStats(){{
-const tk=closedPositions.reduce((s,c)=>s+c.kar,0),ts=closedPositions.length,ws=closedPositions.filter(c=>c.kar>0).length,wr=ts>0?(ws/ts*100).toFixed(1):0;
-const today=now_tr().slice(0,10),bg=closedPositions.filter(c=>c.kapanis.startsWith(today)),bk=bg.reduce((s,c)=>s+c.kar,0),bt=bg.filter(c=>c.kar>0).length,bs=bg.filter(c=>c.kar<=0).length,bw=bg.length>0?(bt/bg.length*100).toFixed(1):0;
+// v6.6 Lite Patch 6: Binance PNL varsa onu kullan, yoksa dashboard kar
+const realKar=(c)=>(c.binance_pnl!=null?c.binance_pnl:c.kar);
+const tk=closedPositions.reduce((s,c)=>s+realKar(c),0),ts=closedPositions.length,ws=closedPositions.filter(c=>realKar(c)>0).length,wr=ts>0?(ws/ts*100).toFixed(1):0;
+const today=now_tr().slice(0,10),bg=closedPositions.filter(c=>c.kapanis.startsWith(today)),bk=bg.reduce((s,c)=>s+realKar(c),0),bt=bg.filter(c=>realKar(c)>0).length,bs=bg.filter(c=>realKar(c)<=0).length,bw=bg.length>0?(bt/bg.length*100).toFixed(1):0;
 const su=closedPositions.map(sureDk),os=su.length>0?su.reduce((a,b)=>a+b,0)/su.length:0,oss=os===0?'—':sureFmt(Math.round(os));
 const nr=tk>0?'#4ade80':(tk<0?'#f87171':'#e5e7eb'),wrr=wr>=50?'#4ade80':(ts>0?'#f87171':'#e5e7eb'),bkr=bk>0?'#4ade80':(bk<0?'#f87171':'#e5e7eb'),bwr=bw>=50?'#4ade80':(bg.length>0?'#f87171':'#e5e7eb');
+// Kaç pozda gerçek Binance verisi var, gösterge için
+const binanceCount=closedPositions.filter(c=>c.binance_pnl!=null).length;
+const karSubLbl=binanceCount===ts?'Net Kar (Binance)':(binanceCount>0?`Net Kar (${{binanceCount}}/${{ts}} gerçek)`:'Net Kar');
 // v6.1: Akıllı slot — TP1 vurmuş VE timeout-BE'liler exempt
 let aktifRisk=0,gar_tp1=0,gar_to=0;
 for(const p of Object.values(openPositions)){{if(p.tp1_hit)gar_tp1++;else if(p.timeout_be)gar_to++;else aktifRisk++}}
@@ -2512,7 +2517,7 @@ const openSubLbl=garantili>0?`Aktif+TP1${{gar_to>0?'+TO':''}}`:'Açık';
 document.getElementById('statsBar').innerHTML=
 `<div class="stat"><div class="stat-val">${{openLbl}}</div><div class="stat-lbl">${{openSubLbl}}</div></div>`+
 `<div class="stat"><div class="stat-val">${{ts}}</div><div class="stat-lbl">Kapanan</div></div>`+
-`<div class="stat"><div class="stat-val" style="color:${{nr}}">${{tk>=0?'+':''}}${{tk.toFixed(1)}}$</div><div class="stat-lbl">Net Kar</div></div>`+
+`<div class="stat"><div class="stat-val" style="color:${{nr}}">${{tk>=0?'+':''}}${{tk.toFixed(1)}}$</div><div class="stat-lbl">${{karSubLbl}}</div></div>`+
 `<div class="stat"><div class="stat-val" style="color:${{wrr}}">${{wr}}%</div><div class="stat-lbl">Win Rate</div></div>`+
 `<div class="stat"><div class="stat-val" style="color:${{bwr}}">${{bw}}%</div><div class="stat-lbl">Bugün WR</div></div>`+
 `<div class="stat"><div class="stat-val">${{oss}}</div><div class="stat-lbl">Ort. Süre</div></div>`+
