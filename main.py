@@ -906,7 +906,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.6 Lite — Patch 12 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions()} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.6 Lite — Patch 13 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions()} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -1112,7 +1112,7 @@ async def export_report():
     
     return JSONResponse({
         "report_generated_at": now_tr(),
-        "version": "v6.6 Lite Patch 12",
+        "version": "v6.6 Lite Patch 13",
         "config": {
             "max_positions": get_max_positions(),
             "max_pos_min": MAX_POSITIONS_MIN,
@@ -1487,9 +1487,9 @@ async def force_reopen_position(req: Request):
 @app.post("/api/migrate_pnl")
 async def migrate_old_pnl(req: Request):
     """
-    v6.6 Lite Patch 11: PER-SYMBOL migrate (inspect_pos mantığı).
-    Her kapanan poz için ayrı ayrı, symbol+zaman penceresi ile çek.
-    Bulk yöntem 1000 limit nedeniyle kayıt ATLIYORDU — bu onu çözer.
+    v6.6 Lite Patch 13: BATCH migrate — her istek 10 poz işler.
+    Frontend tekrar tekrar çağırır, böylece Railway 30sn timeout'una takılmaz.
+    Body: { dry_run, force_refresh, batch_start (0-indexed), batch_size (default 10) }
     """
     import asyncio
     body = {}
@@ -1498,28 +1498,37 @@ async def migrate_old_pnl(req: Request):
     except Exception:
         pass
     dry_run = body.get("dry_run", True)
+    force_refresh = bool(body.get("force_refresh", False))
+    batch_start = int(body.get("batch_start", 0))
+    batch_size = int(body.get("batch_size", 10))
+
+    closed_positions = data.get("closed_positions", [])
+    total = len(closed_positions)
 
     results = {
         "migrated": [], "skipped": [], "failed": [],
-        "dry_run": dry_run, "method": "per_symbol",
-        "closed_total": 0, "debug": []
+        "dry_run": dry_run, "method": "per_symbol_batch",
+        "closed_total": total,
+        "batch_start": batch_start,
+        "batch_size": batch_size,
+        "batch_end": min(batch_start + batch_size, total),
+        "is_last_batch": (batch_start + batch_size) >= total,
+        "force_refresh": force_refresh,
+        "debug": []
     }
-    closed_positions = data.get("closed_positions", [])
-    results["closed_total"] = len(closed_positions)
-    results["debug"].append(f"closed_positions sayısı: {len(closed_positions)}")
 
     if not closed_positions:
+        results["is_last_batch"] = True
         return JSONResponse({**results, "msg": "Kapanan pozisyon yok"})
 
-    # Force-refresh opsiyonu: var olan binance_pnl'i bile yeniden hesapla
-    force_refresh = bool(body.get("force_refresh", False))
-    if force_refresh:
-        results["debug"].append("🔄 force_refresh aktif — mevcut binance_pnl'ler de yeniden hesaplanacak")
+    # Bu batch'te işlenecek pozlar
+    batch = closed_positions[batch_start:batch_start + batch_size]
+    results["debug"].append(f"Batch: {batch_start}-{batch_start+len(batch)} / {total}")
 
     processed = 0
-    for c in closed_positions:
+    for c in batch:
         ticker = c.get("ticker")
-        
+
         # binance_pnl zaten var VE force_refresh kapalıysa atla
         if c.get("binance_pnl") is not None and not force_refresh:
             results["skipped"].append({"ticker": ticker, "reason": "already_has_binance_pnl"})
@@ -1534,19 +1543,17 @@ async def migrate_old_pnl(req: Request):
 
             dt_open = datetime.strptime(acilis, "%Y-%m-%d %H:%M")
             dt_open_utc = dt_open - timedelta(hours=3)
-            pos_start_ms = int(dt_open_utc.timestamp() * 1000) - 60000  # 1dk tampon
+            pos_start_ms = int(dt_open_utc.timestamp() * 1000) - 60000
 
             pos_end_ms = None
             if kapanis:
                 try:
                     dt_close = datetime.strptime(kapanis, "%Y-%m-%d %H:%M")
                     dt_close_utc = dt_close - timedelta(hours=3)
-                    pos_end_ms = int(dt_close_utc.timestamp() * 1000) + 300000  # 5dk tampon
+                    pos_end_ms = int(dt_close_utc.timestamp() * 1000) + 300000
                 except Exception:
                     pass
 
-            # PER-SYMBOL sorgu — inspect_pos ile birebir aynı mantık
-            # Rate limit: her istek arasında 200ms bekle
             await asyncio.sleep(0.2)
 
             pnl_kwargs = {"symbol": ticker, "incomeType": "REALIZED_PNL", "limit": 1000}
@@ -1590,7 +1597,6 @@ async def migrate_old_pnl(req: Request):
                 "fee": round(fee_total, 2),
                 "records": len(pnl_records),
             }
-            # Eğer force refresh idiyse, eski binance_pnl'i de göster
             if force_refresh and old_binance is not None:
                 mig_entry["old_binance_pnl"] = old_binance
                 mig_entry["refresh_change"] = round(net_pnl - old_binance, 2)
@@ -1603,9 +1609,9 @@ async def migrate_old_pnl(req: Request):
 
     if not dry_run and results["migrated"]:
         save_data(data)
-        print(f"[MIGRATE] {len(results['migrated'])} poz (per_symbol) güncellendi (force_refresh={force_refresh})")
+        print(f"[MIGRATE-BATCH] {batch_start}-{batch_start+len(batch)}: {len(results['migrated'])} poz güncellendi (force_refresh={force_refresh})")
 
-    results["debug"].append(f"İşlenen: {processed}, toplam süre ~{processed*0.4:.1f}sn")
+    results["debug"].append(f"İşlenen: {processed}/{len(batch)}")
     return JSONResponse(results)
 
 
@@ -2425,7 +2431,7 @@ async def update_position_highs_lows():
 async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
-    print(f"[BOOT] CAB Bot v6.6 Lite Patch 12 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
+    print(f"[BOOT] CAB Bot v6.6 Lite Patch 13 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -2439,7 +2445,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.6 Lite Patch 12 Dashboard</title>
+<title>CAB Bot v6.6 Lite Patch 13 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box}}
@@ -2493,7 +2499,7 @@ small{{color:#9ca3af}}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.6 Lite Patch 12 Dashboard</h1>
+<h1>🤖 CAB Bot v6.6 Lite Patch 13 Dashboard</h1>
 <div>
   <span class="badge">{mod_badge}</span>
   <small style="color:#9ca3af">MAX:<span id="maxPosDisplay" style="font-weight:700;color:#4ade80">{get_max_positions()}</span> aktif | Timeout:{TIMEOUT_HOURS}s→{TIMEOUT_ABSOLUTE_HOURS}s (koşullu: aktif≥{TIMEOUT_PRESSURE_THRESHOLD} ise akıllı kapama)</small>
@@ -3139,40 +3145,91 @@ function closeModal(){{document.getElementById('analysisModal').classList.remove
 async function clearOld(){{if(!confirm('30 günden eski kapanan pozisyonları silmek istiyor musun?'))return;try{{const r=await fetch('/api/clear_old',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{days:30}})}});const j=await r.json();toast(`✓ ${{j.removed}} kayıt silindi`);loadData()}}catch(e){{toast('Hata',true)}}}}
 
 async function migratePnl(){{
-  // v6.6 Lite Patch 11: Force refresh sor
-  const refreshExisting=confirm('Geçmiş kapanan pozların gerçek Binance PNL\\'ini çek?\\n\\n• TAMAM: TÜM pozları yeniden hesapla (force refresh — eski hatalı değerleri düzeltir)\\n• İPTAL: Sadece güncellenmemiş pozları çek');
-  toast('Binance\\'ten veri çekiliyor, per-symbol mod (~'+(refreshExisting?'30':'10')+'sn)...');
+  // v6.6 Lite Patch 13: BATCH migrate — 10'ar 10'ar, timeout riski yok
+  const refreshExisting=confirm('Geçmiş pozların gerçek Binance PNL\\'ini çek?\\n\\n• TAMAM: TÜM pozları yeniden hesapla (eski yanlışları düzelt)\\n• İPTAL: Sadece güncellenmemiş olanları çek');
+
+  const BATCH_SIZE=10;
+  let batchStart=0;
+  let allMigrated=[],allSkipped=[],allFailed=[];
+  let totalClosed=0;
+
+  toast('Batch 1 başlıyor...');
+
+  // Tüm batch'leri dry-run olarak al
   try{{
-    const r=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dry_run:true, force_refresh:refreshExisting}})}});
-    if(!r.ok){{toast('API yanıt vermedi: HTTP '+r.status,true);return}}
-    if(!r.ok){{toast('API yanıt vermedi: HTTP '+r.status,true);return}}
-    const j=await r.json();
-    const mig=j.migrated||[],skp=j.skipped||[],fail=j.failed||[];
-    console.log('[MIGRATE-DRY]',j);
-    let dbg='📊 Deneme Sonucu — Detaylı\\n\\n';
-    if(j.closed_total!==undefined)dbg+='Kapanan poz (veritabanında): '+j.closed_total+'\\n';
-    if(j.debug&&j.debug.length)dbg+='Debug:\\n'+j.debug.map(x=>'  • '+x).join('\\n')+'\\n\\n';
-    dbg+='✓ Güncellenebilir: '+mig.length+'\\n';
-    dbg+='⏭ Atlanan: '+skp.length+'\\n';
-    dbg+='❌ Başarısız: '+fail.length+'\\n\\n';
-    if(skp.length>0){{dbg+='Atlanma sebepleri (ilk 5):\\n';skp.slice(0,5).forEach(s=>{{dbg+='  '+s.ticker+': '+s.reason+'\\n'}});dbg+='\\n'}}
-    if(fail.length>0){{dbg+='❌ Hatalar (ilk 5):\\n';fail.slice(0,5).forEach(f=>{{dbg+='  '+f.ticker+': '+f.reason+'\\n'}});dbg+='\\n'}}
-    if(mig.length===0){{
-      dbg+='⚠ Hiçbir poz güncellenemedi.\\n\\nMuhtemel nedenler:\\n• API key Futures income izni yok\\n• Zaman parse hatası\\n• Binance IP kısıtı\\n\\nRailway log: [MIGRATE] satırlarına bak';
+    while(true){{
+      toast('Deneme: batch '+(Math.floor(batchStart/BATCH_SIZE)+1)+'... ('+batchStart+'/'+(totalClosed||'?')+')');
+      const r=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dry_run:true, force_refresh:refreshExisting, batch_start:batchStart, batch_size:BATCH_SIZE}})}});
+      if(!r.ok){{toast('API HTTP '+r.status,true);return}}
+      const j=await r.json();
+      totalClosed=j.closed_total||0;
+      allMigrated=allMigrated.concat(j.migrated||[]);
+      allSkipped=allSkipped.concat(j.skipped||[]);
+      allFailed=allFailed.concat(j.failed||[]);
+      console.log('[MIGRATE-DRY] batch '+batchStart+'-'+j.batch_end, j);
+      if(j.is_last_batch)break;
+      batchStart=j.batch_end;
+      // Küçük aralık
+      await new Promise(res=>setTimeout(res,100));
+    }}
+
+    let dbg='📊 Deneme Sonucu — BATCH ('+totalClosed+' poz)\\n\\n';
+    dbg+='✓ Güncellenebilir: '+allMigrated.length+'\\n';
+    dbg+='⏭ Atlanan: '+allSkipped.length+'\\n';
+    dbg+='❌ Başarısız: '+allFailed.length+'\\n\\n';
+    if(allSkipped.length>0){{
+      const reasons={{}};
+      allSkipped.forEach(s=>{{reasons[s.reason]=(reasons[s.reason]||0)+1}});
+      dbg+='Atlanma sebepleri:\\n';
+      Object.entries(reasons).forEach(([k,v])=>{{dbg+='  '+k+': '+v+' poz\\n'}});
+      dbg+='\\n';
+    }}
+    if(allFailed.length>0){{dbg+='❌ Hatalar (ilk 5):\\n';allFailed.slice(0,5).forEach(f=>{{dbg+='  '+f.ticker+': '+f.reason+'\\n'}});dbg+='\\n'}}
+
+    if(allMigrated.length===0){{
+      dbg+='⚠ Hiçbir poz güncellenemedi.';
       alert(dbg);return;
     }}
-    dbg+='Güncellenecek (ilk 5):\\n';
-    mig.slice(0,5).forEach(m=>{{dbg+='  '+m.ticker+': '+(m.dashboard_kar||0).toFixed(1)+' → '+(m.binance_pnl||0).toFixed(2)+' (fark: '+(m.fark||0).toFixed(1)+')\\n'}});
-    const sumOld=mig.reduce((s,m)=>s+(m.dashboard_kar||0),0);
-    const sumNew=mig.reduce((s,m)=>s+(m.binance_pnl||0),0);
-    dbg+='\\nDashboard toplam: '+sumOld.toFixed(2)+'$\\nBinance toplam:    '+sumNew.toFixed(2)+'$\\nFARK: '+(sumNew-sumOld).toFixed(2)+'$\\n\\nGerçek kayıt yapılsın mı?';
+
+    const sumOld=allMigrated.reduce((s,m)=>s+(m.dashboard_kar||0),0);
+    const sumNew=allMigrated.reduce((s,m)=>s+(m.binance_pnl||0),0);
+    dbg+='Dashboard toplam: '+sumOld.toFixed(2)+'$\\n';
+    dbg+='Binance toplam:    '+sumNew.toFixed(2)+'$\\n';
+    dbg+='FARK: '+(sumNew-sumOld).toFixed(2)+'$\\n\\n';
+
+    if(refreshExisting){{
+      const refreshed=allMigrated.filter(m=>m.old_binance_pnl!==undefined);
+      if(refreshed.length>0){{
+        dbg+='🔄 Force refresh ile değişenler: '+refreshed.length+'\\n';
+        const totalChange=refreshed.reduce((s,m)=>s+(m.refresh_change||0),0);
+        dbg+='   Net değişim: '+totalChange.toFixed(2)+'$\\n\\n';
+      }}
+    }}
+
+    dbg+='Gerçek kayıt yapılsın mı?';
     if(!confirm(dbg))return;
-    const r2=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dry_run:false, force_refresh:refreshExisting}})}});
-    const j2=await r2.json();
-    console.log('[MIGRATE-REAL]',j2);
-    toast('✓ '+(j2.migrated||[]).length+' poz güncellendi');
+
+    // REAL batch loop
+    batchStart=0;
+    let realMigrated=0;
+    while(true){{
+      toast('Kaydediliyor: batch '+(Math.floor(batchStart/BATCH_SIZE)+1)+'/'+Math.ceil(totalClosed/BATCH_SIZE));
+      const r2=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dry_run:false, force_refresh:refreshExisting, batch_start:batchStart, batch_size:BATCH_SIZE}})}});
+      if(!r2.ok){{toast('Kaydetme hatası: HTTP '+r2.status,true);return}}
+      const j2=await r2.json();
+      realMigrated+=(j2.migrated||[]).length;
+      console.log('[MIGRATE-REAL] batch '+batchStart, j2);
+      if(j2.is_last_batch)break;
+      batchStart=j2.batch_end;
+      await new Promise(res=>setTimeout(res,100));
+    }}
+
+    toast('✓ '+realMigrated+' poz güncellendi');
     setTimeout(()=>loadData(),800);
-  }}catch(e){{console.error('[MIGRATE ERR]',e);alert('Hata: '+e.message+'\\nRailway log\\'una bak.')}}
+  }}catch(e){{
+    console.error('[MIGRATE ERR]',e);
+    alert('Hata: '+e.message+'\\n\\nBatch: '+batchStart+'/'+totalClosed);
+  }}
 }}
 
 async function forceReopen(ticker){{
