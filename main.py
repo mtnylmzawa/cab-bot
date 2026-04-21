@@ -906,7 +906,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.6 Lite — Patch 13 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions()} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.6 Lite — Patch 13.1 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions()} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -1112,7 +1112,7 @@ async def export_report():
     
     return JSONResponse({
         "report_generated_at": now_tr(),
-        "version": "v6.6 Lite Patch 13",
+        "version": "v6.6 Lite Patch 13.1",
         "config": {
             "max_positions": get_max_positions(),
             "max_pos_min": MAX_POSITIONS_MIN,
@@ -1253,6 +1253,67 @@ async def inspect_position(ticker: str):
         result["error"] = str(e)
     
     return JSONResponse(result)
+
+
+
+@app.get("/api/migrate_test")
+async def migrate_test():
+    """
+    v6.6 Lite Patch 13 HOTFIX: Migrate'in ilk batch'ini doğrudan test et.
+    Tarayıcıya GET at, sonucu gör. Frontend problemi mi backend problemi mi ayırt edilir.
+    """
+    import asyncio
+    closed_positions = data.get("closed_positions", [])
+    if not closed_positions:
+        return JSONResponse({"error": "Kapanan poz yok", "closed_total": 0})
+    
+    # İlk 3 pozla test
+    test_batch = closed_positions[:3]
+    results = {
+        "closed_total": len(closed_positions),
+        "test_batch_size": len(test_batch),
+        "results": []
+    }
+    
+    for c in test_batch:
+        ticker = c.get("ticker")
+        entry = {"ticker": ticker, "existing_binance_pnl": c.get("binance_pnl")}
+        try:
+            acilis = c.get("acilis", "")
+            kapanis = c.get("kapanis", "")
+            dt_open = datetime.strptime(acilis, "%Y-%m-%d %H:%M")
+            dt_open_utc = dt_open - timedelta(hours=3)
+            pos_start_ms = int(dt_open_utc.timestamp() * 1000) - 60000
+            pos_end_ms = None
+            if kapanis:
+                dt_close = datetime.strptime(kapanis, "%Y-%m-%d %H:%M")
+                dt_close_utc = dt_close - timedelta(hours=3)
+                pos_end_ms = int(dt_close_utc.timestamp() * 1000) + 300000
+            
+            await asyncio.sleep(0.2)
+            pnl_records = client.get_income_history(
+                symbol=ticker, incomeType="REALIZED_PNL",
+                limit=1000, startTime=pos_start_ms, endTime=pos_end_ms
+            ) or []
+            await asyncio.sleep(0.2)
+            fee_records = client.get_income_history(
+                symbol=ticker, incomeType="COMMISSION",
+                limit=1000, startTime=pos_start_ms, endTime=pos_end_ms
+            ) or []
+            
+            pnl_total = sum(float(r.get("income", 0)) for r in pnl_records)
+            fee_total = sum(float(r.get("income", 0)) for r in fee_records)
+            entry["pnl_count"] = len(pnl_records)
+            entry["pnl_sum"] = round(pnl_total, 4)
+            entry["fee_count"] = len(fee_records)
+            entry["fee_sum"] = round(fee_total, 4)
+            entry["net"] = round(pnl_total + fee_total, 2)
+            entry["dashboard_kar"] = c.get("kar")
+        except Exception as e:
+            entry["error"] = str(e)
+        results["results"].append(entry)
+    
+    return JSONResponse(results)
 
 
 @app.get("/api/binance_test_income")
@@ -2431,7 +2492,7 @@ async def update_position_highs_lows():
 async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
-    print(f"[BOOT] CAB Bot v6.6 Lite Patch 13 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
+    print(f"[BOOT] CAB Bot v6.6 Lite Patch 13.1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -2445,7 +2506,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.6 Lite Patch 13 Dashboard</title>
+<title>CAB Bot v6.6 Lite Patch 13.1.1 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box}}
@@ -2499,7 +2560,7 @@ small{{color:#9ca3af}}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.6 Lite Patch 13 Dashboard</h1>
+<h1>🤖 CAB Bot v6.6 Lite Patch 13.1.1 Dashboard</h1>
 <div>
   <span class="badge">{mod_badge}</span>
   <small style="color:#9ca3af">MAX:<span id="maxPosDisplay" style="font-weight:700;color:#4ade80">{get_max_positions()}</span> aktif | Timeout:{TIMEOUT_HOURS}s→{TIMEOUT_ABSOLUTE_HOURS}s (koşullu: aktif≥{TIMEOUT_PRESSURE_THRESHOLD} ise akıllı kapama)</small>
