@@ -1487,9 +1487,9 @@ async def force_reopen_position(req: Request):
 @app.post("/api/migrate_pnl")
 async def migrate_old_pnl(req: Request):
     """
-    v6.6 Lite Patch 5: HYBRID migrate.
-    1. Önce symbol'süz toplu çek (1-2 istek)
-    2. Boş dönerse, her sembol için TEK TEK + 250ms delay (rate limit safe)
+    v6.6 Lite Patch 11: PER-SYMBOL migrate (inspect_pos mantığı).
+    Her kapanan poz için ayrı ayrı, symbol+zaman penceresi ile çek.
+    Bulk yöntem 1000 limit nedeniyle kayıt ATLIYORDU — bu onu çözer.
     """
     import asyncio
     body = {}
@@ -1498,11 +1498,10 @@ async def migrate_old_pnl(req: Request):
     except Exception:
         pass
     dry_run = body.get("dry_run", True)
-    days = int(body.get("days", 30))
 
     results = {
         "migrated": [], "skipped": [], "failed": [],
-        "dry_run": dry_run, "method": None,
+        "dry_run": dry_run, "method": "per_symbol",
         "closed_total": 0, "debug": []
     }
     closed_positions = data.get("closed_positions", [])
@@ -1512,45 +1511,17 @@ async def migrate_old_pnl(req: Request):
     if not closed_positions:
         return JSONResponse({**results, "msg": "Kapanan pozisyon yok"})
 
-    start_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    # Force-refresh opsiyonu: var olan binance_pnl'i bile yeniden hesapla
+    force_refresh = bool(body.get("force_refresh", False))
+    if force_refresh:
+        results["debug"].append("🔄 force_refresh aktif — mevcut binance_pnl'ler de yeniden hesaplanacak")
 
-    # ==== YÖNTEM A: Toplu çek (tek istek) ====
-    all_pnl = []
-    all_fees = []
-    bulk_ok = False
-    try:
-        all_pnl = client.get_income_history(incomeType="REALIZED_PNL", startTime=start_ms, limit=1000) or []
-        all_fees = client.get_income_history(incomeType="COMMISSION", startTime=start_ms, limit=1000) or []
-        bulk_ok = True
-        results["debug"].append(f"Toplu: {len(all_pnl)} PNL + {len(all_fees)} fee kayıt")
-    except Exception as e:
-        results["debug"].append(f"Toplu çekim fail: {e}")
-
-    # Toplu boş döndüyse sembol bazlı deneyelim (fallback)
-    symbol_mode = bulk_ok and len(all_pnl) == 0
-    if symbol_mode:
-        results["debug"].append("⚠️ Toplu boş, sembol bazlı deneme yapılıyor (yavaş)...")
-        results["method"] = "per_symbol"
-    else:
-        results["method"] = "bulk"
-
-    # Sembol+zaman bazında grupla
-    def group_by_symbol(rows):
-        groups = {}
-        for r in rows:
-            sym = r.get("symbol", "")
-            if not sym:
-                continue
-            groups.setdefault(sym, []).append(r)
-        return groups
-
-    pnl_by_sym = group_by_symbol(all_pnl)
-    fee_by_sym = group_by_symbol(all_fees)
-
-    # Her kapanan poz için
+    processed = 0
     for c in closed_positions:
         ticker = c.get("ticker")
-        if c.get("binance_pnl") is not None:
+        
+        # binance_pnl zaten var VE force_refresh kapalıysa atla
+        if c.get("binance_pnl") is not None and not force_refresh:
             results["skipped"].append({"ticker": ticker, "reason": "already_has_binance_pnl"})
             continue
 
@@ -1563,294 +1534,79 @@ async def migrate_old_pnl(req: Request):
 
             dt_open = datetime.strptime(acilis, "%Y-%m-%d %H:%M")
             dt_open_utc = dt_open - timedelta(hours=3)
-            pos_start_ms = int(dt_open_utc.timestamp() * 1000) - 60000
+            pos_start_ms = int(dt_open_utc.timestamp() * 1000) - 60000  # 1dk tampon
 
             pos_end_ms = None
             if kapanis:
                 try:
                     dt_close = datetime.strptime(kapanis, "%Y-%m-%d %H:%M")
                     dt_close_utc = dt_close - timedelta(hours=3)
-                    pos_end_ms = int(dt_close_utc.timestamp() * 1000) + 120000
+                    pos_end_ms = int(dt_close_utc.timestamp() * 1000) + 300000  # 5dk tampon
                 except Exception:
                     pass
 
-            # Fallback modunda sembol bazlı çek
-            if symbol_mode:
-                try:
-                    await asyncio.sleep(0.25)  # 4 req/sec limit
-                    sym_pnls = client.get_income_history(
-                        symbol=ticker, incomeType="REALIZED_PNL",
-                        startTime=pos_start_ms,
-                        endTime=pos_end_ms or int(datetime.now(timezone.utc).timestamp()*1000),
-                        limit=20
-                    ) or []
-                    await asyncio.sleep(0.25)
-                    sym_fees = client.get_income_history(
-                        symbol=ticker, incomeType="COMMISSION",
-                        startTime=pos_start_ms,
-                        endTime=pos_end_ms or int(datetime.now(timezone.utc).timestamp()*1000),
-                        limit=20
-                    ) or []
-                except Exception as e:
-                    results["failed"].append({"ticker": ticker, "reason": f"symbol fetch: {e}"})
-                    continue
-                matching_pnls = sym_pnls
-                matching_fees = sym_fees
-            else:
-                sym_pnls = pnl_by_sym.get(ticker, [])
-                sym_fees = fee_by_sym.get(ticker, [])
-                def in_window(r):
-                    t = int(r.get("time", 0))
-                    if t < pos_start_ms:
-                        return False
-                    if pos_end_ms and t > pos_end_ms:
-                        return False
-                    return True
-                matching_pnls = [r for r in sym_pnls if in_window(r)]
-                matching_fees = [r for r in sym_fees if in_window(r)]
+            # PER-SYMBOL sorgu — inspect_pos ile birebir aynı mantık
+            # Rate limit: her istek arasında 200ms bekle
+            await asyncio.sleep(0.2)
 
-            if not matching_pnls:
+            pnl_kwargs = {"symbol": ticker, "incomeType": "REALIZED_PNL", "limit": 1000}
+            if pos_start_ms:
+                pnl_kwargs["startTime"] = pos_start_ms
+            if pos_end_ms:
+                pnl_kwargs["endTime"] = pos_end_ms
+
+            pnl_records = client.get_income_history(**pnl_kwargs) or []
+
+            await asyncio.sleep(0.2)
+
+            fee_kwargs = {"symbol": ticker, "incomeType": "COMMISSION", "limit": 1000}
+            if pos_start_ms:
+                fee_kwargs["startTime"] = pos_start_ms
+            if pos_end_ms:
+                fee_kwargs["endTime"] = pos_end_ms
+
+            fee_records = client.get_income_history(**fee_kwargs) or []
+
+            if not pnl_records and not fee_records:
                 results["skipped"].append({"ticker": ticker, "reason": "no_binance_record_in_window"})
                 continue
 
-            pnl_total = sum(float(r.get("income", 0)) for r in matching_pnls)
-            fee_total = sum(float(r.get("income", 0)) for r in matching_fees)
+            pnl_total = sum(float(r.get("income", 0)) for r in pnl_records)
+            fee_total = sum(float(r.get("income", 0)) for r in fee_records)
             net_pnl = pnl_total + fee_total
             old_pnl = c.get("kar", 0)
+            old_binance = c.get("binance_pnl")
 
             if not dry_run:
                 c["binance_pnl"] = round(net_pnl, 2)
                 c["binance_fee"] = round(fee_total, 2)
 
-            results["migrated"].append({
+            mig_entry = {
                 "ticker": ticker,
                 "acilis": acilis,
                 "dashboard_kar": old_pnl,
                 "binance_pnl": round(net_pnl, 2),
                 "fark": round(net_pnl - old_pnl, 2),
                 "fee": round(fee_total, 2),
-                "records": len(matching_pnls),
-            })
+                "records": len(pnl_records),
+            }
+            # Eğer force refresh idiyse, eski binance_pnl'i de göster
+            if force_refresh and old_binance is not None:
+                mig_entry["old_binance_pnl"] = old_binance
+                mig_entry["refresh_change"] = round(net_pnl - old_binance, 2)
+
+            results["migrated"].append(mig_entry)
+            processed += 1
+
         except Exception as e:
             results["failed"].append({"ticker": ticker, "reason": str(e)})
 
     if not dry_run and results["migrated"]:
         save_data(data)
-        print(f"[MIGRATE] {len(results['migrated'])} pozisyon güncellendi ({results['method']})")
+        print(f"[MIGRATE] {len(results['migrated'])} poz (per_symbol) güncellendi (force_refresh={force_refresh})")
 
+    results["debug"].append(f"İşlenen: {processed}, toplam süre ~{processed*0.4:.1f}sn")
     return JSONResponse(results)
-
-
-# ============ SHADOW MODE HANDLERS (v6.5 — RAM v14 için) ============
-# Shadow pozisyonlar: Binance'e emir göndermez, sadece sanal takip
-# Amaç: Yeni stratejileri canlı piyasada risksiz test etmek
-
-SHADOW_FEE_PCT = 0.1  # Taker fee (0.05 giriş + 0.05 çıkış = toplam 0.1%)
-SHADOW_SLIPPAGE_PCT = 0.05  # Yaklaşık slippage
-
-def shadow_calc_kar(marj, lev, giris, exit_px, oran_pct):
-    """Shadow pozisyon için kar/zarar hesapla (fee + slippage dahil)"""
-    if giris <= 0:
-        return 0.0
-    pos_size = marj * lev
-    kapatilan = pos_size * (oran_pct / 100.0)
-    ham_kar = kapatilan * (exit_px - giris) / giris
-    # Fee ve slippage düş
-    fee_cost = kapatilan * (SHADOW_FEE_PCT / 100.0)
-    slip_cost = kapatilan * (SHADOW_SLIPPAGE_PCT / 100.0)
-    net_kar = ham_kar - fee_cost - slip_cost
-    return round(net_kar, 2)
-
-def shadow_handle_giris(msg, system_tag):
-    """RAM v14 GIRIS mesajını işle — sanal pozisyon aç"""
-    parsed = parse_giris(msg)
-    if not parsed:
-        return {"status": "parse_error", "shadow": True}
-    print(f"[SHADOW PARSE] {parsed}")
-    ticker = parsed["ticker"]
-
-    if ticker in data["shadow_positions"]:
-        print(f"[SHADOW DUP] {ticker} zaten shadow'da açık")
-        return {"status": "duplicate", "shadow": True}
-
-    # v6.6 Lite Patch 10: RAM'e de aynı MAX_POS kısıtı — adil karşılaştırma
-    shadow_aktif = len(data.get("shadow_positions", {}))
-    max_limit = get_max_positions()
-    if shadow_aktif >= max_limit:
-        if "shadow_skipped" not in data:
-            data["shadow_skipped"] = []
-        data["shadow_skipped"].append({
-            "ticker": ticker,
-            "giris": parsed["giris"],
-            "stop": parsed["stop"],
-            "tp1": parsed["tp1"],
-            "tp2": parsed["tp2"],
-            "marj": parsed["marj"],
-            "lev": parsed["lev"],
-            "risk": parsed["risk"],
-            "kapat_oran": parsed["kapat_oran"],
-            "atr_skor": parsed["atr_skor"],
-            "zaman": now_tr(),
-            "sebep": f"Max {max_limit} shadow poz dolu",
-            "max_seen": parsed["giris"], "min_seen": parsed["giris"],
-            "system": system_tag,
-        })
-        # Rolling limit
-        if len(data["shadow_skipped"]) > 200:
-            data["shadow_skipped"] = data["shadow_skipped"][-200:]
-        save_data(data)
-        print(f"[SHADOW LIMIT] {system_tag} | {ticker} atlandı (aktif:{shadow_aktif}/{max_limit})")
-        return {"status": "shadow_skipped_max", "shadow": True, "ticker": ticker, "max": max_limit}
-
-    # Sanal pozisyon kaydı
-    data["shadow_positions"][ticker] = {
-        "ticker": ticker,
-        "system": system_tag,  # "RAM v14" etc
-        "giris": parsed["giris"],
-        "stop": parsed["stop"],
-        "tp1": parsed["tp1"],
-        "tp2": parsed["tp2"],
-        "marj": parsed["marj"],
-        "lev": parsed["lev"],
-        "risk": parsed["risk"],
-        "kapat_oran": parsed["kapat_oran"],
-        "atr_skor": parsed["atr_skor"],
-        "rs_spread": parsed.get("rs_spread", 0),
-        "zaman": now_tr(),
-        "zaman_full": now_tr(),
-        "tp1_hit": False,
-        "tp2_hit": False,
-        "hh_pct": 0,
-        "max_seen": 0,
-        "min_seen": 0,
-        "current_stop": parsed["stop"],
-        "tp1_kar": 0,
-        "tp2_kar": 0,
-    }
-    save_data(data)
-    print(f"[SHADOW GIRIS] {system_tag} | {ticker} @ {parsed['giris']} | Stop:{parsed['stop']} TP1:{parsed['tp1']} TP2:{parsed['tp2']} | Marj:{parsed['marj']}$ Lev:{parsed['lev']}x")
-    return {"status": "shadow_opened", "shadow": True, "ticker": ticker}
-
-def shadow_handle_tp1(msg, system_tag):
-    """RAM v14 TP1 mesajını işle — sanal kısmi kapama + stop BE"""
-    parsed = parse_tp1(msg)
-    if not parsed:
-        return {"status": "parse_error", "shadow": True}
-    ticker = parsed["ticker"]
-
-    if ticker not in data["shadow_positions"]:
-        print(f"[SHADOW] TP1 geldi ama {ticker} shadow'da yok")
-        return {"status": "not_found", "shadow": True}
-
-    pos = data["shadow_positions"][ticker]
-    if pos.get("tp1_hit"):
-        print(f"[SHADOW] TP1 duplicate {ticker}")
-        return {"status": "tp1_duplicate", "shadow": True}
-
-    tp1_px = parsed.get("tp1") or pos["tp1"]
-    yeni_stop = parsed.get("stop") or pos["giris"]  # Genelde BE = giris
-    kapat_oran = parsed.get("kapat_oran", pos.get("kapat_oran", 50))
-
-    # Sanal kar hesapla
-    tp1_kar = shadow_calc_kar(pos["marj"], pos["lev"], pos["giris"], tp1_px, kapat_oran)
-    pos["tp1_hit"] = True
-    pos["tp1_kar"] = tp1_kar
-    pos["current_stop"] = yeni_stop
-    pos["tp1_time"] = now_tr()
-
-    save_data(data)
-    print(f"[SHADOW TP1] {system_tag} | {ticker} @ {tp1_px} | %{kapat_oran} kapat → +{tp1_kar}$ | Stop→{yeni_stop}")
-    return {"status": "shadow_tp1", "shadow": True, "kar": tp1_kar}
-
-def shadow_handle_tp2(msg, system_tag):
-    """RAM v14 TP2 mesajını işle — sanal kısmi kapama"""
-    parsed = parse_tp2(msg)
-    if not parsed:
-        return {"status": "parse_error", "shadow": True}
-    ticker = parsed["ticker"]
-
-    if ticker not in data["shadow_positions"]:
-        print(f"[SHADOW] TP2 geldi ama {ticker} shadow'da yok")
-        return {"status": "not_found", "shadow": True}
-
-    pos = data["shadow_positions"][ticker]
-    if pos.get("tp2_hit"):
-        print(f"[SHADOW] TP2 duplicate {ticker}")
-        return {"status": "tp2_duplicate", "shadow": True}
-
-    tp2_px = parsed.get("tp2") or pos["tp2"]
-    kapat_oran = parsed.get("kapat_oran", 25)
-
-    tp2_kar = shadow_calc_kar(pos["marj"], pos["lev"], pos["giris"], tp2_px, kapat_oran)
-    pos["tp2_hit"] = True
-    pos["tp2_kar"] = tp2_kar
-    pos["current_stop"] = pos["tp1"]  # RAM v14 mantığı: TP2 sonrası stop→TP1 seviyesine
-    pos["tp2_time"] = now_tr()
-
-    save_data(data)
-    print(f"[SHADOW TP2] {system_tag} | {ticker} @ {tp2_px} | %{kapat_oran} kapat → +{tp2_kar}$ | Stop→{pos['tp1']}")
-    return {"status": "shadow_tp2", "shadow": True, "kar": tp2_kar}
-
-def shadow_handle_stop_or_trail(msg, system_tag, kind="STOP"):
-    """RAM v14 STOP/TRAIL mesajını işle — sanal tam kapama"""
-    # STOP ve TRAIL aynı mantık: kalan pozisyonu kapat
-    try:
-        parts = [p.strip() for p in msg.split("|")]
-        ticker = parts[1].strip()
-    except Exception as e:
-        print(f"[SHADOW PARSE ERR {kind}] {e}")
-        return {"status": "parse_error", "shadow": True}
-
-    if ticker not in data["shadow_positions"]:
-        print(f"[SHADOW] {kind} geldi ama {ticker} shadow'da yok")
-        return {"status": "not_found", "shadow": True}
-
-    pos = data["shadow_positions"][ticker]
-    # Kapanış fiyatı: current_stop (TP1/TP2 sonrası BE/TP1'e çekilmiş olabilir)
-    exit_px = pos.get("current_stop", pos["stop"])
-
-    # Kalan pozisyon oranı
-    kapat_oran = 100
-    if pos.get("tp2_hit"):
-        kapat_oran = 100 - pos.get("kapat_oran", 50) - 25  # tp1 sonra tp2 sonra kalan
-    elif pos.get("tp1_hit"):
-        kapat_oran = 100 - pos.get("kapat_oran", 50)
-    # Tp hiç vurmamışsa 100 (tamamını kapat)
-
-    # Kalan pozisyonun kar/zararı (fee+slippage dahil)
-    remaining_kar = shadow_calc_kar(pos["marj"], pos["lev"], pos["giris"], exit_px, kapat_oran)
-
-    # Toplam kar: tp1 + tp2 + kalan
-    total_kar = round(pos.get("tp1_kar", 0) + pos.get("tp2_kar", 0) + remaining_kar, 2)
-
-    # Sonuç tag (TP2 sonrası stop = trailing kapama mantığında)
-    if pos.get("tp2_hit"):
-        sonuc = "TP1+TP2+Trail"
-        kind = "TRAIL"  # otomatik düzelt — TP2 sonrası stop = trailing
-    elif pos.get("tp1_hit"):
-        sonuc = "TP1+" + ("Trail" if kind == "TRAIL" else "Stop")
-    else:
-        sonuc = kind
-
-    closed_rec = {
-        **pos,
-        "sonuc": sonuc,
-        "kar": total_kar,
-        "trail_kar": remaining_kar,
-        "exit_px": exit_px,
-        "kapanis": now_tr(),
-        "kind": kind,
-    }
-    data["shadow_closed"].append(closed_rec)
-    del data["shadow_positions"][ticker]
-
-    # Rolling limit — son 200 kapalı shadow pozisyon
-    if len(data["shadow_closed"]) > 200:
-        data["shadow_closed"] = data["shadow_closed"][-200:]
-
-    save_data(data)
-    print(f"[SHADOW {kind}] {system_tag} | {ticker} | {sonuc} | Toplam:{total_kar}$ (tp1:{pos.get('tp1_kar',0)} tp2:{pos.get('tp2_kar',0)} kalan:{remaining_kar})")
-    return {"status": "shadow_closed", "shadow": True, "kar": total_kar, "sonuc": sonuc}
 
 
 @app.post("/webhook")
@@ -3171,10 +2927,12 @@ function closeModal(){{document.getElementById('analysisModal').classList.remove
 async function clearOld(){{if(!confirm('30 günden eski kapanan pozisyonları silmek istiyor musun?'))return;try{{const r=await fetch('/api/clear_old',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{days:30}})}});const j=await r.json();toast(`✓ ${{j.removed}} kayıt silindi`);loadData()}}catch(e){{toast('Hata',true)}}}}
 
 async function migratePnl(){{
-  if(!confirm('Geçmiş kapanan pozların gerçek Binance PNL\\'ini çek?\\n(Önce DENEME yapılır, sonra onay istenir)'))return;
-  toast('Binance\\'ten veri çekiliyor, bekleyin 10-20sn...');
+  // v6.6 Lite Patch 11: Force refresh sor
+  const refreshExisting=confirm('Geçmiş kapanan pozların gerçek Binance PNL\\'ini çek?\\n\\n• TAMAM: TÜM pozları yeniden hesapla (force refresh — eski hatalı değerleri düzeltir)\\n• İPTAL: Sadece güncellenmemiş pozları çek');
+  toast('Binance\\'ten veri çekiliyor, per-symbol mod (~'+(refreshExisting?'30':'10')+'sn)...');
   try{{
-    const r=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dry_run:true}})}});
+    const r=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dry_run:true, force_refresh:refreshExisting}})}});
+    if(!r.ok){{toast('API yanıt vermedi: HTTP '+r.status,true);return}}
     if(!r.ok){{toast('API yanıt vermedi: HTTP '+r.status,true);return}}
     const j=await r.json();
     const mig=j.migrated||[],skp=j.skipped||[],fail=j.failed||[];
@@ -3197,7 +2955,7 @@ async function migratePnl(){{
     const sumNew=mig.reduce((s,m)=>s+(m.binance_pnl||0),0);
     dbg+='\\nDashboard toplam: '+sumOld.toFixed(2)+'$\\nBinance toplam:    '+sumNew.toFixed(2)+'$\\nFARK: '+(sumNew-sumOld).toFixed(2)+'$\\n\\nGerçek kayıt yapılsın mı?';
     if(!confirm(dbg))return;
-    const r2=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dry_run:false}})}});
+    const r2=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{dry_run:false, force_refresh:refreshExisting}})}});
     const j2=await r2.json();
     console.log('[MIGRATE-REAL]',j2);
     toast('✓ '+(j2.migrated||[]).length+' poz güncellendi');
