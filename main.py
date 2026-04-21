@@ -9,7 +9,9 @@ app = FastAPI()
 
 # ============ KONFIGÜRASYON ============
 TEST_MODE = False  # 🟢 CANLI MOD
-MAX_POSITIONS = 7  # v6.1: 5 → 7 (akıllı slot ile pratikte daha fazla açık olabilir)
+MAX_POSITIONS_DEFAULT = 7  # v6.1: 5 → 7 (akıllı slot ile pratikte daha fazla açık olabilir)
+MAX_POSITIONS_MIN = 3      # v6.6 Lite Patch 8: Hard limit
+MAX_POSITIONS_MAX = 12     # v6.6 Lite Patch 8: Hard limit
 DATA_FILE = os.environ.get("DATA_FILE", "/tmp/cab_data.json")
 TIMEOUT_HOURS = 12  # pozisyon timeout süresi (asgari)
 TIMEOUT_ABSOLUTE_HOURS = 24  # v6.4: mutlak limit — slot baskısı olmasa bile zorla kapat
@@ -37,6 +39,12 @@ INITIAL_DATA = {
         "reason_text": None,     # insan okuyabilir açıklama
         "paused_at": None,       # TR saat string
         "auto_triggered": False  # aynı gün içinde birden çok kez tetiklenmesin
+    },
+    "max_pos_state": {  # v6.6 Lite Patch 8: Dinamik MAX pozisyon
+        "current": MAX_POSITIONS_DEFAULT,
+        "last_change_at": None,
+        "change_history": [],   # [{"ts": "...", "from": X, "to": Y, "reason": "..."}]
+        "auto_reduced": False,  # oto-düşürme yapıldı mı?
     }
 }
 
@@ -51,6 +59,14 @@ def load_data():
                 loaded["pause_state"] = {
                     "paused": False, "reason": None, "reason_text": None,
                     "paused_at": None, "auto_triggered": False
+                }
+            # v6.6 Lite Patch 8: max_pos_state migration
+            if "max_pos_state" not in loaded:
+                loaded["max_pos_state"] = {
+                    "current": MAX_POSITIONS_DEFAULT,
+                    "last_change_at": None,
+                    "change_history": [],
+                    "auto_reduced": False,
                 }
             return loaded
     except Exception as e:
@@ -140,6 +156,82 @@ def check_auto_pause_triggers():
                 "auto_daily_loss",
                 f"Günlük zarar ${daily_net:.1f} (limit: ${DAILY_LOSS_LIMIT}) — günlük kayıp koruması"
             )
+
+
+# ============ DİNAMİK MAX POSITIONS (v6.6 Lite Patch 8) ============
+
+def get_max_positions():
+    """Şu anki MAX pozisyon limitini getir (dinamik, data'dan okunur)"""
+    mp = data.get("max_pos_state", {})
+    val = mp.get("current", MAX_POSITIONS_DEFAULT)
+    # Hard limitler
+    val = max(MAX_POSITIONS_MIN, min(MAX_POSITIONS_MAX, int(val)))
+    return val
+
+
+def set_max_positions(new_val, reason="manual"):
+    """MAX pozisyon limitini değiştir (API ve oto-düşürme tarafından çağrılır)"""
+    new_val = max(MAX_POSITIONS_MIN, min(MAX_POSITIONS_MAX, int(new_val)))
+    if "max_pos_state" not in data:
+        data["max_pos_state"] = {
+            "current": MAX_POSITIONS_DEFAULT,
+            "last_change_at": None,
+            "change_history": [],
+            "auto_reduced": False,
+        }
+    old_val = data["max_pos_state"].get("current", MAX_POSITIONS_DEFAULT)
+    if new_val == old_val:
+        return {"changed": False, "value": new_val}
+
+    data["max_pos_state"]["current"] = new_val
+    data["max_pos_state"]["last_change_at"] = now_tr()
+    history = data["max_pos_state"].get("change_history", [])
+    history.append({
+        "ts": now_tr(),
+        "from": old_val,
+        "to": new_val,
+        "reason": reason,
+    })
+    # Sadece son 50 değişiklik tut
+    data["max_pos_state"]["change_history"] = history[-50:]
+    if reason.startswith("auto_"):
+        data["max_pos_state"]["auto_reduced"] = True
+    save_data(data)
+    print(f"[MAX_POS] {old_val} → {new_val} ({reason})")
+    return {"changed": True, "value": new_val, "from": old_val}
+
+
+def check_auto_reduce_max_pos():
+    """
+    Pozisyon kapanışında çağrılır. Ardışık stop/zarar varsa MAX'ı KÜÇÜLT.
+    ASLA artırmaz (sadece sen manuel artırırsın).
+    Kill Switch'ten önce devreye girer — bu daha yumuşak bir koruma.
+    """
+    if is_paused():
+        return  # zaten pause'da, max'a dokunma
+
+    closed = data.get("closed_positions", [])
+    if len(closed) < 3:
+        return  # yeterli veri yok
+
+    current_max = get_max_positions()
+
+    # Kural 1: Son 3 pozda 2+ stop/timeout → MAX'ı 2 düşür (min 3)
+    last3 = closed[-3:]
+    stops_in_3 = sum(1 for c in last3 if c.get("kar", 0) < 0 and ("Stop" in c.get("sonuc", "") or "Timeout" in c.get("sonuc", "")))
+    if stops_in_3 >= 2 and current_max > MAX_POSITIONS_MIN:
+        new_val = max(MAX_POSITIONS_MIN, current_max - 2)
+        if new_val < current_max:
+            set_max_positions(new_val, f"auto_stop_streak_3in2")
+            return
+
+    # Kural 2: Bugün 4+ stop yediyse → MAX = 3 (min)
+    today = now_tr()[:10]
+    bugun = [c for c in closed if c.get("kapanis", "").startswith(today)]
+    stops_today = sum(1 for c in bugun if c.get("kar", 0) < 0 and ("Stop" in c.get("sonuc", "") or "Timeout" in c.get("sonuc", "")))
+    if stops_today >= 4 and current_max > MAX_POSITIONS_MIN:
+        set_max_positions(MAX_POSITIONS_MIN, f"auto_daily_{stops_today}stops")
+        return
 
 
 # ============ VERİ YÖNETİMİ (devam) ============# v6.1: Skipped_signals key'i eski verilerde olmayabilir, garanti et
@@ -814,7 +906,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.6 Lite çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {MAX_POSITIONS} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.6 Lite çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions()} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -872,7 +964,7 @@ async def test_binance():
     all_ok = all("✅" in str(v) for k, v in results.items() if k.endswith("_status"))
     results["SONUC"] = "🟢 TÜM TESTLER BAŞARILI — Gerçek mod için hazır!" if all_ok else "🔴 BAZI TESTLER BAŞARISIZ — Kontrol et!"
     results["test_mode"] = TEST_MODE
-    results["max_positions"] = MAX_POSITIONS
+    results["max_positions"] = get_max_positions()
     results["timeout_hours"] = TIMEOUT_HOURS
 
     return JSONResponse(results)
@@ -972,6 +1064,197 @@ async def manual_timeout_check():
     return JSONResponse(result)
 
 
+@app.get("/api/export_report")
+async def export_report():
+    """
+    v6.6 Lite Patch 10: Tüm sistem verisini rapor olarak döner.
+    Metin bu JSON'u Claude'a atar, Claude analiz yapar.
+    """
+    closed = data.get("closed_positions", [])
+    shadow_closed = data.get("shadow_closed", [])
+    open_pos = data.get("open_positions", {})
+    shadow_open = data.get("shadow_positions", {})
+    skipped = data.get("skipped_signals", [])
+    shadow_skipped = data.get("shadow_skipped", [])
+    
+    def stats_from_closed(arr, use_binance=False):
+        if not arr:
+            return {"count": 0, "wins": 0, "losses": 0, "wr": 0, "total_pnl": 0,
+                    "avg_win": 0, "avg_loss": 0, "profit_factor": 0}
+        kar_fn = lambda c: (c.get("binance_pnl") if use_binance and c.get("binance_pnl") is not None else c.get("kar", 0))
+        total = sum(kar_fn(c) for c in arr)
+        wins = [c for c in arr if kar_fn(c) > 0]
+        losses = [c for c in arr if kar_fn(c) < 0]
+        total_win = sum(kar_fn(c) for c in wins)
+        total_loss = sum(kar_fn(c) for c in losses)
+        return {
+            "count": len(arr),
+            "wins": len(wins),
+            "losses": len(losses),
+            "wr": round(len(wins) / len(arr) * 100, 1) if arr else 0,
+            "total_pnl": round(total, 2),
+            "avg_win": round(total_win / len(wins), 2) if wins else 0,
+            "avg_loss": round(total_loss / len(losses), 2) if losses else 0,
+            "profit_factor": round(abs(total_win / total_loss), 2) if total_loss else 0,
+        }
+    
+    today = now_tr()[:10]
+    cab_today = [c for c in closed if c.get("kapanis", "").startswith(today)]
+    ram_today = [c for c in shadow_closed if c.get("kapanis", "").startswith(today)]
+    
+    # Son 7 gün
+    try:
+        d7 = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        d7 = ""
+    cab_7d = [c for c in closed if c.get("kapanis", "") >= d7]
+    ram_7d = [c for c in shadow_closed if c.get("kapanis", "") >= d7]
+    
+    return JSONResponse({
+        "report_generated_at": now_tr(),
+        "version": "v6.6 Lite Patch 10",
+        "config": {
+            "max_positions": get_max_positions(),
+            "max_pos_min": MAX_POSITIONS_MIN,
+            "max_pos_max": MAX_POSITIONS_MAX,
+            "timeout_hours": TIMEOUT_HOURS,
+            "kill_switch_enabled": KILL_SWITCH_ENABLED,
+            "stop_streak_window": STOP_STREAK_WINDOW,
+            "stop_streak_threshold": STOP_STREAK_THRESHOLD,
+            "daily_loss_limit": DAILY_LOSS_LIMIT,
+        },
+        "pause_state": get_pause_info(),
+        "max_pos_state": data.get("max_pos_state", {}),
+        "cab": {
+            "open_count": len(open_pos),
+            "open_positions": open_pos,
+            "closed_count": len(closed),
+            "closed_positions": closed,  # tamamı
+            "skipped_count": len(skipped),
+            "skipped_signals": skipped[-100:],  # son 100
+            "stats_all_time_dashboard": stats_from_closed(closed, use_binance=False),
+            "stats_all_time_binance": stats_from_closed(closed, use_binance=True),
+            "stats_today_dashboard": stats_from_closed(cab_today, use_binance=False),
+            "stats_today_binance": stats_from_closed(cab_today, use_binance=True),
+            "stats_7d_dashboard": stats_from_closed(cab_7d, use_binance=False),
+            "stats_7d_binance": stats_from_closed(cab_7d, use_binance=True),
+        },
+        "ram": {
+            "open_count": len(shadow_open),
+            "open_positions": shadow_open,
+            "closed_count": len(shadow_closed),
+            "closed_positions": shadow_closed,  # tamamı
+            "skipped_count": len(shadow_skipped),
+            "skipped_signals": shadow_skipped[-100:],
+            "stats_all_time": stats_from_closed(shadow_closed),
+            "stats_today": stats_from_closed(ram_today),
+            "stats_7d": stats_from_closed(ram_7d),
+        },
+    })
+
+
+@app.get("/api/inspect_pos/{ticker}")
+async def inspect_position(ticker: str):
+    """
+    v6.6 Lite Patch 9: Bir pozisyon için Binance'ten TÜM income kayıtlarını getir.
+    Teşhis için — migrate fonksiyonunun neden eksik hesapladığını gör.
+    """
+    ticker = ticker.upper()
+    # Closed'da bu ticker için son kayıt
+    closed_positions = data.get("closed_positions", [])
+    target = None
+    for c in reversed(closed_positions):
+        if c.get("ticker") == ticker:
+            target = c
+            break
+    if not target:
+        return JSONResponse({"error": f"{ticker} closed_positions'da yok"}, status_code=404)
+    
+    result = {
+        "ticker": ticker,
+        "dashboard_record": {
+            "kar": target.get("kar"),
+            "sonuc": target.get("sonuc"),
+            "tp1_kar": target.get("tp1_kar"),
+            "tp2_kar": target.get("tp2_kar"),
+            "trail_kar": target.get("trail_kar"),
+            "acilis": target.get("acilis"),
+            "kapanis": target.get("kapanis"),
+            "binance_pnl": target.get("binance_pnl"),
+            "binance_fee": target.get("binance_fee"),
+        },
+    }
+    
+    # Zaman penceresi
+    try:
+        acilis_str = target.get("acilis", "")
+        kapanis_str = target.get("kapanis", "")
+        dt_open = datetime.strptime(acilis_str, "%Y-%m-%d %H:%M")
+        dt_open_utc = dt_open - timedelta(hours=3)
+        start_ms = int(dt_open_utc.timestamp() * 1000) - 60000
+        
+        end_ms = None
+        if kapanis_str:
+            dt_close = datetime.strptime(kapanis_str, "%Y-%m-%d %H:%M")
+            dt_close_utc = dt_close - timedelta(hours=3)
+            end_ms = int(dt_close_utc.timestamp() * 1000) + 300000  # 5 dakika tampon
+        
+        result["window"] = {
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "acilis": acilis_str,
+            "kapanis": kapanis_str,
+        }
+        
+        # Binance'ten SYMBOL bazlı TÜM income kayıtları
+        kwargs = {"symbol": ticker, "limit": 1000}
+        if start_ms:
+            kwargs["startTime"] = start_ms
+        if end_ms:
+            kwargs["endTime"] = end_ms
+        
+        # REALIZED_PNL
+        pnl_records = client.get_income_history(**{**kwargs, "incomeType": "REALIZED_PNL"}) or []
+        # COMMISSION
+        fee_records = client.get_income_history(**{**kwargs, "incomeType": "COMMISSION"}) or []
+        # Tüm income (tip belirtmeden)
+        all_records = client.get_income_history(**kwargs) or []
+        
+        result["binance_records"] = {
+            "realized_pnl": {
+                "count": len(pnl_records),
+                "total": round(sum(float(r.get("income", 0)) for r in pnl_records), 4),
+                "records": pnl_records,
+            },
+            "commission": {
+                "count": len(fee_records),
+                "total": round(sum(float(r.get("income", 0)) for r in fee_records), 4),
+                "records": fee_records,
+            },
+            "all_income": {
+                "count": len(all_records),
+                "types": list(set(r.get("incomeType", "?") for r in all_records)),
+            },
+        }
+        
+        # Hesaplanan toplam
+        pnl_sum = result["binance_records"]["realized_pnl"]["total"]
+        fee_sum = result["binance_records"]["commission"]["total"]
+        net = pnl_sum + fee_sum
+        result["calculated"] = {
+            "pnl_sum": pnl_sum,
+            "fee_sum": fee_sum,
+            "net": round(net, 2),
+            "dashboard_binance_pnl": target.get("binance_pnl"),
+            "fark": round(net - (target.get("binance_pnl") or 0), 2),
+        }
+        
+    except Exception as e:
+        result["error"] = str(e)
+    
+    return JSONResponse(result)
+
+
 @app.get("/api/binance_test_income")
 async def test_binance_income():
     """
@@ -1055,6 +1338,52 @@ async def toggle_pause(req: Request):
         else:
             pause_bot("manual", reason_text)
             return JSONResponse({"success": True, "state": get_pause_info(), "msg": "Bot durduruldu"})
+
+
+@app.get("/api/max_pos_status")
+async def get_max_pos_status():
+    """v6.6 Lite Patch 8: MAX pozisyon durumu + geçmiş"""
+    mp = data.get("max_pos_state", {})
+    history = mp.get("change_history", [])
+    today = now_tr()[:10]
+    changes_today = [h for h in history if h.get("ts", "").startswith(today)]
+    return JSONResponse({
+        "current": get_max_positions(),
+        "min": MAX_POSITIONS_MIN,
+        "max": MAX_POSITIONS_MAX,
+        "default": MAX_POSITIONS_DEFAULT,
+        "last_change_at": mp.get("last_change_at"),
+        "auto_reduced": mp.get("auto_reduced", False),
+        "changes_today_count": len(changes_today),
+        "changes_today": changes_today,
+        "recent_history": history[-10:],
+    })
+
+
+@app.post("/api/set_max_pos")
+async def api_set_max_pos(req: Request):
+    """v6.6 Lite Patch 8: MAX pozisyon limiti değiştir (manuel)
+    Body: {"value": 7, "reason": "manuel" (opsiyonel)}"""
+    body = {}
+    try:
+        body = await req.json()
+    except Exception:
+        pass
+    new_val = body.get("value")
+    reason = body.get("reason", "manual")
+    if new_val is None:
+        return JSONResponse({"success": False, "error": "value gerekli"}, status_code=400)
+    try:
+        new_val = int(new_val)
+    except Exception:
+        return JSONResponse({"success": False, "error": "value sayı olmalı"}, status_code=400)
+    if new_val < MAX_POSITIONS_MIN or new_val > MAX_POSITIONS_MAX:
+        return JSONResponse({
+            "success": False,
+            "error": f"value {MAX_POSITIONS_MIN}-{MAX_POSITIONS_MAX} aralığında olmalı"
+        }, status_code=400)
+    result = set_max_positions(new_val, reason)
+    return JSONResponse({"success": True, **result, "current": get_max_positions()})
 
 
 @app.post("/api/force_reopen")
@@ -1344,6 +1673,35 @@ def shadow_handle_giris(msg, system_tag):
         print(f"[SHADOW DUP] {ticker} zaten shadow'da açık")
         return {"status": "duplicate", "shadow": True}
 
+    # v6.6 Lite Patch 10: RAM'e de aynı MAX_POS kısıtı — adil karşılaştırma
+    shadow_aktif = len(data.get("shadow_positions", {}))
+    max_limit = get_max_positions()
+    if shadow_aktif >= max_limit:
+        if "shadow_skipped" not in data:
+            data["shadow_skipped"] = []
+        data["shadow_skipped"].append({
+            "ticker": ticker,
+            "giris": parsed["giris"],
+            "stop": parsed["stop"],
+            "tp1": parsed["tp1"],
+            "tp2": parsed["tp2"],
+            "marj": parsed["marj"],
+            "lev": parsed["lev"],
+            "risk": parsed["risk"],
+            "kapat_oran": parsed["kapat_oran"],
+            "atr_skor": parsed["atr_skor"],
+            "zaman": now_tr(),
+            "sebep": f"Max {max_limit} shadow poz dolu",
+            "max_seen": parsed["giris"], "min_seen": parsed["giris"],
+            "system": system_tag,
+        })
+        # Rolling limit
+        if len(data["shadow_skipped"]) > 200:
+            data["shadow_skipped"] = data["shadow_skipped"][-200:]
+        save_data(data)
+        print(f"[SHADOW LIMIT] {system_tag} | {ticker} atlandı (aktif:{shadow_aktif}/{max_limit})")
+        return {"status": "shadow_skipped_max", "shadow": True, "ticker": ticker, "max": max_limit}
+
     # Sanal pozisyon kaydı
     data["shadow_positions"][ticker] = {
         "ticker": ticker,
@@ -1551,7 +1909,7 @@ async def webhook(req: Request):
         aktif_risk, gar_tp1, gar_to = count_active_risk()
         garantili = gar_tp1 + gar_to
 
-        if aktif_risk >= MAX_POSITIONS:
+        if aktif_risk >= get_max_positions():
             if "skipped_signals" not in data:
                 data["skipped_signals"] = []
             data["skipped_signals"].append({
@@ -1566,12 +1924,12 @@ async def webhook(req: Request):
                 "kapat_oran": parsed["kapat_oran"],
                 "atr_skor": parsed["atr_skor"],
                 "zaman": now_tr(),
-                "sebep": f"Max {MAX_POSITIONS} aktif risk dolu (+{garantili} garantili)"
+                "sebep": f"Max {get_max_positions()} aktif risk dolu (+{garantili} garantili)"
             })
             if len(data["skipped_signals"]) > 50:
                 data["skipped_signals"] = data["skipped_signals"][-50:]
             save_data(data)
-            print(f"[LIMIT] Aktif risk {aktif_risk}/{MAX_POSITIONS} (+{gar_tp1} TP1 +{gar_to} TO-BE) — {ticker} atlandı (kaydedildi)")
+            print(f"[LIMIT] Aktif risk {aktif_risk}/{get_max_positions()} (+{gar_tp1} TP1 +{gar_to} TO-BE) — {ticker} atlandı (kaydedildi)")
             return {"status": "limit"}
         if ticker in data["open_positions"]:
             print(f"[DUP] {ticker} zaten açık")
@@ -1747,6 +2105,7 @@ async def webhook(req: Request):
         save_data(data)
         print(f"{mode_tag} TRAIL({parsed['tp_type']}): {ticker} | {sonuc} | dashboard:+{total_kar}$ binance:{binance_pnl}$")
         check_auto_pause_triggers()  # v6.6 Lite Patch 5
+        check_auto_reduce_max_pos()   # v6.6 Lite Patch 8
         return {"status": "trail_closed"}
 
     # === STOP ===
@@ -1827,6 +2186,7 @@ async def webhook(req: Request):
         save_data(data)
         print(f"{mode_tag} STOP: {ticker} | {sonuc} | dashboard:{total_kar}$ binance:{binance_pnl}$")
         check_auto_pause_triggers()  # v6.6 Lite Patch 5
+        check_auto_reduce_max_pos()   # v6.6 Lite Patch 8
         return {"status": "stopped"}
 
     else:
@@ -1868,17 +2228,17 @@ async def timeout_scan_once():
             # MUTLAK LİMİT (24s+) → ne olursa olsun timeout
             # 12s ≤ yaş < 24s arası → slot baskısı varsa timeout, yoksa skip
             aktif_risk, gar_tp1, gar_to = count_active_risk()
-            slot_doluluk_pct = (aktif_risk / MAX_POSITIONS) * 100
+            slot_doluluk_pct = (aktif_risk / get_max_positions()) * 100
 
             if age_hours < TIMEOUT_ABSOLUTE_HOURS:
                 # Henüz mutlak limite gelmedi → slot baskısına bak
                 if aktif_risk < TIMEOUT_PRESSURE_THRESHOLD:
                     # Slot baskısı yok → pozisyona şans tanı, timeout YAPMA
                     if scanned == 1:  # İlk kontrol için log yaz, spam etmeyelim
-                        print(f"[TIMEOUT-SKIP] {ticker} {age_hours:.1f}s açık ama aktif_risk:{aktif_risk}/{MAX_POSITIONS} (eşik:{TIMEOUT_PRESSURE_THRESHOLD}) — bekle")
+                        print(f"[TIMEOUT-SKIP] {ticker} {age_hours:.1f}s açık ama aktif_risk:{aktif_risk}/{get_max_positions()} (eşik:{TIMEOUT_PRESSURE_THRESHOLD}) — bekle")
                     continue
                 else:
-                    print(f"[TIMEOUT] {ticker} {age_hours:.1f}s açık | aktif_risk:{aktif_risk}/{MAX_POSITIONS} (eşik:{TIMEOUT_PRESSURE_THRESHOLD}) — slot baskısı, akıllı kapama")
+                    print(f"[TIMEOUT] {ticker} {age_hours:.1f}s açık | aktif_risk:{aktif_risk}/{get_max_positions()} (eşik:{TIMEOUT_PRESSURE_THRESHOLD}) — slot baskısı, akıllı kapama")
             else:
                 print(f"[TIMEOUT] {ticker} {age_hours:.1f}s açık (MUTLAK limit:{TIMEOUT_ABSOLUTE_HOURS}s) — zorla akıllı kapama")
 
@@ -1934,6 +2294,7 @@ async def timeout_scan_once():
                 actioned.append({"ticker": ticker, "action": "CLOSE", "kar": kar, "age_hours": round(age_hours, 1)})
                 print(f"[TIMEOUT-CLOSE] {ticker} → kapatıldı ({kar:+.1f}$)")
                 check_auto_pause_triggers()  # v6.6 Lite Patch 5
+                check_auto_reduce_max_pos()   # v6.6 Lite Patch 8
 
     except Exception as e:
         errors.append(f"global: {e}")
@@ -2096,7 +2457,7 @@ async def update_position_highs_lows():
 async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
-    print(f"[BOOT] CAB Bot v6.6 Lite | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{MAX_POSITIONS} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
+    print(f"[BOOT] CAB Bot v6.6 Lite | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -2167,9 +2528,18 @@ small{{color:#9ca3af}}
 <h1>🤖 CAB Bot v6.6 Lite Dashboard</h1>
 <div>
   <span class="badge">{mod_badge}</span>
-  <small style="color:#9ca3af">MAX:{MAX_POSITIONS} aktif | Timeout:{TIMEOUT_HOURS}s→{TIMEOUT_ABSOLUTE_HOURS}s (koşullu: aktif≥{TIMEOUT_PRESSURE_THRESHOLD} ise akıllı kapama)</small>
+  <small style="color:#9ca3af">MAX:<span id="maxPosDisplay" style="font-weight:700;color:#4ade80">{get_max_positions()}</span> aktif | Timeout:{TIMEOUT_HOURS}s→{TIMEOUT_ABSOLUTE_HOURS}s (koşullu: aktif≥{TIMEOUT_PRESSURE_THRESHOLD} ise akıllı kapama)</small>
   <button class="btn btn-warn" style="margin-left:8px;padding:3px 8px;font-size:10px" onclick="requestNotif()">🔔 Bildirim İzni</button>
   <button class="btn" style="padding:3px 8px;font-size:10px" onclick="manualTimeoutCheck()">⏰ Timeout Kontrol</button>
+  <!-- v6.6 Lite Patch 8: MAX POS +/- Kontrol -->
+  <span style="margin-left:8px;padding:3px 6px;background:#1e293b;border-radius:6px;font-size:11px;border:1px solid #475569">
+    <span style="color:#9ca3af">MAX:</span>
+    <button class="btn" style="padding:1px 6px;font-size:11px;background:#475569" onclick="changeMaxPos(-1)">−</button>
+    <b id="maxPosBtnVal" style="color:#4ade80;padding:0 6px;min-width:16px;display:inline-block;text-align:center">7</b>
+    <button class="btn" style="padding:1px 6px;font-size:11px;background:#475569" onclick="changeMaxPos(1)">+</button>
+    <small id="maxPosSubtext" style="color:#9ca3af;margin-left:4px"></small>
+  </span>
+  <button class="btn" style="padding:3px 8px;font-size:10px;background:#0891b2;margin-left:8px" onclick="downloadReport()">📊 Rapor</button>
   <button id="pauseBtn" class="btn" style="padding:3px 8px;font-size:10px;background:#dc2626;margin-left:8px" onclick="togglePause()">🛑 BOT'U DURDUR</button>
 </div>
 <div class="subtitle">⟳ Son güncelleme: <span id="lastUpdate">—</span> <small>(5sn fiyat / 20sn sayfa)</small></div>
@@ -2367,7 +2737,7 @@ let shadowPositions={{}},shadowClosed=[],shadowPrices={{}};let shadowTab='open';
 let currentSystem='cab'; // 'cab' veya 'ram' — aktif sekme
 let sortState={{open:{{col:null,dir:'asc'}},closed:{{col:'kapanis',dir:'desc'}}}};
 
-async function loadData(){{loadPauseState();try{{const r=await fetch('/api/data');const d=await r.json();openPositions=d.open_positions||{{}};closedPositions=d.closed_positions||[];skippedSignals=d.skipped_signals||[];shadowPositions=d.shadow_positions||{{}};shadowClosed=d.shadow_closed||[];renderAll();detectChanges()}}catch(e){{console.error(e)}}}}
+async function loadData(){{loadPauseState();loadMaxPosState();try{{const r=await fetch('/api/data');const d=await r.json();openPositions=d.open_positions||{{}};closedPositions=d.closed_positions||[];skippedSignals=d.skipped_signals||[];shadowPositions=d.shadow_positions||{{}};shadowClosed=d.shadow_closed||[];renderAll();detectChanges()}}catch(e){{console.error(e)}}}}
 
 async function fp(sym){{try{{const r=await fetch('https://fapi.binance.com/fapi/v1/ticker/price?symbol='+sym);if(!r.ok)return null;return parseFloat((await r.json()).price)}}catch(e){{return null}}}}
 
@@ -2392,7 +2762,7 @@ if(j.actioned_count>0){{const summary=j.actioned.map(a=>`${{a.ticker}}: ${{a.act
 else{{toast(`✓ Tarandı: ${{j.scanned}} poz, hiçbiri timeout aşmadı`)}}
 }}catch(e){{toast('Hata: '+e.message,true)}}}}
 
-function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();renderShadow();updateTabBadges();if(currentSystem==='ram')renderRamStatsBar();checkWarnings();renderCompare();detectDivergence();renderPauseState()}}
+function renderAll(){{renderStats();renderOpen();renderClosed();renderSkipped();renderShadow();updateTabBadges();if(currentSystem==='ram')renderRamStatsBar();checkWarnings();renderCompare();detectDivergence();renderPauseState();renderMaxPosState()}}
 
 function renderCompare(){{
   const box=document.getElementById('compareBox');
@@ -2892,6 +3262,76 @@ async function togglePause(){{
       pauseState=j.state;
       renderPauseState();
     }}
+  }}catch(e){{alert('Hata: '+e.message)}}
+}}
+
+// v6.6 Lite Patch 10: MAX POS kontrolü
+let maxPosState = {{current:7, min:3, max:12, changes_today_count:0}};
+
+async function loadMaxPosState(){{
+  try{{
+    const r=await fetch('/api/max_pos_status');
+    const j=await r.json();
+    maxPosState=j;
+    renderMaxPosState();
+  }}catch(e){{console.error('Max pos state:',e)}}
+}}
+
+function renderMaxPosState(){{
+  const val=maxPosState.current||7;
+  const count=maxPosState.changes_today_count||0;
+  const autoReduced=maxPosState.auto_reduced||false;
+  const btnVal=document.getElementById('maxPosBtnVal');
+  const disp=document.getElementById('maxPosDisplay');
+  const sub=document.getElementById('maxPosSubtext');
+  if(btnVal)btnVal.textContent=val;
+  if(disp)disp.textContent=val;
+  if(sub){{
+    let txt='';
+    if(autoReduced)txt='🤖 oto';
+    if(count>=5)txt+=(txt?' | ':'')+`⚠️ ${{count}} değişim bugün`;
+    sub.innerHTML=txt;
+  }}
+}}
+
+async function changeMaxPos(delta){{
+  const current=maxPosState.current||7;
+  const newVal=current+delta;
+  const min=maxPosState.min||3;
+  const max=maxPosState.max||12;
+  if(newVal<min){{toast(`Min ${{min}}, daha az olamaz`);return}}
+  if(newVal>max){{toast(`Max ${{max}}, daha fazla olamaz`);return}}
+  // Günlük hatırlatma: 5'ten fazla değişim yapmışsa uyar
+  const count=maxPosState.changes_today_count||0;
+  if(count>=5){{
+    if(!confirm(`⚠️ Bugün ${{count}} kez MAX değiştirdin, aşırı tepki verme. Devam?`))return;
+  }}
+  try{{
+    const r=await fetch('/api/set_max_pos',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{value:newVal,reason:'manual_ui'}})}});
+    const j=await r.json();
+    if(j.success){{
+      toast(`✓ MAX: ${{current}} → ${{newVal}}`);
+      loadMaxPosState();
+    }}else{{alert('Hata: '+(j.error||'bilinmiyor'))}}
+  }}catch(e){{alert('Hata: '+e.message)}}
+}}
+
+// v6.6 Lite Patch 10: Rapor indir
+async function downloadReport(){{
+  toast('Rapor hazırlanıyor...');
+  try{{
+    const r=await fetch('/api/export_report');
+    if(!r.ok){{toast('Rapor alınamadı: HTTP '+r.status,true);return}}
+    const j=await r.json();
+    const blob=new Blob([JSON.stringify(j,null,2)],{{type:'application/json'}});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    const ts=new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+    a.href=url;a.download=`cab_ram_report_${{ts}}.json`;
+    document.body.appendChild(a);a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast('✓ Rapor indirildi');
   }}catch(e){{alert('Hata: '+e.message)}}
 }}
 
