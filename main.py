@@ -910,7 +910,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.6 Lite — Patch 14.1 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions()} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.6 Lite — Patch 14.2 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions()} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -1116,7 +1116,7 @@ async def export_report():
     
     return JSONResponse({
         "report_generated_at": now_tr(),
-        "version": "v6.6 Lite Patch 14.1",
+        "version": "v6.6 Lite Patch 14.2",
         "config": {
             "max_positions": get_max_positions(),
             "max_pos_min": MAX_POSITIONS_MIN,
@@ -2539,7 +2539,7 @@ async def update_position_highs_lows():
 async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
-    print(f"[BOOT] CAB Bot v6.6 Lite Patch 14.1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
+    print(f"[BOOT] CAB Bot v6.6 Lite Patch 14.2 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -2553,7 +2553,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.6 Lite Patch 14.1.1 Dashboard</title>
+<title>CAB Bot v6.6 Lite Patch 14.2.1 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box}}
@@ -2607,7 +2607,7 @@ small{{color:#9ca3af}}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.6 Lite Patch 14.1.1 Dashboard</h1>
+<h1>🤖 CAB Bot v6.6 Lite Patch 14.2.1 Dashboard</h1>
 <div>
   <span class="badge">{mod_badge}</span>
   <small style="color:#9ca3af">MAX:<span id="maxPosDisplay" style="font-weight:700;color:#4ade80">{get_max_positions()}</span> aktif | Timeout:{TIMEOUT_HOURS}s→{TIMEOUT_ABSOLUTE_HOURS}s (koşullu: aktif≥{TIMEOUT_PRESSURE_THRESHOLD} ise akıllı kapama)</small>
@@ -2624,7 +2624,7 @@ small{{color:#9ca3af}}
   <button class="btn" style="padding:3px 8px;font-size:10px;background:#0891b2;margin-left:8px" onclick="downloadReport()">📊 Rapor</button>
   <button id="pauseBtn" class="btn" style="padding:3px 8px;font-size:10px;background:#dc2626;margin-left:8px" onclick="togglePause()">🛑 BOT'U DURDUR</button>
 </div>
-<div class="subtitle">⟳ Son güncelleme: <span id="lastUpdate">—</span> <small>(5sn fiyat / 20sn sayfa)</small></div>
+<div class="subtitle">⟳ Son güncelleme: <span id="lastUpdate">—</span> <small>(5sn fiyat)</small></div>
 
 <!-- v6.6 Lite Patch 5: PAUSE / KILL SWITCH BANNER -->
 <div id="pauseBanner" style="display:none;background:linear-gradient(90deg,#7f1d1d,#991b1b);border:2px solid #dc2626;border-radius:8px;padding:14px 18px;margin:14px 0;color:#fecaca;font-size:13px;box-shadow:0 0 20px rgba(220,38,38,0.3)">
@@ -3489,7 +3489,9 @@ async function init(){{setupSort();await loadData();lastOpenState=JSON.parse(JSO
 // v6.5: Son kullanılan sekmeyi geri yükle
 try{{const savedSys=localStorage.getItem('cabbot_system');if(savedSys==='ram')switchSystem('ram')}}catch(e){{}}
 if(Object.keys(openPositions).length>0||skippedSignals.length>0){{updatePrices()}}else{{setInterval(async()=>{{if(window._migrateActive)return;await loadData();document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8)}},10000)}}
-setTimeout(()=>location.reload(),20000)}}
+// v14.2: 20sn reload KALDIRILDI — loadData zaten 10sn'de çalışıyor
+// Artık sadece migrate olmadığında ve çok uzun kaldığında reload
+setInterval(()=>{{if(window._migrateActive)return;location.reload()}},300000)}}
 init();
 </script>
 </body></html>"""
