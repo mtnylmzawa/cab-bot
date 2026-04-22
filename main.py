@@ -910,7 +910,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.6 Lite — Patch 14 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions()} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.6 Lite — Patch 14.1 çalışıyor</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions()} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -1116,7 +1116,7 @@ async def export_report():
     
     return JSONResponse({
         "report_generated_at": now_tr(),
-        "version": "v6.6 Lite Patch 14",
+        "version": "v6.6 Lite Patch 14.1",
         "config": {
             "max_positions": get_max_positions(),
             "max_pos_min": MAX_POSITIONS_MIN,
@@ -2539,7 +2539,7 @@ async def update_position_highs_lows():
 async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
-    print(f"[BOOT] CAB Bot v6.6 Lite Patch 14 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
+    print(f"[BOOT] CAB Bot v6.6 Lite Patch 14.1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -2553,7 +2553,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.6 Lite Patch 14.1 Dashboard</title>
+<title>CAB Bot v6.6 Lite Patch 14.1.1 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box}}
@@ -2607,7 +2607,7 @@ small{{color:#9ca3af}}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.6 Lite Patch 14.1 Dashboard</h1>
+<h1>🤖 CAB Bot v6.6 Lite Patch 14.1.1 Dashboard</h1>
 <div>
   <span class="badge">{mod_badge}</span>
   <small style="color:#9ca3af">MAX:<span id="maxPosDisplay" style="font-weight:700;color:#4ade80">{get_max_positions()}</span> aktif | Timeout:{TIMEOUT_HOURS}s→{TIMEOUT_ABSOLUTE_HOURS}s (koşullu: aktif≥{TIMEOUT_PRESSURE_THRESHOLD} ise akıllı kapama)</small>
@@ -2824,7 +2824,10 @@ async function loadData(){{loadPauseState();loadMaxPosState();try{{const r=await
 async function fp(sym){{try{{const r=await fetch('https://fapi.binance.com/fapi/v1/ticker/price?symbol='+sym);if(!r.ok)return null;return parseFloat((await r.json()).price)}}catch(e){{return null}}}}
 
 let skippedUpdateCounter=0;
-async function updatePrices(){{for(const sym of Object.keys(openPositions)){{const px=await fp(sym);if(px===null)continue;openPrices[sym]=px;try{{await fetch('/update_hh',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ticker:sym,price:px}})}})}}catch(e){{}}}}renderOpen();
+async function updatePrices(){{
+// v14 fix: Migrate aktifken fiyat güncellemesini duraklat (DOM tazelemeyi önle)
+if(window._migrateActive){{setTimeout(updatePrices,5000);return}}
+for(const sym of Object.keys(openPositions)){{const px=await fp(sym);if(px===null)continue;openPrices[sym]=px;try{{await fetch('/update_hh',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ticker:sym,price:px}})}})}}catch(e){{}}}}renderOpen();
 if(skippedUpdateCounter===0||skippedUpdateCounter%6===0){{if(skippedSignals.length>0)updateSkippedPrices();if(Object.keys(shadowPositions).length>0)updateShadowPrices()}}
 skippedUpdateCounter++;
 document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8);setTimeout(updatePrices,5000)}}
@@ -3262,6 +3265,7 @@ async function migratePnl(){{
 
   try{{
     // Dry run - sadece say
+    window._migrateActive=true;  // v14 fix: DOM refresh'leri duraklat
     toast('Sayım yapılıyor...');
     const r1=await fetch('/api/migrate_pnl',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'dry_run',force_refresh:refreshExisting}})}});
     if(!r1.ok){{toast('Sayım hatası: HTTP '+r1.status,true);return}}
@@ -3313,12 +3317,13 @@ async function migratePnl(){{
             done+='Binance toplam:   '+st.summary.binance_total+'$\\n';
             done+='FARK: '+st.summary.fark+'$';
           }}
+          window._migrateActive=false;  // v14 fix: refresh'leri aç
           alert(done);
           toast('✓ Tamamlandı!');
           setTimeout(()=>loadData(),500);
         }}else if(st.status==='error'){{
           clearInterval(pollInterval);
-          alert('❌ Hata: '+(st.error||'bilinmiyor'));
+          window._migrateActive=false;alert('❌ Hata: '+(st.error||'bilinmiyor'));
         }}
       }}catch(e){{
         console.error('[MIGRATE-POLL ERR]',e);
@@ -3327,9 +3332,10 @@ async function migratePnl(){{
     }},2000);
 
     // Güvenlik: 10 dakika sonra polling'i durdur
-    setTimeout(()=>clearInterval(pollInterval),600000);
+    setTimeout(()=>{{clearInterval(pollInterval);window._migrateActive=false}},600000);
 
   }}catch(e){{
+    window._migrateActive=false;
     console.error('[MIGRATE ERR]',e);
     alert('Hata: '+e.message);
   }}
@@ -3482,7 +3488,7 @@ function exportCSV(type){{let rows,fn;if(type==='open'){{rows=Object.entries(ope
 async function init(){{setupSort();await loadData();lastOpenState=JSON.parse(JSON.stringify(openPositions));
 // v6.5: Son kullanılan sekmeyi geri yükle
 try{{const savedSys=localStorage.getItem('cabbot_system');if(savedSys==='ram')switchSystem('ram')}}catch(e){{}}
-if(Object.keys(openPositions).length>0||skippedSignals.length>0){{updatePrices()}}else{{setInterval(async()=>{{await loadData();document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8)}},10000)}}
+if(Object.keys(openPositions).length>0||skippedSignals.length>0){{updatePrices()}}else{{setInterval(async()=>{{if(window._migrateActive)return;await loadData();document.getElementById('lastUpdate').textContent=new Date().toTimeString().slice(0,8)}},10000)}}
 setTimeout(()=>location.reload(),20000)}}
 init();
 </script>
