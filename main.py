@@ -3023,6 +3023,30 @@ tr:hover{background:#16213a}
 .modalBox h2{margin:0 0 12px;color:#a5b4fc;font-size:18px}
 .modalClose{float:right;background:#dc2626;color:white;border:none;padding:6px 12px;border-radius:5px;cursor:pointer}
 
+/* Üst fiyat çubuğu */
+.priceBar{display:flex;gap:8px;margin:10px 0 4px;flex-wrap:wrap}
+.priceCard{flex:1;min-width:120px;background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;padding:8px 12px;border-radius:8px;display:flex;flex-direction:column;gap:2px}
+.pcLabel{font-size:10px;color:#94a3b8;font-weight:600;letter-spacing:0.5px}
+.pcVal{font-size:16px;font-weight:700;color:#fbbf24}
+.pcChg{font-size:11px;font-weight:600}
+.pcChg.up{color:#4ade80}
+.pcChg.down{color:#f87171}
+@media(max-width:640px){
+  .priceCard{padding:6px 10px;min-width:100px}
+  .pcVal{font-size:14px}
+  .pcLabel{font-size:9px}
+}
+
+/* Coin link stili */
+.coinLink{color:#60a5fa;text-decoration:none;font-weight:700;cursor:pointer}
+.coinLink:hover{color:#93c5fd;text-decoration:underline}
+.coinLink::after{content:" 🔗";font-size:9px;opacity:0.6}
+
+/* Açık pozlar Durum sütunu renkleri */
+.statusCell{font-weight:600;font-size:11px}
+.statusCell.up{color:#4ade80}
+.statusCell.down{color:#f87171}
+
 /* Filter row */
 .filterRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0 8px;padding:8px 10px;background:#0f172a;border-radius:6px;border:1px solid #334155}
 .filterRow label{font-size:11px;color:#94a3b8;margin-right:2px}
@@ -3049,6 +3073,25 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 
 <h1>🤖 CAB Bot v6.7 — Dual System</h1>
 <div class="muted">⟳ <span id="lastUpdate">—</span> | Veri 10sn'de yenilenir</div>
+
+<!-- Üst Fiyat Çubuğu -->
+<div class="priceBar">
+  <div class="priceCard">
+    <div class="pcLabel">BTC/USDT</div>
+    <div class="pcVal" id="btcPrice">—</div>
+    <div class="pcChg" id="btcChg">—</div>
+  </div>
+  <div class="priceCard">
+    <div class="pcLabel">ETH/USDT</div>
+    <div class="pcVal" id="ethPrice">—</div>
+    <div class="pcChg" id="ethChg">—</div>
+  </div>
+  <div class="priceCard">
+    <div class="pcLabel">ETH/BTC</div>
+    <div class="pcVal" id="ethBtcPrice">—</div>
+    <div class="pcChg" id="ethBtcChg">—</div>
+  </div>
+</div>
 
 <!-- Mod genel bilgi (üst) -->
 <div class="bar">
@@ -3126,12 +3169,16 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
           <th data-sort="cab_open:marj" onclick="setSort('cab_open','marj')">Marj</th>
           <th data-sort="cab_open:lev" onclick="setSort('cab_open','lev')">Lev</th>
           <th data-sort="cab_open:giris" onclick="setSort('cab_open','giris')">Giriş</th>
+          <th data-sort="cab_open:px" onclick="setSort('cab_open','px')">Şu An</th>
+          <th data-sort="cab_open:pct" onclick="setSort('cab_open','pct')">Durum</th>
+          <th data-sort="cab_open:tp1kalan" onclick="setSort('cab_open','tp1kalan')">TP1'e Kalan</th>
+          <th data-sort="cab_open:stopkalan" onclick="setSort('cab_open','stopkalan')">Stop'a Kalan</th>
           <th>Stop</th><th>TP1</th><th>TP2</th>
           <th data-sort="cab_open:hh_pct" onclick="setSort('cab_open','hh_pct')">HH%</th>
           <th data-sort="cab_open:market_regime" onclick="setSort('cab_open','market_regime')">Rejim</th>
           <th data-sort="cab_open:zaman" onclick="setSort('cab_open','zaman')">Zaman</th>
         </tr></thead>
-        <tbody id="cabOpenBody"><tr><td colspan="10" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
+        <tbody id="cabOpenBody"><tr><td colspan="14" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -3256,12 +3303,16 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
           <th data-sort="ram_open:marj" onclick="setSort('ram_open','marj')">Marj</th>
           <th data-sort="ram_open:lev" onclick="setSort('ram_open','lev')">Lev</th>
           <th data-sort="ram_open:giris" onclick="setSort('ram_open','giris')">Giriş</th>
+          <th data-sort="ram_open:px" onclick="setSort('ram_open','px')">Şu An</th>
+          <th data-sort="ram_open:pct" onclick="setSort('ram_open','pct')">Durum</th>
+          <th data-sort="ram_open:tp1kalan" onclick="setSort('ram_open','tp1kalan')">TP1'e Kalan</th>
+          <th data-sort="ram_open:stopkalan" onclick="setSort('ram_open','stopkalan')">Stop'a Kalan</th>
           <th>Stop</th><th>TP1</th><th>TP2</th>
           <th data-sort="ram_open:hh_pct" onclick="setSort('ram_open','hh_pct')">HH%</th>
           <th data-sort="ram_open:market_regime" onclick="setSort('ram_open','market_regime')">Rejim</th>
           <th data-sort="ram_open:zaman" onclick="setSort('ram_open','zaman')">Zaman</th>
         </tr></thead>
-        <tbody id="ramOpenBody"><tr><td colspan="10" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
+        <tbody id="ramOpenBody"><tr><td colspan="14" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -3355,6 +3406,83 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 <script>
 let DATA={};
 let CURRENT_SYS='cab';
+let openPrices={};  // Açık pozların anlık fiyatları (Binance public API)
+let topPrices={btc:null, eth:null, ethBtc:null, btcPrev:null, ethPrev:null, ethBtcPrev:null};
+
+// TradingView'a coin linki açar (Binance Futures sembolü)
+function openTV(ticker){
+  const sym = 'BINANCE:' + ticker + '.P';  // Perpetual futures
+  const url = 'https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(sym);
+  window.open(url, '_blank');
+}
+
+// Binance public ticker fiyat çekme
+async function fp(symbol){
+  try{
+    const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/price?symbol=' + symbol);
+    if(!r.ok) return null;
+    const j = await r.json();
+    return parseFloat(j.price);
+  }catch(e){return null}
+}
+
+// BTC + ETH spot fiyat (24sn değişim için)
+async function fp24h(symbol){
+  try{
+    // Spot için fapi yerine api kullan (ya da fapi/ticker/24hr)
+    const r = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=' + symbol);
+    if(!r.ok) return null;
+    const j = await r.json();
+    return {price: parseFloat(j.lastPrice), change: parseFloat(j.priceChangePercent)};
+  }catch(e){return null}
+}
+
+// Üst fiyat çubuğunu güncelle
+async function updateTopPrices(){
+  const [btc, eth] = await Promise.all([
+    fp24h('BTCUSDT'),
+    fp24h('ETHUSDT')
+  ]);
+  if(btc){
+    document.getElementById('btcPrice').textContent = '$' + btc.price.toFixed(0);
+    const chg = document.getElementById('btcChg');
+    chg.textContent = (btc.change>=0?'▲ +':'▼ ') + btc.change.toFixed(2) + '%';
+    chg.className = 'pcChg ' + (btc.change>=0?'up':'down');
+  }
+  if(eth){
+    document.getElementById('ethPrice').textContent = '$' + eth.price.toFixed(0);
+    const chg = document.getElementById('ethChg');
+    chg.textContent = (eth.change>=0?'▲ +':'▼ ') + eth.change.toFixed(2) + '%';
+    chg.className = 'pcChg ' + (eth.change>=0?'up':'down');
+  }
+  // ETH/BTC oranı (lokal hesap)
+  if(btc && eth){
+    const ratio = eth.price / btc.price;
+    document.getElementById('ethBtcPrice').textContent = ratio.toFixed(5);
+    // 24s değişim: ETH change% - BTC change% (yaklaşık)
+    const ratioChg = eth.change - btc.change;
+    const chg = document.getElementById('ethBtcChg');
+    chg.textContent = (ratioChg>=0?'▲ +':'▼ ') + ratioChg.toFixed(2) + '%';
+    chg.className = 'pcChg ' + (ratioChg>=0?'up':'down');
+  }
+}
+
+// Açık poz fiyatlarını çek (her sistem için)
+async function updateOpenPrices(){
+  const allTickers = new Set([
+    ...Object.keys(DATA.open_positions || {}),
+    ...Object.keys(DATA.ram_open_positions || {})
+  ]);
+  if(allTickers.size === 0) return;
+  const promises = Array.from(allTickers).map(async sym => {
+    const px = await fp(sym);
+    if(px !== null) openPrices[sym] = px;
+  });
+  await Promise.all(promises);
+  // Render açık pozları
+  if(DATA.open_positions) renderOpenTable('cab', DATA.open_positions);
+  if(DATA.ram_open_positions) renderOpenTable('ram', DATA.ram_open_positions);
+}
 let SORT={
   cab_open:{c:'zaman',d:'desc'},
   cab_closed:{c:'kapanis',d:'desc'},
@@ -3617,12 +3745,21 @@ function renderSystem(sys, open_pos, closed, skipped, pause, maxState, mode){
 
 function renderOpenTable(sys, open_pos){
   const body = document.getElementById(sys+'OpenBody');
-  let arr = Object.entries(open_pos).map(([t,p]) => ({...p, ticker:t}));
+  let arr = Object.entries(open_pos).map(([t,p]) => {
+    const px = openPrices[t] || null;
+    const giris = p.giris || 0;
+    const stopVal = p.current_stop || p.stop || p.original_stop || 0;
+    const tp1Val = p.tp1 || 0;
+    const pct = (px && giris) ? (px - giris) / giris * 100 : null;
+    const tp1kalan = (px && tp1Val) ? (tp1Val - px) / px * 100 : null;
+    const stopkalan = (px && stopVal) ? (px - stopVal) / px * 100 : null;
+    return {...p, ticker:t, px, pct, tp1kalan, stopkalan};
+  });
   // Search filter
   const searchText = getFilterValue(sys+'_searchOpen');
   arr = filterBySearch(arr, searchText);
   if(!arr.length){
-    body.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#94a3b8;padding:14px">Eşleşen poz yok</td></tr>';
+    body.innerHTML = '<tr><td colspan="14" style="text-align:center;color:#94a3b8;padding:14px">Eşleşen poz yok</td></tr>';
     updateSortArrows(sys+'OpenTable', sys+'_open');
     document.getElementById(sys+'OpenCt').textContent = '0';
     return;
@@ -3630,20 +3767,58 @@ function renderOpenTable(sys, open_pos){
   // Sort
   const s = SORT[sys+'_open'];
   arr = sortRows(arr, s.c, s.d);
-  body.innerHTML = arr.map(p => `
+  body.innerHTML = arr.map(r => {
+    const p = r;
+    // Şu an fiyat
+    let pxCell = '<span style="color:#94a3b8">—</span>';
+    let durumCell = '<span style="color:#94a3b8">—</span>';
+    if(r.px !== null){
+      const ps = (p.marj||0) * (p.lev||1);
+      const pnlDolar = ps * r.pct / 100;
+      const pxColor = r.pct >= 0 ? '#4ade80' : '#f87171';
+      pxCell = `<span style="color:${pxColor}">${fmtNum(r.px)}</span>`;
+      const arrow = r.pct >= 0 ? '▲' : '▼';
+      const cls = r.pct >= 0 ? 'up' : 'down';
+      durumCell = `<span class="statusCell ${cls}">${arrow} ${pnlDolar>=0?'+':''}${pnlDolar.toFixed(1)}$ (${r.pct>=0?'+':''}${r.pct.toFixed(2)}%)</span>`;
+    }
+    // TP1'e kalan
+    let tp1kCell = '<span style="color:#94a3b8">—</span>';
+    if(r.tp1kalan !== null){
+      if(r.tp1kalan <= 0){
+        tp1kCell = '<span style="color:#4ade80;font-weight:600">✓ Geçildi</span>';
+      } else {
+        tp1kCell = `<span style="color:#a5b4fc">%${r.tp1kalan.toFixed(2)} uzak</span>`;
+      }
+    }
+    // Stop'a kalan
+    let skCell = '<span style="color:#94a3b8">—</span>';
+    if(r.stopkalan !== null){
+      const sk = r.stopkalan;
+      let skC = '#4ade80';
+      if(sk <= 0) skC = '#dc2626';
+      else if(sk < 2) skC = '#f87171';
+      else if(sk < 5) skC = '#fbbf24';
+      skCell = `<span style="color:${skC};font-weight:600">%${sk.toFixed(2)} ${sk<0?'↓':'uzak'}</span>`;
+    }
+    return `
     <tr>
-      <td><b>${p.ticker}</b></td>
+      <td><a class="coinLink" onclick="openTV('${p.ticker}')">${p.ticker}</a></td>
       <td>$${p.marj}</td>
       <td>${p.lev}x</td>
       <td>${fmtNum(p.giris)}</td>
-      <td style="color:#f87171">${fmtNum(p.stop || p.original_stop)}</td>
+      <td>${pxCell}</td>
+      <td>${durumCell}</td>
+      <td>${tp1kCell}</td>
+      <td>${skCell}</td>
+      <td style="color:#f87171">${fmtNum(p.current_stop || p.stop || p.original_stop)}</td>
       <td style="color:#4ade80">${fmtNum(p.tp1)}</td>
       <td style="color:#22d3ee">${fmtNum(p.tp2)}</td>
       <td>${(p.hh_pct||0).toFixed(1)}%</td>
       <td>${regimeChip(p.market_regime)}</td>
       <td>${(p.zaman||'').slice(11,16)}</td>
     </tr>
-  `).join('');
+    `;
+  }).join('');
   document.getElementById(sys+'OpenCt').textContent = arr.length;
   updateSortArrows(sys+'OpenTable', sys+'_open');
 }
@@ -3684,7 +3859,7 @@ function renderClosedTable(sys, closed){
   if(arr.length>200) arr = arr.slice(0,200);
   body.innerHTML = arr.map(c => `
     <tr>
-      <td><b>${c.ticker}</b></td>
+      <td><a class="coinLink" onclick="openTV('${c.ticker}')">${c.ticker}</a></td>
       <td>${c.sonuc||'—'}</td>
       <td>${fmtMoney(c.kar)}</td>
       <td>${fmtMoney(c.binance_pnl)}</td>
@@ -3715,7 +3890,7 @@ function renderSkipTable(sys, skipped){
   if(arr.length>100) arr=arr.slice(0,100);
   body.innerHTML = arr.map(sk => `
     <tr>
-      <td><b>${sk.ticker||'?'}</b></td>
+      <td><a class="coinLink" onclick="openTV('${sk.ticker||''}')">${sk.ticker||'?'}</a></td>
       <td style="font-size:10px">${(sk.sebep||'').slice(0,80)}</td>
       <td>${fmtNum(sk.giris)}</td>
       <td style="font-size:10px">${(sk.zaman||'').slice(11,16)}</td>
@@ -4004,10 +4179,21 @@ async function init(){
     const saved = localStorage.getItem('v67_sys');
     if(saved==='ram') switchSys('ram');
   }catch(e){}
-  // 10sn yenileme (migrate aktif değilse)
+  // İlk fiyatlar
+  updateTopPrices();
+  updateOpenPrices();
+  // 10sn data yenileme (migrate aktif değilse)
   setInterval(()=>{
     if(!window._migrateActive) loadData();
   }, 10000);
+  // 5sn açık poz fiyatları yenileme
+  setInterval(()=>{
+    if(!window._migrateActive) updateOpenPrices();
+  }, 5000);
+  // 15sn üst fiyat çubuğu yenileme (BTC/ETH yavaş değişir)
+  setInterval(()=>{
+    if(!window._migrateActive) updateTopPrices();
+  }, 15000);
 }
 init();
 </script>
