@@ -3023,6 +3023,17 @@ tr:hover{background:#16213a}
 .modalBox h2{margin:0 0 12px;color:#a5b4fc;font-size:18px}
 .modalClose{float:right;background:#dc2626;color:white;border:none;padding:6px 12px;border-radius:5px;cursor:pointer}
 
+/* Filter row */
+.filterRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0 8px;padding:8px 10px;background:#0f172a;border-radius:6px;border:1px solid #334155}
+.filterRow label{font-size:11px;color:#94a3b8;margin-right:2px}
+.filterRow select, .filterRow input{background:#1e293b;color:#e5e7eb;border:1px solid #334155;padding:5px 8px;border-radius:4px;font-size:12px;outline:none}
+.filterRow select:focus, .filterRow input:focus{border-color:#4ade80}
+.searchBox{flex:1;min-width:140px;max-width:240px}
+th[data-sort]{cursor:pointer;user-select:none}
+th[data-sort]:hover{background:#1e293b}
+th.sorted-asc::after{content:" ▲";color:#4ade80;font-size:10px}
+th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
+
 /* Mobil */
 @media(max-width:640px){
   body{padding:6px}
@@ -3104,17 +3115,20 @@ tr:hover{background:#16213a}
     <h3>📌 Açık Pozisyonlar <span class="ct" id="cabOpenCt">0</span>
       <button class="btn btn-grey btn-sm" style="margin-left:auto" onclick="exportCSV('cab','open')">CSV</button>
     </h3>
+    <div class="filterRow">
+      <input type="text" id="cab_searchOpen" class="searchBox" placeholder="🔍 Coin ara..." oninput="render()">
+    </div>
     <div class="tableWrap">
-      <table>
+      <table id="cabOpenTable">
         <thead><tr>
-          <th data-sort="ticker">Coin</th>
-          <th data-sort="marj">Marj</th>
-          <th data-sort="lev">Lev</th>
-          <th data-sort="giris">Giriş</th>
+          <th data-sort="cab_open:ticker" onclick="setSort('cab_open','ticker')">Coin</th>
+          <th data-sort="cab_open:marj" onclick="setSort('cab_open','marj')">Marj</th>
+          <th data-sort="cab_open:lev" onclick="setSort('cab_open','lev')">Lev</th>
+          <th data-sort="cab_open:giris" onclick="setSort('cab_open','giris')">Giriş</th>
           <th>Stop</th><th>TP1</th><th>TP2</th>
-          <th data-sort="hh_pct">HH%</th>
-          <th data-sort="market_regime">Rejim</th>
-          <th data-sort="zaman">Zaman</th>
+          <th data-sort="cab_open:hh_pct" onclick="setSort('cab_open','hh_pct')">HH%</th>
+          <th data-sort="cab_open:market_regime" onclick="setSort('cab_open','market_regime')">Rejim</th>
+          <th data-sort="cab_open:zaman" onclick="setSort('cab_open','zaman')">Zaman</th>
         </tr></thead>
         <tbody id="cabOpenBody"><tr><td colspan="10" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
       </table>
@@ -3123,18 +3137,37 @@ tr:hover{background:#16213a}
 
   <!-- Kapanan -->
   <div class="section">
-    <h3>📜 Kapanan Pozisyonlar (son 50) <span class="ct" id="cabClosedCt">0</span>
+    <h3>📜 Kapanan Pozisyonlar <span class="ct" id="cabClosedCt">0</span>
       <button class="btn btn-grey btn-sm" style="margin-left:auto" onclick="exportCSV('cab','closed')">CSV</button>
     </h3>
+    <div class="filterRow">
+      <label>📅 Tarih:</label>
+      <select id="cab_dateFilter" onchange="render()">
+        <option value="all" selected>Hepsi</option>
+        <option value="today">Bugün</option>
+        <option value="yesterday">Dün</option>
+        <option value="7d">Son 7 gün</option>
+      </select>
+      <label>🎯 Sonuç:</label>
+      <select id="cab_resultFilter" onchange="render()">
+        <option value="all" selected>Hepsi</option>
+        <option value="tp">TP (kar)</option>
+        <option value="stop">Stop (zarar)</option>
+        <option value="trail">Trail</option>
+        <option value="timeout">Timeout</option>
+      </select>
+      <input type="text" id="cab_searchClosed" class="searchBox" placeholder="🔍 Coin ara..." oninput="render()">
+    </div>
     <div class="tableWrap">
-      <table>
+      <table id="cabClosedTable">
         <thead><tr>
-          <th>Coin</th><th>Sonuç</th>
-          <th data-sort="kar">Dashboard K/Z</th>
-          <th data-sort="binance_pnl">Binance K/Z</th>
-          <th>Rejim</th>
-          <th>Süre</th>
-          <th>Kapanış</th>
+          <th data-sort="cab_closed:ticker" onclick="setSort('cab_closed','ticker')">Coin</th>
+          <th data-sort="cab_closed:sonuc" onclick="setSort('cab_closed','sonuc')">Sonuç</th>
+          <th data-sort="cab_closed:kar" onclick="setSort('cab_closed','kar')">Dashboard K/Z</th>
+          <th data-sort="cab_closed:binance_pnl" onclick="setSort('cab_closed','binance_pnl')">Binance K/Z</th>
+          <th data-sort="cab_closed:market_regime" onclick="setSort('cab_closed','market_regime')">Rejim</th>
+          <th data-sort="cab_closed:sure_dk" onclick="setSort('cab_closed','sure_dk')">Süre</th>
+          <th data-sort="cab_closed:kapanis" onclick="setSort('cab_closed','kapanis')">Kapanış</th>
         </tr></thead>
         <tbody id="cabClosedBody"></tbody>
       </table>
@@ -3143,10 +3176,25 @@ tr:hover{background:#16213a}
 
   <!-- Kaçırılan -->
   <div class="section">
-    <h3>🚫 Kaçırılan Sinyaller (bugün) <span class="ct" id="cabSkipCt">0</span></h3>
-    <div class="tableWrap" style="max-height:200px">
-      <table>
-        <thead><tr><th>Coin</th><th>Sebep</th><th>Sinyal Fiyat</th><th>Zaman</th></tr></thead>
+    <h3>🚫 Kaçırılan Sinyaller <span class="ct" id="cabSkipCt">0</span></h3>
+    <div class="filterRow">
+      <label>📅 Tarih:</label>
+      <select id="cab_skipDateFilter" onchange="render()">
+        <option value="today" selected>Bugün</option>
+        <option value="yesterday">Dün</option>
+        <option value="7d">Son 7 gün</option>
+        <option value="all">Hepsi</option>
+      </select>
+      <input type="text" id="cab_searchSkip" class="searchBox" placeholder="🔍 Coin ara..." oninput="render()">
+    </div>
+    <div class="tableWrap" style="max-height:250px">
+      <table id="cabSkipTable">
+        <thead><tr>
+          <th data-sort="cab_skip:ticker" onclick="setSort('cab_skip','ticker')">Coin</th>
+          <th>Sebep</th>
+          <th data-sort="cab_skip:giris" onclick="setSort('cab_skip','giris')">Sinyal Fiyat</th>
+          <th data-sort="cab_skip:zaman" onclick="setSort('cab_skip','zaman')">Zaman</th>
+        </tr></thead>
         <tbody id="cabSkipBody"></tbody>
       </table>
     </div>
@@ -3197,12 +3245,20 @@ tr:hover{background:#16213a}
     <h3>📌 Açık Pozisyonlar <span class="ct" id="ramOpenCt">0</span>
       <button class="btn btn-grey btn-sm" style="margin-left:auto" onclick="exportCSV('ram','open')">CSV</button>
     </h3>
+    <div class="filterRow">
+      <input type="text" id="ram_searchOpen" class="searchBox" placeholder="🔍 Coin ara..." oninput="render()">
+    </div>
     <div class="tableWrap">
-      <table>
+      <table id="ramOpenTable">
         <thead><tr>
-          <th>Coin</th><th>Marj</th><th>Lev</th><th>Giriş</th>
+          <th data-sort="ram_open:ticker" onclick="setSort('ram_open','ticker')">Coin</th>
+          <th data-sort="ram_open:marj" onclick="setSort('ram_open','marj')">Marj</th>
+          <th data-sort="ram_open:lev" onclick="setSort('ram_open','lev')">Lev</th>
+          <th data-sort="ram_open:giris" onclick="setSort('ram_open','giris')">Giriş</th>
           <th>Stop</th><th>TP1</th><th>TP2</th>
-          <th>HH%</th><th>Rejim</th><th>Zaman</th>
+          <th data-sort="ram_open:hh_pct" onclick="setSort('ram_open','hh_pct')">HH%</th>
+          <th data-sort="ram_open:market_regime" onclick="setSort('ram_open','market_regime')">Rejim</th>
+          <th data-sort="ram_open:zaman" onclick="setSort('ram_open','zaman')">Zaman</th>
         </tr></thead>
         <tbody id="ramOpenBody"><tr><td colspan="10" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
       </table>
@@ -3211,16 +3267,37 @@ tr:hover{background:#16213a}
 
   <!-- Kapanan -->
   <div class="section">
-    <h3>📜 Kapanan Pozisyonlar (son 50) <span class="ct" id="ramClosedCt">0</span>
+    <h3>📜 Kapanan Pozisyonlar <span class="ct" id="ramClosedCt">0</span>
       <button class="btn btn-grey btn-sm" style="margin-left:auto" onclick="exportCSV('ram','closed')">CSV</button>
     </h3>
+    <div class="filterRow">
+      <label>📅 Tarih:</label>
+      <select id="ram_dateFilter" onchange="render()">
+        <option value="all" selected>Hepsi</option>
+        <option value="today">Bugün</option>
+        <option value="yesterday">Dün</option>
+        <option value="7d">Son 7 gün</option>
+      </select>
+      <label>🎯 Sonuç:</label>
+      <select id="ram_resultFilter" onchange="render()">
+        <option value="all" selected>Hepsi</option>
+        <option value="tp">TP (kar)</option>
+        <option value="stop">Stop (zarar)</option>
+        <option value="trail">Trail</option>
+        <option value="timeout">Timeout</option>
+      </select>
+      <input type="text" id="ram_searchClosed" class="searchBox" placeholder="🔍 Coin ara..." oninput="render()">
+    </div>
     <div class="tableWrap">
-      <table>
+      <table id="ramClosedTable">
         <thead><tr>
-          <th>Coin</th><th>Sonuç</th>
-          <th>Dashboard K/Z</th>
-          <th>Binance K/Z</th>
-          <th>Rejim</th><th>Süre</th><th>Kapanış</th>
+          <th data-sort="ram_closed:ticker" onclick="setSort('ram_closed','ticker')">Coin</th>
+          <th data-sort="ram_closed:sonuc" onclick="setSort('ram_closed','sonuc')">Sonuç</th>
+          <th data-sort="ram_closed:kar" onclick="setSort('ram_closed','kar')">Dashboard K/Z</th>
+          <th data-sort="ram_closed:binance_pnl" onclick="setSort('ram_closed','binance_pnl')">Binance K/Z</th>
+          <th data-sort="ram_closed:market_regime" onclick="setSort('ram_closed','market_regime')">Rejim</th>
+          <th data-sort="ram_closed:sure_dk" onclick="setSort('ram_closed','sure_dk')">Süre</th>
+          <th data-sort="ram_closed:kapanis" onclick="setSort('ram_closed','kapanis')">Kapanış</th>
         </tr></thead>
         <tbody id="ramClosedBody"></tbody>
       </table>
@@ -3229,10 +3306,25 @@ tr:hover{background:#16213a}
 
   <!-- Kaçırılan -->
   <div class="section">
-    <h3>🚫 Kaçırılan Sinyaller (bugün) <span class="ct" id="ramSkipCt">0</span></h3>
-    <div class="tableWrap" style="max-height:200px">
-      <table>
-        <thead><tr><th>Coin</th><th>Sebep</th><th>Sinyal Fiyat</th><th>Zaman</th></tr></thead>
+    <h3>🚫 Kaçırılan Sinyaller <span class="ct" id="ramSkipCt">0</span></h3>
+    <div class="filterRow">
+      <label>📅 Tarih:</label>
+      <select id="ram_skipDateFilter" onchange="render()">
+        <option value="today" selected>Bugün</option>
+        <option value="yesterday">Dün</option>
+        <option value="7d">Son 7 gün</option>
+        <option value="all">Hepsi</option>
+      </select>
+      <input type="text" id="ram_searchSkip" class="searchBox" placeholder="🔍 Coin ara..." oninput="render()">
+    </div>
+    <div class="tableWrap" style="max-height:250px">
+      <table id="ramSkipTable">
+        <thead><tr>
+          <th data-sort="ram_skip:ticker" onclick="setSort('ram_skip','ticker')">Coin</th>
+          <th>Sebep</th>
+          <th data-sort="ram_skip:giris" onclick="setSort('ram_skip','giris')">Sinyal Fiyat</th>
+          <th data-sort="ram_skip:zaman" onclick="setSort('ram_skip','zaman')">Zaman</th>
+        </tr></thead>
         <tbody id="ramSkipBody"></tbody>
       </table>
     </div>
@@ -3262,8 +3354,86 @@ tr:hover{background:#16213a}
 <script>
 let DATA={};
 let CURRENT_SYS='cab';
-let SORT={cab_open:{c:'zaman',d:'desc'}, cab_closed:{c:null,d:'desc'},
-          ram_open:{c:'zaman',d:'desc'}, ram_closed:{c:null,d:'desc'}};
+let SORT={
+  cab_open:{c:'zaman',d:'desc'},
+  cab_closed:{c:'kapanis',d:'desc'},
+  cab_skip:{c:'zaman',d:'desc'},
+  ram_open:{c:'zaman',d:'desc'},
+  ram_closed:{c:'kapanis',d:'desc'},
+  ram_skip:{c:'zaman',d:'desc'}
+};
+
+function setSort(table, col){
+  const s=SORT[table];
+  if(s.c===col) s.d = s.d==='asc' ? 'desc' : 'asc';
+  else { s.c=col; s.d='desc'; }
+  render();
+}
+
+function updateSortArrows(tableId, tableKey){
+  const s=SORT[tableKey];
+  document.querySelectorAll('#'+tableId+' th').forEach(th=>{
+    th.classList.remove('sorted-asc','sorted-desc');
+    const ds=th.getAttribute('data-sort');
+    if(ds && ds.endsWith(':'+s.c)) th.classList.add('sorted-'+s.d);
+  });
+}
+
+function sortRows(rows, key, dir){
+  if(!key) return rows;
+  return rows.slice().sort((a,b)=>{
+    let av=a[key], bv=b[key];
+    if(av===null||av===undefined) av=-Infinity;
+    if(bv===null||bv===undefined) bv=-Infinity;
+    if(typeof av==='string' && typeof bv==='string')
+      return dir==='asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+    return dir==='asc' ? (av-bv) : (bv-av);
+  });
+}
+
+function filterByDate(rows, dateFilter, dateKey){
+  if(!dateFilter || dateFilter==='all') return rows;
+  const today = now_tr_today();
+  const yesterday = (()=>{
+    const d=new Date(); d.setDate(d.getDate()-1);
+    const trH=d.getUTCHours()+3;
+    return d.toISOString().slice(0,10);
+  })();
+  const d7 = (()=>{
+    const d=new Date(); d.setDate(d.getDate()-7);
+    return d.toISOString().slice(0,10);
+  })();
+  return rows.filter(r=>{
+    const ts=(r[dateKey]||'').slice(0,10);
+    if(dateFilter==='today') return ts===today;
+    if(dateFilter==='yesterday') return ts===yesterday;
+    if(dateFilter==='7d') return ts>=d7;
+    return true;
+  });
+}
+
+function filterByResult(rows, resultFilter){
+  if(!resultFilter || resultFilter==='all') return rows;
+  return rows.filter(r=>{
+    const s=(r.sonuc||'').toLowerCase();
+    if(resultFilter==='tp') return s.includes('tp') && !s.includes('stop');
+    if(resultFilter==='stop') return s.includes('stop');
+    if(resultFilter==='trail') return s.includes('trail');
+    if(resultFilter==='timeout') return s.includes('timeout');
+    return true;
+  });
+}
+
+function filterBySearch(rows, searchText){
+  if(!searchText) return rows;
+  const q=searchText.toUpperCase();
+  return rows.filter(r=>(r.ticker||'').toUpperCase().includes(q));
+}
+
+function getFilterValue(id){
+  const el=document.getElementById(id);
+  return el ? el.value : '';
+}
 
 function toast(msg, kind){
   const el=document.getElementById('toast');
@@ -3424,10 +3594,10 @@ function renderSystem(sys, open_pos, closed, skipped, pause, maxState, mode){
   document.getElementById(sys+'TodayKar').innerHTML = fmtMoney(todayKar);
   document.getElementById(sys+'WR').textContent = total>0 ? Math.round(wins/total*100)+'%' : '0%';
 
-  // Skipped (bugün)
+  // Skipped stat: bugün sayısı (stat kutusu için)
   const skipToday = (skipped||[]).filter(s => (s.zaman||'').startsWith(today));
   document.getElementById(sys+'SkipN').textContent = skipToday.length;
-  document.getElementById(sys+'SkipCt').textContent = skipToday.length;
+  // NOT: SkipCt filter'a göre renderSkipTable içinde güncellenir
 
   // Tablo: Açık
   document.getElementById(sys+'OpenCt').textContent = openCount;
@@ -3437,8 +3607,8 @@ function renderSystem(sys, open_pos, closed, skipped, pause, maxState, mode){
   document.getElementById(sys+'ClosedCt').textContent = closed.length;
   renderClosedTable(sys, closed);
 
-  // Tablo: Kaçırılan
-  renderSkipTable(sys, skipToday);
+  // Tablo: Kaçırılan (filtreleme içeride yapılır)
+  renderSkipTable(sys, skipped);
 
   // Sekme badge
   document.getElementById(sys+'Badge').textContent = openCount;
@@ -3446,12 +3616,19 @@ function renderSystem(sys, open_pos, closed, skipped, pause, maxState, mode){
 
 function renderOpenTable(sys, open_pos){
   const body = document.getElementById(sys+'OpenBody');
-  const arr = Object.entries(open_pos).map(([t,p]) => ({...p, ticker:t}));
+  let arr = Object.entries(open_pos).map(([t,p]) => ({...p, ticker:t}));
+  // Search filter
+  const searchText = getFilterValue(sys+'_searchOpen');
+  arr = filterBySearch(arr, searchText);
   if(!arr.length){
-    body.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr>';
+    body.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#94a3b8;padding:14px">Eşleşen poz yok</td></tr>';
+    updateSortArrows(sys+'OpenTable', sys+'_open');
+    document.getElementById(sys+'OpenCt').textContent = '0';
     return;
   }
-  arr.sort((a,b) => (b.zaman||'').localeCompare(a.zaman||''));
+  // Sort
+  const s = SORT[sys+'_open'];
+  arr = sortRows(arr, s.c, s.d);
   body.innerHTML = arr.map(p => `
     <tr>
       <td><b>${p.ticker}</b></td>
@@ -3466,16 +3643,44 @@ function renderOpenTable(sys, open_pos){
       <td>${(p.zaman||'').slice(11,16)}</td>
     </tr>
   `).join('');
+  document.getElementById(sys+'OpenCt').textContent = arr.length;
+  updateSortArrows(sys+'OpenTable', sys+'_open');
 }
 
 function renderClosedTable(sys, closed){
   const body = document.getElementById(sys+'ClosedBody');
-  if(!closed.length){
-    body.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:14px">Kapanmış poz yok</td></tr>';
+  // Filtreler
+  const dateFilter = getFilterValue(sys+'_dateFilter');
+  const resultFilter = getFilterValue(sys+'_resultFilter');
+  const searchText = getFilterValue(sys+'_searchClosed');
+  // Enrich: sure_dk ekle (sort için)
+  let arr = closed.map(c => {
+    let sure_dk = 0;
+    if(c.acilis && c.kapanis){
+      try{
+        const s=new Date(c.acilis.replace(' ','T')+'+03:00').getTime();
+        const e=new Date(c.kapanis.replace(' ','T')+'+03:00').getTime();
+        sure_dk = Math.floor((e-s)/60000);
+      }catch(e){}
+    }
+    return {...c, sure_dk};
+  });
+  // Filtrele
+  arr = filterByDate(arr, dateFilter, 'kapanis');
+  arr = filterByResult(arr, resultFilter);
+  arr = filterBySearch(arr, searchText);
+  // Count
+  document.getElementById(sys+'ClosedCt').textContent = arr.length;
+  if(!arr.length){
+    body.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:14px">Eşleşen poz yok</td></tr>';
+    updateSortArrows(sys+'ClosedTable', sys+'_closed');
     return;
   }
-  // Son 50, ters sıralı (yeni üstte)
-  const arr = closed.slice(-50).reverse();
+  // Sort
+  const s=SORT[sys+'_closed'];
+  arr = sortRows(arr, s.c, s.d);
+  // Limit 200 (performance)
+  if(arr.length>200) arr = arr.slice(0,200);
   body.innerHTML = arr.map(c => `
     <tr>
       <td><b>${c.ticker}</b></td>
@@ -3483,27 +3688,39 @@ function renderClosedTable(sys, closed){
       <td>${fmtMoney(c.kar)}</td>
       <td>${fmtMoney(c.binance_pnl)}</td>
       <td>${regimeChip(c.market_regime)}</td>
-      <td>${timeDiff(c.acilis, c.kapanis)}</td>
+      <td>${c.sure_dk ? (c.sure_dk<60 ? c.sure_dk+'dk' : Math.floor(c.sure_dk/60)+'s '+(c.sure_dk%60)+'dk') : '—'}</td>
       <td style="font-size:10px">${(c.kapanis||'').slice(5,16)}</td>
     </tr>
   `).join('');
+  updateSortArrows(sys+'ClosedTable', sys+'_closed');
 }
 
 function renderSkipTable(sys, skipped){
   const body = document.getElementById(sys+'SkipBody');
-  if(!skipped.length){
+  // Filters
+  const dateFilter = getFilterValue(sys+'_skipDateFilter') || 'today';
+  const searchText = getFilterValue(sys+'_searchSkip');
+  let arr = filterByDate(skipped, dateFilter, 'zaman');
+  arr = filterBySearch(arr, searchText);
+  document.getElementById(sys+'SkipCt').textContent = arr.length;
+  if(!arr.length){
     body.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#94a3b8;padding:10px">Kaçırılan sinyal yok</td></tr>';
+    updateSortArrows(sys+'SkipTable', sys+'_skip');
     return;
   }
-  const arr = skipped.slice(-30).reverse();
-  body.innerHTML = arr.map(s => `
+  // Sort
+  const s = SORT[sys+'_skip'];
+  arr = sortRows(arr, s.c, s.d);
+  if(arr.length>100) arr=arr.slice(0,100);
+  body.innerHTML = arr.map(sk => `
     <tr>
-      <td><b>${s.ticker||'?'}</b></td>
-      <td style="font-size:10px">${(s.sebep||'').slice(0,80)}</td>
-      <td>${fmtNum(s.giris)}</td>
-      <td style="font-size:10px">${(s.zaman||'').slice(11,16)}</td>
+      <td><b>${sk.ticker||'?'}</b></td>
+      <td style="font-size:10px">${(sk.sebep||'').slice(0,80)}</td>
+      <td>${fmtNum(sk.giris)}</td>
+      <td style="font-size:10px">${(sk.zaman||'').slice(11,16)}</td>
     </tr>
   `).join('');
+  updateSortArrows(sys+'SkipTable', sys+'_skip');
 }
 
 function fmtNum(v){
