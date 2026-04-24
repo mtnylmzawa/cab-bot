@@ -3057,6 +3057,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
   <button class="btn btn-purple btn-sm" onclick="openArchive()">📚 Arşiv</button>
   <button class="btn btn-orange btn-sm" onclick="archiveAndReset()">🧹 Arşivle + Temizle</button>
   <button class="btn btn-grey btn-sm" onclick="migratePnl()">🔥 Binance PNL Çek</button>
+  <button class="btn btn-sm" style="background:#0891b2" onclick="downloadReport()">📊 Rapor İndir</button>
 </div>
 
 <!-- Sistem Sekmeleri -->
@@ -3918,6 +3919,29 @@ function exportCSV(sys, type){
   a.download = `${sys}_${type}_${new Date().toISOString().slice(0,10)}.csv`;
   a.click();
   toast('✓ CSV indirildi', 'success');
+}
+
+// ═══════════════ RAPOR İNDİR ═══════════════
+async function downloadReport(){
+  toast('Rapor hazırlanıyor...');
+  try{
+    const r = await fetch('/api/export_report');
+    if(!r.ok){ toast('Rapor alınamadı: HTTP '+r.status, 'error'); return; }
+    const j = await r.json();
+    const blob = new Blob([JSON.stringify(j, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    a.href = url;
+    a.download = `cab_ram_report_${ts}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast('✓ Rapor indirildi — Claude\'a atabilirsin', 'success');
+  }catch(e){
+    alert('Rapor hatası: '+e.message);
+  }
 }
 
 // ═══════════════ MIGRATE PNL (background, mevcut Patch 14.2 mantığı) ═══════════════
