@@ -2933,7 +2933,7 @@ async def dashboard():
     cab_mod_text = "CANLI" if cab_mode == "live" else "SHADOW"
     ram_mod_text = "CANLI" if ram_mode == "live" else "SHADOW"
 
-    html = """<!DOCTYPE html>
+    html = r"""<!DOCTYPE html>
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -3041,8 +3041,8 @@ tr:hover{background:#16213a}
 
 <!-- Mod genel bilgi (üst) -->
 <div class="bar">
-  <span style="background:""" + cab_mod_color + """;color:#0f172a;padding:4px 10px;border-radius:6px;font-weight:700;font-size:12px">CAB: """ + cab_mod_text + """</span>
-  <span style="background:""" + ram_mod_color + """;color:#0f172a;padding:4px 10px;border-radius:6px;font-weight:700;font-size:12px">RAM: """ + ram_mod_text + """</span>
+  <span style="background:""" + cab_mod_color + r""";color:#0f172a;padding:4px 10px;border-radius:6px;font-weight:700;font-size:12px">CAB: """ + cab_mod_text + r"""</span>
+  <span style="background:""" + ram_mod_color + r""";color:#0f172a;padding:4px 10px;border-radius:6px;font-weight:700;font-size:12px">RAM: """ + ram_mod_text + r"""</span>
   <button class="btn btn-purple btn-sm" onclick="openArchive()">📚 Arşiv</button>
   <button class="btn btn-orange btn-sm" onclick="archiveAndReset()">🧹 Arşivle + Temizle</button>
   <button class="btn btn-grey btn-sm" onclick="migratePnl()">🔥 Binance PNL Çek</button>
@@ -3051,11 +3051,11 @@ tr:hover{background:#16213a}
 <!-- Sistem Sekmeleri -->
 <div id="systemTabs">
   <button id="tabCab" class="sysTab active" onclick="switchSys('cab')">
-    🟢 CAB v14 — <span id="cabModeLabel">""" + cab_mod_text + """</span>
+    🟢 CAB v14 — <span id="cabModeLabel">""" + cab_mod_text + r"""</span>
     <span id="cabBadge" class="sysBadge">0</span>
   </button>
   <button id="tabRam" class="sysTab" onclick="switchSys('ram')">
-    🌓 RAM v15 — <span id="ramModeLabel">""" + ram_mod_text + """</span>
+    🌓 RAM v15 — <span id="ramModeLabel">""" + ram_mod_text + r"""</span>
     <span id="ramBadge" class="sysBadge">0</span>
   </button>
 </div>
