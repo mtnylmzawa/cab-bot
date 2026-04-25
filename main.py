@@ -3031,11 +3031,18 @@ tr:hover{background:#16213a}
 .pcChg{font-size:11px;font-weight:600}
 .pcChg.up{color:#4ade80}
 .pcChg.down{color:#f87171}
-/* Dominance bar — farklı renk tonu */
-.dominanceBar{margin-top:4px}
-.dominanceBar .priceCard{background:linear-gradient(135deg,#1e1b4b,#0f0f23);border-color:#4c1d95}
-.dominanceBar .pcLabel{color:#c4b5fd}
-.dominanceBar .pcVal{color:#a78bfa;font-size:14px}
+/* Dominance kompakt çubuk */
+.domBarCompact{display:flex;gap:14px;flex-wrap:wrap;align-items:center;background:linear-gradient(90deg,#1e1b4b,#0f0f23);border:1px solid #4c1d95;border-radius:6px;padding:6px 12px;margin:4px 0 8px;font-size:12px}
+.domItem{display:inline-flex;align-items:center;gap:5px;color:#c4b5fd}
+.domItem b{color:#c4b5fd;font-weight:600;font-size:11px}
+.domItem span{color:#a78bfa;font-weight:700}
+.domItem .domChg{font-size:10px;font-weight:600}
+.domItem .domChg.up{color:#4ade80}
+.domItem .domChg.down{color:#f87171}
+@media(max-width:640px){
+  .domBarCompact{gap:8px;font-size:11px;padding:5px 8px}
+  .domItem{font-size:10px}
+}
 @media(max-width:640px){
   .priceCard{padding:6px 10px;min-width:100px}
   .pcVal{font-size:14px}
@@ -3098,28 +3105,12 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
   </div>
 </div>
 
-<!-- Dominance Çubuğu (Market Cap %) -->
-<div class="priceBar dominanceBar">
-  <div class="priceCard">
-    <div class="pcLabel">BTC.D</div>
-    <div class="pcVal" id="btcDom">—</div>
-    <div class="pcChg" id="btcDomChg">—</div>
-  </div>
-  <div class="priceCard">
-    <div class="pcLabel">ETH.D</div>
-    <div class="pcVal" id="ethDom">—</div>
-    <div class="pcChg" id="ethDomChg">—</div>
-  </div>
-  <div class="priceCard">
-    <div class="pcLabel">USDT.D</div>
-    <div class="pcVal" id="usdtDom">—</div>
-    <div class="pcChg" id="usdtDomChg">—</div>
-  </div>
-  <div class="priceCard">
-    <div class="pcLabel">OTHERS.D</div>
-    <div class="pcVal" id="othersDom">—</div>
-    <div class="pcChg" id="othersDomChg">—</div>
-  </div>
+<!-- Dominance Çubuğu (Kompakt — tek satır) -->
+<div class="domBarCompact">
+  <span class="domItem"><b>BTC.D</b> <span id="btcDom">—</span> <span class="domChg" id="btcDomChg"></span></span>
+  <span class="domItem"><b>ETH.D</b> <span id="ethDom">—</span> <span class="domChg" id="ethDomChg"></span></span>
+  <span class="domItem"><b>USDT.D</b> <span id="usdtDom">—</span> <span class="domChg" id="usdtDomChg"></span></span>
+  <span class="domItem"><b>OTHERS.D</b> <span id="othersDom">—</span> <span class="domChg" id="othersDomChg"></span></span>
 </div>
 
 <!-- Mod genel bilgi (üst) -->
@@ -3199,15 +3190,16 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
           <th data-sort="cab_open:lev" onclick="setSort('cab_open','lev')">Lev</th>
           <th data-sort="cab_open:giris" onclick="setSort('cab_open','giris')">Giriş</th>
           <th data-sort="cab_open:px" onclick="setSort('cab_open','px')">Şu An</th>
-          <th data-sort="cab_open:pct" onclick="setSort('cab_open','pct')">Durum</th>
+          <th data-sort="cab_open:realPnl" onclick="setSort('cab_open','realPnl')">Durum</th>
           <th data-sort="cab_open:tp1kalan" onclick="setSort('cab_open','tp1kalan')">TP1'e Kalan</th>
           <th data-sort="cab_open:stopkalan" onclick="setSort('cab_open','stopkalan')">Stop'a Kalan</th>
+          <th data-sort="cab_open:trailGap" onclick="setSort('cab_open','trailGap')">Trail</th>
           <th>Stop</th><th>TP1</th><th>TP2</th>
           <th data-sort="cab_open:hh_pct" onclick="setSort('cab_open','hh_pct')">HH%</th>
           <th data-sort="cab_open:market_regime" onclick="setSort('cab_open','market_regime')">Rejim</th>
           <th data-sort="cab_open:zaman" onclick="setSort('cab_open','zaman')">Zaman</th>
         </tr></thead>
-        <tbody id="cabOpenBody"><tr><td colspan="14" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
+        <tbody id="cabOpenBody"><tr><td colspan="15" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -3333,15 +3325,16 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
           <th data-sort="ram_open:lev" onclick="setSort('ram_open','lev')">Lev</th>
           <th data-sort="ram_open:giris" onclick="setSort('ram_open','giris')">Giriş</th>
           <th data-sort="ram_open:px" onclick="setSort('ram_open','px')">Şu An</th>
-          <th data-sort="ram_open:pct" onclick="setSort('ram_open','pct')">Durum</th>
+          <th data-sort="ram_open:realPnl" onclick="setSort('ram_open','realPnl')">Durum</th>
           <th data-sort="ram_open:tp1kalan" onclick="setSort('ram_open','tp1kalan')">TP1'e Kalan</th>
           <th data-sort="ram_open:stopkalan" onclick="setSort('ram_open','stopkalan')">Stop'a Kalan</th>
+          <th data-sort="ram_open:trailGap" onclick="setSort('ram_open','trailGap')">Trail</th>
           <th>Stop</th><th>TP1</th><th>TP2</th>
           <th data-sort="ram_open:hh_pct" onclick="setSort('ram_open','hh_pct')">HH%</th>
           <th data-sort="ram_open:market_regime" onclick="setSort('ram_open','market_regime')">Rejim</th>
           <th data-sort="ram_open:zaman" onclick="setSort('ram_open','zaman')">Zaman</th>
         </tr></thead>
-        <tbody id="ramOpenBody"><tr><td colspan="14" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
+        <tbody id="ramOpenBody"><tr><td colspan="15" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -3498,7 +3491,7 @@ async function updateTopPrices(){
   }
 }
 
-// Dominance fetch (CoinGecko free)
+// Dominance fetch (CoinGecko free) — kompakt versiyon
 async function updateDominance(){
   try{
     const r = await fetch('https://api.coingecko.com/api/v3/global');
@@ -3516,34 +3509,32 @@ async function updateDominance(){
       const el = document.getElementById(id);
       const elChg = document.getElementById(id+'Chg');
       el.textContent = val.toFixed(2) + '%';
-      if(prev !== null && prev !== undefined){
+      if(prev !== null && prev !== undefined && Math.abs(val - prev) >= 0.001){
         const diff = val - prev;
-        if(Math.abs(diff) < 0.01){
-          elChg.textContent = '— sabit';
-          elChg.className = 'pcChg';
-        } else {
-          const arrow = diff >= 0 ? '▲ +' : '▼ ';
-          elChg.textContent = arrow + diff.toFixed(2) + '%';
-          elChg.className = 'pcChg ' + (diff >= 0 ? 'up' : 'down');
-        }
+        const arrow = diff >= 0 ? '▲+' : '▼';
+        elChg.textContent = arrow + diff.toFixed(3) + '%';
+        elChg.className = 'domChg ' + (diff >= 0 ? 'up' : 'down');
+      } else if(prev !== null && prev !== undefined){
+        elChg.textContent = '';  // Sabit, yer kaplama
+        elChg.className = 'domChg';
       } else {
-        elChg.textContent = '— ilk veri';
-        elChg.className = 'pcChg';
+        elChg.textContent = '';
+        elChg.className = 'domChg';
       }
     }
 
+    // KRİTİK: prev'i göstermeden ÖNCE değişimi göster (önceki değerle karşılaştır)
     setDom('btcDom', btcD, dominanceState.btcDPrev);
     setDom('ethDom', ethD, dominanceState.ethDPrev);
     setDom('usdtDom', usdtD, dominanceState.usdtDPrev);
     setDom('othersDom', othersD, dominanceState.othersDPrev);
 
-    // Önceki değer = ilk fetch sonrası set et (referans için)
-    if(dominanceState.btcDPrev === null){
-      dominanceState.btcDPrev = btcD;
-      dominanceState.ethDPrev = ethD;
-      dominanceState.usdtDPrev = usdtD;
-      dominanceState.othersDPrev = othersD;
-    }
+    // SONRA prev'i güncelle (her fetch'te)
+    // Böylece değişim = bu fetch ile bir önceki fetch arası fark
+    dominanceState.btcDPrev = dominanceState.btcD || btcD;
+    dominanceState.ethDPrev = dominanceState.ethD || ethD;
+    dominanceState.usdtDPrev = dominanceState.usdtD || usdtD;
+    dominanceState.othersDPrev = dominanceState.othersD || othersD;
 
     dominanceState.btcD = btcD;
     dominanceState.ethD = ethD;
@@ -3840,13 +3831,51 @@ function renderOpenTable(sys, open_pos){
     const pct = (px && giris) ? (px - giris) / giris * 100 : null;
     const tp1kalan = (px && tp1Val) ? (tp1Val - px) / px * 100 : null;
     const stopkalan = (px && stopVal) ? (px - stopVal) / px * 100 : null;
-    return {...p, ticker:t, px, pct, tp1kalan, stopkalan};
+
+    // GERÇEK PnL — kalan pozisyon büyüklüğüne göre
+    const ps = (p.marj||0) * (p.lev||1);  // toplam pozisyon
+    const kapatOran = p.kapat_oran || 60;  // TP1'de kapatılan oran
+    let kalanOran = 100;
+    if(p.tp1_hit) kalanOran -= kapatOran;
+    if(p.tp2_hit) kalanOran -= 25;  // RAM v15'te TP2 hep %25
+    const kalanPs = ps * kalanOran / 100;
+    const realizedKar = (p.tp1_kar || 0) + (p.tp2_kar || 0);
+    const unrealizedKar = (px && giris) ? (kalanPs * pct / 100) : 0;
+    const realPnl = realizedKar + unrealizedKar;
+
+    // TRAIL hesabı (TP2 sonrası aktif)
+    // RAM v15: trailLevel = highest(close, 10) - ATR14 * 2
+    // Yaklaşık tahmin: HH * (1 - 0.02) ≈ tepeden %2-4 geri
+    let trailLevel = null;
+    let trailGap = null;  // şu an fiyatın trail'e uzaklığı
+    if(p.tp2_hit && p.hh_pct && giris && px){
+      // HH = en yüksek fiyat (giris × (1 + hh_pct/100))
+      const hh = giris * (1 + (p.hh_pct||0)/100);
+      // Trail mesafesi tahmini: ~%3-5 (ATR×2)
+      // Daha doğru: current_stop'a bak, eğer giriş üstündeyse trail aktif
+      const cs = p.current_stop || stopVal;
+      if(cs > giris){
+        trailLevel = cs;
+        trailGap = (px - cs) / px * 100;
+      } else {
+        // Henüz trail aktif değil — tahmini hesap
+        trailLevel = hh * 0.97;  // tepeden %3 aşağı tahmini
+        trailGap = (px - trailLevel) / px * 100;
+      }
+    } else if(p.tp1_hit && !p.tp2_hit && p.current_stop) {
+      // TP1 sonrası BE (giriş'e çekildi)
+      trailLevel = p.current_stop;
+      trailGap = (px && trailLevel) ? (px - trailLevel) / px * 100 : null;
+    }
+
+    return {...p, ticker:t, px, pct, tp1kalan, stopkalan, realPnl, trailLevel, trailGap, kalanOran};
   });
+
   // Search filter
   const searchText = getFilterValue(sys+'_searchOpen');
   arr = filterBySearch(arr, searchText);
   if(!arr.length){
-    body.innerHTML = '<tr><td colspan="14" style="text-align:center;color:#94a3b8;padding:14px">Eşleşen poz yok</td></tr>';
+    body.innerHTML = '<tr><td colspan="15" style="text-align:center;color:#94a3b8;padding:14px">Eşleşen poz yok</td></tr>';
     updateSortArrows(sys+'OpenTable', sys+'_open');
     document.getElementById(sys+'OpenCt').textContent = '0';
     return;
@@ -3860,18 +3889,22 @@ function renderOpenTable(sys, open_pos){
     let pxCell = '<span style="color:#94a3b8">—</span>';
     let durumCell = '<span style="color:#94a3b8">—</span>';
     if(r.px !== null){
-      const ps = (p.marj||0) * (p.lev||1);
-      const pnlDolar = ps * r.pct / 100;
       const pxColor = r.pct >= 0 ? '#4ade80' : '#f87171';
       pxCell = `<span style="color:${pxColor}">${fmtNum(r.px)}</span>`;
-      const arrow = r.pct >= 0 ? '▲' : '▼';
-      const cls = r.pct >= 0 ? 'up' : 'down';
-      durumCell = `<span class="statusCell ${cls}">${arrow} ${pnlDolar>=0?'+':''}${pnlDolar.toFixed(1)}$ (${r.pct>=0?'+':''}${r.pct.toFixed(2)}%)</span>`;
+      // GERÇEK PnL göster
+      const arrow = r.realPnl >= 0 ? '▲' : '▼';
+      const cls = r.realPnl >= 0 ? 'up' : 'down';
+      // Detay: realized + unrealized
+      const realized = (p.tp1_kar||0) + (p.tp2_kar||0);
+      const tip = realized > 0
+        ? `(realize: ${realized.toFixed(1)}$ + kalan %${r.kalanOran}: ${(r.realPnl-realized).toFixed(1)}$)`
+        : `(${r.kalanOran}% açık)`;
+      durumCell = `<span class="statusCell ${cls}" title="${tip}">${arrow} ${r.realPnl>=0?'+':''}${r.realPnl.toFixed(1)}$ <span style="font-size:9px;opacity:0.7">${r.kalanOran<100?'%'+r.kalanOran+' aktif':''}</span></span>`;
     }
     // TP1'e kalan
     let tp1kCell = '<span style="color:#94a3b8">—</span>';
     if(r.tp1kalan !== null){
-      if(r.tp1kalan <= 0){
+      if(r.tp1kalan <= 0 || p.tp1_hit){
         tp1kCell = '<span style="color:#4ade80;font-weight:600">✓ Geçildi</span>';
       } else {
         tp1kCell = `<span style="color:#a5b4fc">%${r.tp1kalan.toFixed(2)} uzak</span>`;
@@ -3887,6 +3920,19 @@ function renderOpenTable(sys, open_pos){
       else if(sk < 5) skC = '#fbbf24';
       skCell = `<span style="color:${skC};font-weight:600">%${sk.toFixed(2)} ${sk<0?'↓':'uzak'}</span>`;
     }
+    // TRAIL kolonu
+    let trailCell = '<span style="color:#94a3b8;font-size:10px">— pasif</span>';
+    if(r.trailLevel !== null){
+      const tg = r.trailGap;
+      let tgC = '#a78bfa';
+      if(tg !== null){
+        if(tg <= 0) tgC = '#dc2626';
+        else if(tg < 2) tgC = '#f87171';
+        else if(tg < 4) tgC = '#fbbf24';
+      }
+      const status = p.tp2_hit ? 'TP2 sonrası' : (p.tp1_hit ? 'BE' : 'tahmini');
+      trailCell = `<span style="color:${tgC};font-weight:600;font-size:11px" title="${status}">${fmtNum(r.trailLevel)}<br><span style="font-size:9px">%${(tg||0).toFixed(2)} uzak</span></span>`;
+    }
     return `
     <tr>
       <td><a class="coinLink" onclick="openTV('${p.ticker}')">${p.ticker}</a></td>
@@ -3897,6 +3943,7 @@ function renderOpenTable(sys, open_pos){
       <td>${durumCell}</td>
       <td>${tp1kCell}</td>
       <td>${skCell}</td>
+      <td>${trailCell}</td>
       <td style="color:#f87171">${fmtNum(p.current_stop || p.stop || p.original_stop)}</td>
       <td style="color:#4ade80">${fmtNum(p.tp1)}</td>
       <td style="color:#22d3ee">${fmtNum(p.tp2)}</td>
