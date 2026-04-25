@@ -3031,6 +3031,11 @@ tr:hover{background:#16213a}
 .pcChg{font-size:11px;font-weight:600}
 .pcChg.up{color:#4ade80}
 .pcChg.down{color:#f87171}
+/* Dominance bar — farklı renk tonu */
+.dominanceBar{margin-top:4px}
+.dominanceBar .priceCard{background:linear-gradient(135deg,#1e1b4b,#0f0f23);border-color:#4c1d95}
+.dominanceBar .pcLabel{color:#c4b5fd}
+.dominanceBar .pcVal{color:#a78bfa;font-size:14px}
 @media(max-width:640px){
   .priceCard{padding:6px 10px;min-width:100px}
   .pcVal{font-size:14px}
@@ -3074,7 +3079,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 <h1>🤖 CAB Bot v6.7 — Dual System</h1>
 <div class="muted">⟳ <span id="lastUpdate">—</span> | Veri 10sn'de yenilenir</div>
 
-<!-- Üst Fiyat Çubuğu -->
+<!-- Üst Fiyat Çubuğu (Coin fiyatları) -->
 <div class="priceBar">
   <div class="priceCard">
     <div class="pcLabel">BTC/USDT</div>
@@ -3090,6 +3095,30 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
     <div class="pcLabel">ETH/BTC</div>
     <div class="pcVal" id="ethBtcPrice">—</div>
     <div class="pcChg" id="ethBtcChg">—</div>
+  </div>
+</div>
+
+<!-- Dominance Çubuğu (Market Cap %) -->
+<div class="priceBar dominanceBar">
+  <div class="priceCard">
+    <div class="pcLabel">BTC.D</div>
+    <div class="pcVal" id="btcDom">—</div>
+    <div class="pcChg" id="btcDomChg">—</div>
+  </div>
+  <div class="priceCard">
+    <div class="pcLabel">ETH.D</div>
+    <div class="pcVal" id="ethDom">—</div>
+    <div class="pcChg" id="ethDomChg">—</div>
+  </div>
+  <div class="priceCard">
+    <div class="pcLabel">USDT.D</div>
+    <div class="pcVal" id="usdtDom">—</div>
+    <div class="pcChg" id="usdtDomChg">—</div>
+  </div>
+  <div class="priceCard">
+    <div class="pcLabel">OTHERS.D</div>
+    <div class="pcVal" id="othersDom">—</div>
+    <div class="pcChg" id="othersDomChg">—</div>
   </div>
 </div>
 
@@ -3408,6 +3437,8 @@ let DATA={};
 let CURRENT_SYS='cab';
 let openPrices={};  // Açık pozların anlık fiyatları (Binance public API)
 let topPrices={btc:null, eth:null, ethBtc:null, btcPrev:null, ethPrev:null, ethBtcPrev:null};
+let dominanceState={btcD:null, ethD:null, usdtD:null, othersD:null,
+                    btcDPrev:null, ethDPrev:null, usdtDPrev:null, othersDPrev:null};
 
 // TradingView'a coin linki açar (Binance Futures sembolü)
 function openTV(ticker){
@@ -3464,6 +3495,62 @@ async function updateTopPrices(){
     const chg = document.getElementById('ethBtcChg');
     chg.textContent = (ratioChg>=0?'▲ +':'▼ ') + ratioChg.toFixed(2) + '%';
     chg.className = 'pcChg ' + (ratioChg>=0?'up':'down');
+  }
+}
+
+// Dominance fetch (CoinGecko free)
+async function updateDominance(){
+  try{
+    const r = await fetch('https://api.coingecko.com/api/v3/global');
+    if(!r.ok) return;
+    const j = await r.json();
+    const mc = (j.data && j.data.market_cap_percentage) || {};
+    const btcD = mc.btc || 0;
+    const ethD = mc.eth || 0;
+    const usdtD = mc.usdt || 0;
+    const usdcD = mc.usdc || 0;
+    const bnbD = mc.bnb || 0;
+    const othersD = 100 - btcD - ethD - usdtD - usdcD - bnbD;
+
+    function setDom(id, val, prev){
+      const el = document.getElementById(id);
+      const elChg = document.getElementById(id+'Chg');
+      el.textContent = val.toFixed(2) + '%';
+      if(prev !== null && prev !== undefined){
+        const diff = val - prev;
+        if(Math.abs(diff) < 0.01){
+          elChg.textContent = '— sabit';
+          elChg.className = 'pcChg';
+        } else {
+          const arrow = diff >= 0 ? '▲ +' : '▼ ';
+          elChg.textContent = arrow + diff.toFixed(2) + '%';
+          elChg.className = 'pcChg ' + (diff >= 0 ? 'up' : 'down');
+        }
+      } else {
+        elChg.textContent = '— ilk veri';
+        elChg.className = 'pcChg';
+      }
+    }
+
+    setDom('btcDom', btcD, dominanceState.btcDPrev);
+    setDom('ethDom', ethD, dominanceState.ethDPrev);
+    setDom('usdtDom', usdtD, dominanceState.usdtDPrev);
+    setDom('othersDom', othersD, dominanceState.othersDPrev);
+
+    // Önceki değer = ilk fetch sonrası set et (referans için)
+    if(dominanceState.btcDPrev === null){
+      dominanceState.btcDPrev = btcD;
+      dominanceState.ethDPrev = ethD;
+      dominanceState.usdtDPrev = usdtD;
+      dominanceState.othersDPrev = othersD;
+    }
+
+    dominanceState.btcD = btcD;
+    dominanceState.ethD = ethD;
+    dominanceState.usdtD = usdtD;
+    dominanceState.othersD = othersD;
+  }catch(e){
+    console.warn('Dominance fetch error:', e.message);
   }
 }
 
@@ -4181,6 +4268,7 @@ async function init(){
   }catch(e){}
   // İlk fiyatlar
   updateTopPrices();
+  updateDominance();
   updateOpenPrices();
   // 10sn data yenileme (migrate aktif değilse)
   setInterval(()=>{
@@ -4194,6 +4282,10 @@ async function init(){
   setInterval(()=>{
     if(!window._migrateActive) updateTopPrices();
   }, 15000);
+  // 60sn dominance yenileme (yavaş değişen veri, rate limit önemli)
+  setInterval(()=>{
+    if(!window._migrateActive) updateDominance();
+  }, 60000);
 }
 init();
 </script>
