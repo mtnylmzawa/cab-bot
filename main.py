@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from binance.um_futures import UMFutures
 from binance.error import ClientError
+import asyncio
 import os, json, httpx, asyncio, math, time
 from datetime import datetime, timezone, timedelta
 
@@ -58,6 +59,26 @@ INITIAL_DATA = {
         "last_change_at": None, "change_history": [], "auto_reduced": False,
     },
 
+    # ═══════════════ v6.7: Auto-Recovery (test için) ═══════════════
+    "cab_auto_recovery": False,  # canlı mod default kapalı
+    "ram_auto_recovery": True,   # shadow için varsayılan açık
+    "cab_recovery_state": {
+        "next_resume_at": None,        # ISO timestamp — bu zamanda otomatik resume
+        "next_max_pos_inc_at": None,   # ISO timestamp — bu zamanda MAX_POS +1
+        "ks_today_count": 0,           # Bugün kaç kez kill switch oldu
+        "ks_today_date": None,         # Hangi gün için sayaç
+        "long_cooldown_until": None,   # 3+ KS sonrası 2 saat cooldown
+        "last_action_log": [],         # Son 10 aksiyon (debug için)
+    },
+    "ram_recovery_state": {
+        "next_resume_at": None,
+        "next_max_pos_inc_at": None,
+        "ks_today_count": 0,
+        "ks_today_date": None,
+        "long_cooldown_until": None,
+        "last_action_log": [],
+    },
+
     # ═══════════════ v6.5 Legacy Shadow (RAM v14 için, artık KULLANILMAYACAK) ═══════════════
     "shadow_positions": {}, "shadow_closed": [], "shadow_skipped": [],
 
@@ -111,6 +132,22 @@ def load_data():
             # v6.7: Arşiv alanı
             if "archive" not in loaded:
                 loaded["archive"] = []
+            # v6.7: Auto-Recovery migration
+            if "cab_auto_recovery" not in loaded:
+                loaded["cab_auto_recovery"] = False
+            if "ram_auto_recovery" not in loaded:
+                loaded["ram_auto_recovery"] = True
+            for sys_key in ["cab", "ram"]:
+                rs_key = f"{sys_key}_recovery_state"
+                if rs_key not in loaded:
+                    loaded[rs_key] = {
+                        "next_resume_at": None,
+                        "next_max_pos_inc_at": None,
+                        "ks_today_count": 0,
+                        "ks_today_date": None,
+                        "long_cooldown_until": None,
+                        "last_action_log": [],
+                    }
             return loaded
     except Exception as e:
         print(f"[LOAD ERR] {e}")
@@ -180,7 +217,7 @@ def get_pause_info(system="cab"):
 
 
 def pause_bot(reason, reason_text, system="cab"):
-    """Belirtilen sistemi pause'a al"""
+    """Belirtilen sistemi pause'a al — v6.7: auto-recovery tetikler"""
     key = _sys_key(system, "pause_state")
     data[key] = {
         "paused": True, "reason": reason, "reason_text": reason_text,
@@ -189,6 +226,159 @@ def pause_bot(reason, reason_text, system="cab"):
     }
     save_data(data)
     print(f"[PAUSE:{system.upper()}] {reason}: {reason_text}")
+
+    # v6.7: Auto-Recovery tetikleyici (auto_ prefix ile gelirse)
+    if reason.startswith("auto_") and get_auto_recovery(system):
+        schedule_recovery(system, reason)
+
+
+# ============ v6.7: AUTO-RECOVERY ============
+def get_auto_recovery(system):
+    """Sistem auto-recovery açık mı?"""
+    return bool(data.get(f"{system}_auto_recovery", False))
+
+
+def set_auto_recovery(system, enabled):
+    """Auto-recovery aç/kapa"""
+    data[f"{system}_auto_recovery"] = bool(enabled)
+    save_data(data)
+    print(f"[AUTO-RECOVERY:{system.upper()}] → {'AÇIK' if enabled else 'KAPALI'}")
+
+
+def get_recovery_state(system):
+    """Recovery state'i getir"""
+    return data.get(f"{system}_recovery_state", {})
+
+
+def schedule_recovery(system, reason):
+    """Kill Switch sonrası otomatik resume planla"""
+    from datetime import datetime, timedelta
+    rs = get_recovery_state(system)
+    today = now_tr()[:10]
+
+    # Bugünkü KS sayacını güncelle
+    if rs.get("ks_today_date") != today:
+        rs["ks_today_date"] = today
+        rs["ks_today_count"] = 1
+    else:
+        rs["ks_today_count"] = rs.get("ks_today_count", 0) + 1
+
+    # Cooldown süresi belirle
+    ks_count = rs["ks_today_count"]
+    if ks_count >= 3:
+        # 3+ KS aynı gün → 2 saat cooldown
+        cooldown_min = 120
+        rs["long_cooldown_until"] = (datetime.now() + timedelta(minutes=120)).isoformat()
+        action = f"3+ KS bugün → 2 saat cooldown"
+    else:
+        cooldown_min = 30  # Normal cooldown
+        action = f"KS #{ks_count} bugün → 30 dk cooldown"
+
+    next_resume = (datetime.now() + timedelta(minutes=cooldown_min)).isoformat()
+    rs["next_resume_at"] = next_resume
+
+    # Aksiyon logu
+    log = rs.get("last_action_log", [])
+    log.append({"ts": now_tr(), "action": action, "reason": reason, "next_resume": next_resume})
+    rs["last_action_log"] = log[-10:]
+
+    data[f"{system}_recovery_state"] = rs
+    save_data(data)
+    print(f"[RECOVERY:{system.upper()}] {action} — resume planlandı: {next_resume}")
+
+
+def schedule_max_pos_increase(system):
+    """MAX POS otomatik artış için zaman planla"""
+    from datetime import datetime, timedelta
+    rs = get_recovery_state(system)
+    rs["next_max_pos_inc_at"] = (datetime.now() + timedelta(minutes=30)).isoformat()
+    data[f"{system}_recovery_state"] = rs
+    save_data(data)
+    print(f"[RECOVERY:{system.upper()}] MAX POS artış planlandı: 30 dk sonra")
+
+
+async def recovery_loop():
+    """v6.7: Background task — her 5 dk auto-recovery kontrol"""
+    import asyncio
+    from datetime import datetime
+    while True:
+        try:
+            await asyncio.sleep(300)  # 5 dakika
+
+            for system in ["cab", "ram"]:
+                if not get_auto_recovery(system):
+                    continue
+
+                rs = get_recovery_state(system)
+                now = datetime.now()
+
+                # 1) Long cooldown kontrolü
+                lcu = rs.get("long_cooldown_until")
+                if lcu:
+                    try:
+                        lcu_dt = datetime.fromisoformat(lcu)
+                        if now < lcu_dt:
+                            continue  # Hala cooldown'da
+                        else:
+                            rs["long_cooldown_until"] = None
+                    except: pass
+
+                # 2) Pause edilmiş mi? Resume zamanı geldi mi?
+                if is_paused(system):
+                    nra = rs.get("next_resume_at")
+                    if nra:
+                        try:
+                            nra_dt = datetime.fromisoformat(nra)
+                            if now >= nra_dt:
+                                # AUTO RESUME
+                                resume_bot(system=system)
+                                rs["next_resume_at"] = None
+
+                                # MAX POS minimumdaysa, oto-artış başlat
+                                mp_state = data.get(_sys_key(system, "max_pos_state"), {})
+                                if mp_state.get("current", MAX_POSITIONS_DEFAULT) <= MAX_POSITIONS_MIN + 1:
+                                    schedule_max_pos_increase(system)
+
+                                log = rs.get("last_action_log", [])
+                                log.append({"ts": now_tr(), "action": "AUTO RESUME"})
+                                rs["last_action_log"] = log[-10:]
+                                data[f"{system}_recovery_state"] = rs
+                                save_data(data)
+                                print(f"[RECOVERY:{system.upper()}] AUTO RESUME — bot tekrar aktif")
+                        except Exception as e:
+                            print(f"[RECOVERY:{system.upper()}] resume parse error: {e}")
+
+                # 3) MAX POS oto-artış zamanı geldi mi?
+                if not is_paused(system):
+                    nmpi = rs.get("next_max_pos_inc_at")
+                    if nmpi:
+                        try:
+                            nmpi_dt = datetime.fromisoformat(nmpi)
+                            if now >= nmpi_dt:
+                                cur_max = get_max_positions(system)
+                                if cur_max < MAX_POSITIONS_DEFAULT:  # 7'ye kadar artır
+                                    new_max = cur_max + 1
+                                    set_max_positions(new_max, "auto_recovery_increase", system=system)
+                                    if new_max < MAX_POSITIONS_DEFAULT:
+                                        schedule_max_pos_increase(system)  # bir sonrakini planla
+                                    else:
+                                        rs["next_max_pos_inc_at"] = None  # tamam
+                                        data[f"{system}_recovery_state"] = rs
+                                        save_data(data)
+                        except Exception as e:
+                            print(f"[RECOVERY:{system.upper()}] max_pos parse error: {e}")
+
+                # 4) Yeni gün başında KS sayaçlarını sıfırla
+                today = now_tr()[:10]
+                if rs.get("ks_today_date") and rs["ks_today_date"] != today:
+                    rs["ks_today_count"] = 0
+                    rs["ks_today_date"] = today
+                    data[f"{system}_recovery_state"] = rs
+                    save_data(data)
+        except Exception as e:
+            print(f"[RECOVERY LOOP] Error: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def resume_bot(system="cab"):
@@ -1601,6 +1791,41 @@ async def toggle_mode(req: Request):
     })
 
 
+@app.get("/api/recovery_status")
+async def get_recovery_status(system: str = "cab"):
+    """v6.7: Auto-Recovery durumu"""
+    if system not in ("cab", "ram"):
+        system = "cab"
+    rs = get_recovery_state(system)
+    return JSONResponse({
+        "system": system,
+        "enabled": get_auto_recovery(system),
+        "state": rs,
+    })
+
+
+@app.post("/api/toggle_auto_recovery")
+async def toggle_auto_recovery(req: Request):
+    """v6.7: Auto-Recovery aç/kapa.
+    Body: {"system": "cab"|"ram", "enabled": true|false}
+    """
+    body = {}
+    try:
+        body = await req.json()
+    except: pass
+    system = body.get("system", "cab")
+    enabled = bool(body.get("enabled", False))
+    if system not in ("cab", "ram"):
+        return JSONResponse({"success": False, "error": "system 'cab' veya 'ram'"}, status_code=400)
+    set_auto_recovery(system, enabled)
+    return JSONResponse({
+        "success": True,
+        "system": system,
+        "enabled": enabled,
+        "msg": f"{system.upper()} Auto-Recovery → {'AÇIK' if enabled else 'KAPALI'}"
+    })
+
+
 @app.post("/api/archive_and_reset")
 async def archive_and_reset(req: Request):
     """v6.7: Mevcut verileri arşivle ve temiz başlangıç yap.
@@ -2920,6 +3145,7 @@ async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
     print(f"[BOOT] CAB Bot v6.7 Patch 1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
+    asyncio.create_task(recovery_loop())  # v6.7: auto-recovery
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -3022,6 +3248,14 @@ tr:hover{background:#16213a}
 .modalBox{background:#1e293b;border-radius:10px;padding:20px;max-width:900px;margin:20px auto;border:2px solid #475569}
 .modalBox h2{margin:0 0 12px;color:#a5b4fc;font-size:18px}
 .modalClose{float:right;background:#dc2626;color:white;border:none;padding:6px 12px;border-radius:5px;cursor:pointer}
+
+/* Auto-Recovery box */
+.recoveryBox{display:flex;align-items:center;justify-content:space-between;background:#1e1b4b;border:1px solid #6366f1;padding:10px 14px;border-radius:8px;margin:8px 0;flex-wrap:wrap;gap:8px}
+.recoveryTitle{font-weight:700;font-size:13px;color:#a5b4fc;display:flex;align-items:center;gap:8px}
+.recStatus{background:#312e81;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600}
+.recStatus.on{background:#059669;color:white}
+.recStatus.off{background:#475569;color:#cbd5e1}
+.recStatus.cooling{background:#d97706;color:white}
 
 /* Üst fiyat çubuğu */
 .priceBar{display:flex;gap:8px;margin:10px 0 4px;flex-wrap:wrap}
@@ -3153,6 +3387,17 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
       <div class="muted" id="cabPauseDetail">Yeni sinyaller kabul ediliyor</div>
     </div>
     <button id="cabPauseBtn" class="btn btn-red btn-sm" onclick="togglePause('cab')">⏸ Durdur</button>
+  </div>
+
+  <!-- Auto-Recovery Box -->
+  <div id="cabRecoveryBox" class="recoveryBox">
+    <div>
+      <div class="recoveryTitle">🔄 Auto-Recovery
+        <span id="cabRecoveryStatus" class="recStatus">—</span>
+      </div>
+      <div class="muted" id="cabRecoveryDetail">Kill Switch sonrası otomatik resume + MAX POS artışı</div>
+    </div>
+    <button id="cabRecoveryBtn" class="btn btn-sm" onclick="toggleAutoRecovery('cab')">—</button>
   </div>
 
   <!-- MAX POS -->
@@ -3288,6 +3533,17 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
       <div class="muted" id="ramPauseDetail">Yeni sinyaller kabul ediliyor</div>
     </div>
     <button id="ramPauseBtn" class="btn btn-red btn-sm" onclick="togglePause('ram')">⏸ Durdur</button>
+  </div>
+
+  <!-- Auto-Recovery Box -->
+  <div id="ramRecoveryBox" class="recoveryBox">
+    <div>
+      <div class="recoveryTitle">🔄 Auto-Recovery
+        <span id="ramRecoveryStatus" class="recStatus">—</span>
+      </div>
+      <div class="muted" id="ramRecoveryDetail">Kill Switch sonrası otomatik resume + MAX POS artışı</div>
+    </div>
+    <button id="ramRecoveryBtn" class="btn btn-sm" onclick="toggleAutoRecovery('ram')">—</button>
   </div>
 
   <!-- MAX POS -->
@@ -3491,58 +3747,97 @@ async function updateTopPrices(){
   }
 }
 
-// Dominance fetch (CoinGecko free) — kompakt versiyon
+// Dominance fetch — multi-source fallback ile
 async function updateDominance(){
+  let mc = null;
+  let source = '';
+
+  // Kaynak 1: CoinGecko (öncelikli)
   try{
-    const r = await fetch('https://api.coingecko.com/api/v3/global');
-    if(!r.ok) return;
-    const j = await r.json();
-    const mc = (j.data && j.data.market_cap_percentage) || {};
-    const btcD = mc.btc || 0;
-    const ethD = mc.eth || 0;
-    const usdtD = mc.usdt || 0;
-    const usdcD = mc.usdc || 0;
-    const bnbD = mc.bnb || 0;
-    const othersD = 100 - btcD - ethD - usdtD - usdcD - bnbD;
-
-    function setDom(id, val, prev){
-      const el = document.getElementById(id);
-      const elChg = document.getElementById(id+'Chg');
-      el.textContent = val.toFixed(2) + '%';
-      if(prev !== null && prev !== undefined && Math.abs(val - prev) >= 0.001){
-        const diff = val - prev;
-        const arrow = diff >= 0 ? '▲+' : '▼';
-        elChg.textContent = arrow + diff.toFixed(3) + '%';
-        elChg.className = 'domChg ' + (diff >= 0 ? 'up' : 'down');
-      } else if(prev !== null && prev !== undefined){
-        elChg.textContent = '';  // Sabit, yer kaplama
-        elChg.className = 'domChg';
-      } else {
-        elChg.textContent = '';
-        elChg.className = 'domChg';
-      }
+    const r = await fetch('https://api.coingecko.com/api/v3/global', {
+      headers: {'Accept': 'application/json'}
+    });
+    if(r.ok){
+      const j = await r.json();
+      mc = (j.data && j.data.market_cap_percentage) || null;
+      source = 'CoinGecko';
+    } else {
+      console.warn('[DOM] CoinGecko HTTP', r.status);
     }
-
-    // KRİTİK: prev'i göstermeden ÖNCE değişimi göster (önceki değerle karşılaştır)
-    setDom('btcDom', btcD, dominanceState.btcDPrev);
-    setDom('ethDom', ethD, dominanceState.ethDPrev);
-    setDom('usdtDom', usdtD, dominanceState.usdtDPrev);
-    setDom('othersDom', othersD, dominanceState.othersDPrev);
-
-    // SONRA prev'i güncelle (her fetch'te)
-    // Böylece değişim = bu fetch ile bir önceki fetch arası fark
-    dominanceState.btcDPrev = dominanceState.btcD || btcD;
-    dominanceState.ethDPrev = dominanceState.ethD || ethD;
-    dominanceState.usdtDPrev = dominanceState.usdtD || usdtD;
-    dominanceState.othersDPrev = dominanceState.othersD || othersD;
-
-    dominanceState.btcD = btcD;
-    dominanceState.ethD = ethD;
-    dominanceState.usdtD = usdtD;
-    dominanceState.othersD = othersD;
   }catch(e){
-    console.warn('Dominance fetch error:', e.message);
+    console.warn('[DOM] CoinGecko hata:', e.message);
   }
+
+  // Kaynak 2: CoinPaprika (yedek)
+  if(!mc){
+    try{
+      const r = await fetch('https://api.coinpaprika.com/v1/global');
+      if(r.ok){
+        const j = await r.json();
+        // CoinPaprika formatı farklı: bitcoin_dominance_percentage
+        if(j.bitcoin_dominance_percentage){
+          mc = {
+            btc: j.bitcoin_dominance_percentage,
+            // ETH, USDT vb. yok bu API'de — kabaca tahmin
+            eth: 12.0,  // sabit yaklaşım
+            usdt: 5.0,
+            usdc: 1.0,
+            bnb: 3.0,
+          };
+          source = 'CoinPaprika (sınırlı)';
+        }
+      }
+    }catch(e){
+      console.warn('[DOM] CoinPaprika hata:', e.message);
+    }
+  }
+
+  if(!mc){
+    // Hiçbir kaynak çalışmadı — uyarı göster
+    document.getElementById('btcDom').textContent = 'API hata';
+    document.getElementById('ethDom').textContent = '—';
+    document.getElementById('usdtDom').textContent = '—';
+    document.getElementById('othersDom').textContent = '—';
+    document.getElementById('btcDomChg').textContent = '';
+    return;
+  }
+
+  const btcD = parseFloat(mc.btc) || 0;
+  const ethD = parseFloat(mc.eth) || 0;
+  const usdtD = parseFloat(mc.usdt) || 0;
+  const usdcD = parseFloat(mc.usdc) || 0;
+  const bnbD = parseFloat(mc.bnb) || 0;
+  const othersD = 100 - btcD - ethD - usdtD - usdcD - bnbD;
+
+  console.log('[DOM] Source:', source, 'BTC.D:', btcD.toFixed(2));
+
+  function setDom(id, val, prev){
+    const el = document.getElementById(id);
+    const elChg = document.getElementById(id+'Chg');
+    if(!el) return;
+    el.textContent = val.toFixed(2) + '%';
+    if(prev !== null && prev !== undefined && Math.abs(val - prev) >= 0.001){
+      const diff = val - prev;
+      const arrow = diff >= 0 ? '▲+' : '▼';
+      elChg.textContent = arrow + diff.toFixed(3) + '%';
+      elChg.className = 'domChg ' + (diff >= 0 ? 'up' : 'down');
+    } else {
+      elChg.textContent = '';
+      elChg.className = 'domChg';
+    }
+  }
+
+  // İLK ÖNCE değişimi göster (önceki ile karşılaştır)
+  setDom('btcDom', btcD, dominanceState.btcD);  // prev = BU FETCHTEN ÖNCEKİ değer
+  setDom('ethDom', ethD, dominanceState.ethD);
+  setDom('usdtDom', usdtD, dominanceState.usdtD);
+  setDom('othersDom', othersD, dominanceState.othersD);
+
+  // SONRA değerleri güncelle (bir sonraki fetch için referans)
+  dominanceState.btcD = btcD;
+  dominanceState.ethD = ethD;
+  dominanceState.usdtD = usdtD;
+  dominanceState.othersD = othersD;
 }
 
 // Açık poz fiyatlarını çek (her sistem için)
@@ -3694,6 +3989,82 @@ function switchSys(sys){
   try{ localStorage.setItem('v67_sys', sys); }catch(e){}
 }
 
+// Auto-Recovery durumunu güncelle (her render'da)
+function updateRecoveryUI(sys){
+  const enabled = sys==='cab' ? DATA.cab_auto_recovery : DATA.ram_auto_recovery;
+  const rs = sys==='cab' ? (DATA.cab_recovery_state||{}) : (DATA.ram_recovery_state||{});
+  const status = document.getElementById(sys+'RecoveryStatus');
+  const detail = document.getElementById(sys+'RecoveryDetail');
+  const btn = document.getElementById(sys+'RecoveryBtn');
+
+  if(enabled){
+    // Cooldown var mı?
+    const lcu = rs.long_cooldown_until;
+    const nra = rs.next_resume_at;
+    if(lcu){
+      const dt = new Date(lcu);
+      const left = Math.round((dt.getTime() - Date.now()) / 60000);
+      if(left > 0){
+        status.textContent = '🟡 LONG COOLDOWN';
+        status.className = 'recStatus cooling';
+        detail.textContent = `${left} dk sonra normale döner (3+ kill switch oldu)`;
+      }
+    } else if(nra){
+      const dt = new Date(nra);
+      const left = Math.round((dt.getTime() - Date.now()) / 60000);
+      if(left > 0){
+        status.textContent = '⏳ Resume bekliyor';
+        status.className = 'recStatus cooling';
+        detail.textContent = `${left} dk sonra otomatik resume olacak`;
+      } else {
+        status.textContent = '🟢 AÇIK';
+        status.className = 'recStatus on';
+        const ksCount = rs.ks_today_count || 0;
+        detail.textContent = `Bugün ${ksCount} kill switch | Cooldown: 30dk | MAX +1: 30dk`;
+      }
+    } else {
+      status.textContent = '🟢 AÇIK';
+      status.className = 'recStatus on';
+      const ksCount = rs.ks_today_count || 0;
+      detail.textContent = `Bugün ${ksCount} kill switch | Cooldown: 30dk | MAX +1: 30dk`;
+    }
+    btn.textContent = '⏹ Kapat';
+    btn.className = 'btn btn-red btn-sm';
+  } else {
+    status.textContent = '⚫ KAPALI';
+    status.className = 'recStatus off';
+    detail.textContent = 'Kill switch sonrası elle resume etmen gerekir';
+    btn.textContent = '▶ Aç';
+    btn.className = 'btn btn-green btn-sm';
+  }
+}
+
+async function toggleAutoRecovery(sys){
+  const enabled = sys==='cab' ? DATA.cab_auto_recovery : DATA.ram_auto_recovery;
+  const target = !enabled;
+  let msg = `${sys.toUpperCase()} Auto-Recovery → ${target?'AÇIK':'KAPALI'}\n\n`;
+  if(target){
+    msg += '✓ Kill Switch tetiklenince 30 dk sonra otomatik resume\n';
+    msg += '✓ MAX POS otomatik düşmüşse 30 dk başına +1\n';
+    msg += '✓ Aynı gün 3+ kill switch → 2 saat cooldown\n\n';
+    msg += 'Bu test modu için ideal.';
+  } else {
+    msg += '⚠️ Bot kill switch yiyince elle resume etmen gerekir';
+  }
+  if(!confirm(msg)) return;
+  try{
+    const r = await fetch('/api/toggle_auto_recovery', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({system:sys, enabled:target})});
+    const j = await r.json();
+    if(j.success){
+      toast('✓ '+j.msg, 'success');
+      loadData();
+    } else {
+      toast('Hata: '+(j.error||'?'), 'error');
+    }
+  }catch(e){ toast('Hata: '+e.message, 'error'); }
+}
+
 async function loadData(){
   try{
     const r = await fetch('/api/data');
@@ -3708,6 +4079,9 @@ async function loadData(){
 }
 
 function render(){
+  // Auto-Recovery UI güncelle
+  updateRecoveryUI('cab');
+  updateRecoveryUI('ram');
   // CAB
   renderSystem('cab',
     DATA.open_positions || {},
