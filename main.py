@@ -4454,16 +4454,18 @@ function renderOpenTable(sys, open_pos){
     }
     // TRAIL kolonu — sade ve anlatımlı
     let trailCell = '<span style="color:#94a3b8;font-size:10px">— Pasif (TP1 öncesi)</span>';
+    const _px = r.px;
+    const _giris = p.giris || 0;
     if(p.tp1_hit && !p.tp2_hit){
       // BE durumu
-      const beLevel = p.current_stop || giris;
-      const tg = (px && beLevel) ? (px - beLevel) / px * 100 : 0;
+      const beLevel = p.current_stop || _giris;
+      const tg = (_px && beLevel) ? (_px - beLevel) / _px * 100 : 0;
       let bgC = tg < 1 ? '#f87171' : (tg < 3 ? '#fbbf24' : '#4ade80');
       trailCell = `<span style="color:${bgC};font-weight:600;font-size:11px" title="TP1 vurdu, stop giriş seviyesine çekildi (Break-Even)">BE @ ${fmtNum(beLevel)}<br><span style="font-size:9px">%${tg.toFixed(2)} uzak</span></span>`;
     } else if(p.tp2_hit){
       // Trail aktif: ATR×2 chandelier
-      const trailLevel = p.current_stop || (giris * 1.05);
-      const tg = (px && trailLevel) ? (px - trailLevel) / px * 100 : 0;
+      const trailLevel = p.current_stop || (_giris * 1.05);
+      const tg = (_px && trailLevel) ? (_px - trailLevel) / _px * 100 : 0;
       let tgC = '#a78bfa';
       if(tg <= 0) tgC = '#dc2626';
       else if(tg < 2) tgC = '#f87171';
