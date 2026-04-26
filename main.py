@@ -3389,6 +3389,16 @@ tr:hover{background:#16213a}
 .modalBox h2{margin:0 0 12px;color:#a5b4fc;font-size:18px}
 .modalClose{float:right;background:#dc2626;color:white;border:none;padding:6px 12px;border-radius:5px;cursor:pointer}
 
+/* Skipped özet kutusu */
+.skipSummary{background:#0f172a;border:1px solid #334155;border-radius:6px;padding:10px 14px;margin:8px 0;display:none;font-size:12px}
+.skipSummary.has-data{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+.skipSummary .ssItem{display:flex;flex-direction:column;gap:2px;min-width:100px}
+.skipSummary .ssLabel{font-size:10px;color:#94a3b8;font-weight:600;letter-spacing:0.5px}
+.skipSummary .ssVal{font-size:14px;font-weight:700}
+.skipSummary .ssVal.up{color:#4ade80}
+.skipSummary .ssVal.down{color:#f87171}
+.skipSummary .ssVal.neutral{color:#fbbf24}
+
 /* Auto-Recovery box */
 .recoveryBox{display:flex;align-items:center;justify-content:space-between;background:#1e1b4b;border:1px solid #6366f1;padding:10px 14px;border-radius:8px;margin:8px 0;flex-wrap:wrap;gap:8px}
 .recoveryTitle{font-weight:700;font-size:13px;color:#a5b4fc;display:flex;align-items:center;gap:8px}
@@ -3631,6 +3641,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
   <!-- Kaçırılan -->
   <div class="section">
     <h3>🚫 Kaçırılan Sinyaller <span class="ct" id="cabSkipCt">0</span></h3>
+    <div id="cabSkipSummary" class="skipSummary"></div>
     <div class="filterRow">
       <label>📅 Tarih:</label>
       <select id="cab_skipDateFilter" onchange="render()">
@@ -3780,6 +3791,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
   <!-- Kaçırılan -->
   <div class="section">
     <h3>🚫 Kaçırılan Sinyaller <span class="ct" id="ramSkipCt">0</span></h3>
+    <div id="ramSkipSummary" class="skipSummary"></div>
     <div class="filterRow">
       <label>📅 Tarih:</label>
       <select id="ram_skipDateFilter" onchange="render()">
@@ -4053,16 +4065,19 @@ function sortRows(rows, key, dir){
 
 function filterByDate(rows, dateFilter, dateKey){
   if(!dateFilter || dateFilter==='all') return rows;
-  const today = now_tr_today();
-  const yesterday = (()=>{
-    const d=new Date(); d.setDate(d.getDate()-1);
-    const trH=d.getUTCHours()+3;
-    return d.toISOString().slice(0,10);
-  })();
-  const d7 = (()=>{
-    const d=new Date(); d.setDate(d.getDate()-7);
-    return d.toISOString().slice(0,10);
-  })();
+  // Türkiye saatiyle hesap (UTC+3)
+  function trDateStr(offsetDays){
+    const d = new Date();
+    const trMs = d.getTime() + (3 * 3600 * 1000) - (offsetDays * 86400 * 1000);
+    const trDate = new Date(trMs);
+    const y = trDate.getUTCFullYear();
+    const m = String(trDate.getUTCMonth()+1).padStart(2,'0');
+    const dd = String(trDate.getUTCDate()).padStart(2,'0');
+    return `${y}-${m}-${dd}`;
+  }
+  const today = trDateStr(0);
+  const yesterday = trDateStr(1);
+  const d7 = trDateStr(7);
   return rows.filter(r=>{
     const ts=(r[dateKey]||'').slice(0,10);
     if(dateFilter==='today') return ts===today;
@@ -4558,8 +4573,79 @@ function renderSkipTable(sys, skipped){
   let arr = filterByDate(skipped, dateFilter, 'zaman');
   arr = filterBySearch(arr, searchText);
   document.getElementById(sys+'SkipCt').textContent = arr.length;
+
+  // ÖZET HESABI — sanal kar/zarar simülasyonu
+  const summaryEl = document.getElementById(sys+'SkipSummary');
+  let summaryItems = [];
+  let totalSkipped = arr.length;
+  if(totalSkipped > 0){
+    let tp1Count = 0, tp2Count = 0, stopCount = 0, timeoutCount = 0, pendingCount = 0;
+    let virtualPnl = 0;  // sanal kar/zarar tahmini
+    arr.forEach(sk => {
+      const vr = sk.virtual_result || 'BEKLENIYOR';
+      if(vr === 'TP1_HIT') tp1Count++;
+      else if(vr === 'TP2_HIT') tp2Count++;
+      else if(vr === 'STOP_HIT') stopCount++;
+      else if(vr === 'TIMEOUT') timeoutCount++;
+      else pendingCount++;
+
+      // Sanal PnL: TP1=%50 kapat, TP2=%75 kapat (kümülatif), Stop=tam zarar
+      const giris = sk.giris || 0;
+      const tp1 = sk.tp1 || 0;
+      const tp2 = sk.tp2 || 0;
+      const stop = sk.stop || 0;
+      const marj = sk.marj || 100;
+      const lev = sk.lev || 10;
+      const ps = marj * lev;
+      const kapatOran = sk.kapat_oran || 50;
+
+      if(giris > 0){
+        if(vr === 'TP1_HIT' && tp1){
+          // TP1 vurdu: sadece %50 kar (kalan açık)
+          const tp1Pct = (tp1 - giris) / giris * 100;
+          virtualPnl += ps * (kapatOran/100) * tp1Pct / 100;
+        } else if(vr === 'TP2_HIT' && tp2){
+          // TP1+TP2 vurdu: %50 + %25 kar
+          const tp1Pct = tp1 ? (tp1 - giris) / giris * 100 : 0;
+          const tp2Pct = (tp2 - giris) / giris * 100;
+          virtualPnl += ps * (kapatOran/100) * tp1Pct / 100;  // TP1 karı
+          virtualPnl += ps * 0.25 * tp2Pct / 100;  // TP2 karı
+        } else if(vr === 'STOP_HIT' && stop){
+          // Stop yedi: tam zarar
+          const stopPct = (stop - giris) / giris * 100;
+          virtualPnl += ps * stopPct / 100;
+        }
+      }
+    });
+
+    summaryItems = [
+      {label:'Toplam', val: `${totalSkipped}`, cls: 'neutral'},
+      {label:'⏳ Bekliyor', val: `${pendingCount}`, cls: 'neutral'},
+      {label:'✓ TP1', val: `${tp1Count}`, cls: 'up'},
+      {label:'✓✓ TP2', val: `${tp2Count}`, cls: 'up'},
+      {label:'✗ Stop', val: `${stopCount}`, cls: 'down'},
+    ];
+    if(timeoutCount > 0) summaryItems.push({label:'⏱ Timeout', val: `${timeoutCount}`, cls: 'neutral'});
+
+    // Sanal P/L
+    const settled = tp1Count + tp2Count + stopCount;
+    if(settled > 0){
+      const cls = virtualPnl >= 0 ? 'up' : 'down';
+      const sign = virtualPnl >= 0 ? '+' : '';
+      summaryItems.push({label:'💸 Sanal P/L', val: `${sign}${virtualPnl.toFixed(1)}$`, cls});
+    }
+
+    summaryEl.className = 'skipSummary has-data';
+    summaryEl.innerHTML = summaryItems.map(it =>
+      `<div class="ssItem"><div class="ssLabel">${it.label}</div><div class="ssVal ${it.cls}">${it.val}</div></div>`
+    ).join('');
+  } else {
+    summaryEl.className = 'skipSummary';
+    summaryEl.innerHTML = '';
+  }
+
   if(!arr.length){
-    body.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#94a3b8;padding:10px">Kaçırılan sinyal yok</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:10px">Kaçırılan sinyal yok</td></tr>';
     updateSortArrows(sys+'SkipTable', sys+'_skip');
     return;
   }
@@ -4616,13 +4702,15 @@ function fmtNum(v){
 }
 
 function now_tr_today(){
+  // Türkiye saati = UTC+3
   const d = new Date();
-  const trH = d.getUTCHours()+3;
-  if(trH>=24){
-    const tomorrow = new Date(d.getTime()+86400000);
-    return tomorrow.toISOString().slice(0,10);
-  }
-  return d.toISOString().slice(0,10);
+  const trMs = d.getTime() + (3 * 3600 * 1000);
+  const trDate = new Date(trMs);
+  // UTC fonksiyonlarıyla TR tarihini al (offset zaten eklendi)
+  const y = trDate.getUTCFullYear();
+  const m = String(trDate.getUTCMonth()+1).padStart(2,'0');
+  const dd = String(trDate.getUTCDate()).padStart(2,'0');
+  return `${y}-${m}-${dd}`;
 }
 
 // ═══════════════ ACTIONS ═══════════════
