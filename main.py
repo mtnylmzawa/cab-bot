@@ -381,6 +381,107 @@ async def recovery_loop():
             traceback.print_exc()
 
 
+async def virtual_skipped_loop():
+    """v6.7: Skipped sinyalleri sanal olarak takip et.
+    Her 5 dakikada bir, BEKLENIYOR durumdaki skipped'lara
+    Binance'ten anlık fiyat çek, TP1/TP2/Stop seviyelerine ulaşıp ulaşmadığını kontrol et.
+    """
+    import asyncio
+    from datetime import datetime
+    import urllib.request
+    import json as _json
+
+    while True:
+        try:
+            await asyncio.sleep(300)  # 5 dk
+
+            for sys_code in ["cab", "ram"]:
+                sk_key = _sys_key(sys_code, "skipped_signals")
+                skipped = data.get(sk_key, [])
+                if not skipped:
+                    continue
+
+                # Sadece BEKLENIYOR olanları işle
+                pending = [s for s in skipped if s.get("virtual_result") == "BEKLENIYOR"]
+                if not pending:
+                    continue
+
+                changed = False
+                for s in pending:
+                    ticker = s.get("ticker")
+                    if not ticker:
+                        continue
+
+                    # Timeout kontrolü
+                    until = s.get("virtual_check_until")
+                    if until:
+                        try:
+                            until_dt = datetime.fromisoformat(until)
+                            if datetime.now() > until_dt:
+                                s["virtual_result"] = "TIMEOUT"
+                                changed = True
+                                continue
+                        except: pass
+
+                    # Anlık fiyat çek (Binance public)
+                    try:
+                        url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={ticker}"
+                        with urllib.request.urlopen(url, timeout=5) as r:
+                            j = _json.loads(r.read())
+                            px = float(j.get("price", 0))
+                    except Exception as e:
+                        # Fiyat alınamadı, atlıyoruz
+                        continue
+
+                    if px <= 0:
+                        continue
+
+                    # Max/min güncelle
+                    cmax = s.get("virtual_max_px") or s.get("giris", px)
+                    cmin = s.get("virtual_min_px") or s.get("giris", px)
+                    if px > cmax:
+                        s["virtual_max_px"] = px
+                        changed = True
+                    if px < cmin:
+                        s["virtual_min_px"] = px
+                        changed = True
+
+                    # Sonuç kontrolü (LONG poz varsayımı)
+                    giris = s.get("giris", 0)
+                    tp1 = s.get("tp1", 0)
+                    tp2 = s.get("tp2", 0)
+                    stop = s.get("stop", 0)
+
+                    if giris and stop and stop > 0:
+                        # Stop önce kontrol (öncelik)
+                        if px <= stop or s.get("virtual_min_px", px) <= stop:
+                            s["virtual_result"] = "STOP_HIT"
+                            s["virtual_exit_px"] = stop
+                            changed = True
+                            continue
+                        # TP2 sonra
+                        if tp2 and (px >= tp2 or s.get("virtual_max_px", px) >= tp2):
+                            s["virtual_result"] = "TP2_HIT"
+                            s["virtual_exit_px"] = tp2
+                            changed = True
+                            continue
+                        # TP1
+                        if tp1 and (px >= tp1 or s.get("virtual_max_px", px) >= tp1):
+                            s["virtual_result"] = "TP1_HIT"
+                            s["virtual_exit_px"] = tp1
+                            changed = True
+                            continue
+
+                if changed:
+                    data[sk_key] = skipped
+                    save_data(data)
+
+        except Exception as e:
+            print(f"[VIRTUAL_SKIPPED LOOP] Error: {e}")
+            import traceback
+            traceback.print_exc()
+
+
 def resume_bot(system="cab"):
     """Belirtilen sistemi tekrar aktif et"""
     key = _sys_key(system, "pause_state")
@@ -1397,6 +1498,11 @@ async def export_report():
         "ram_pause_state": get_pause_info("ram"),
         "cab_max_pos_state": data.get("max_pos_state", {}),
         "ram_max_pos_state": data.get("ram_max_pos_state", {}),
+        # v6.7: Auto-Recovery state
+        "cab_auto_recovery": data.get("cab_auto_recovery", False),
+        "ram_auto_recovery": data.get("ram_auto_recovery", False),
+        "cab_recovery_state": data.get("cab_recovery_state", {}),
+        "ram_recovery_state": data.get("ram_recovery_state", {}),
         "archive_count": len(data.get("archive", [])),
         "cab": {
             "open_count": len(open_pos),
@@ -2269,8 +2375,25 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
         if sk_key not in data:
             data[sk_key] = []
         data[sk_key].append({
-            "ticker": ticker, "sebep": f"[SHADOW] BOT PAUSE: {pi.get('reason', 'N/A')}",
-            "zaman": now, "giris": parsed.get("giris"), "system": system_tag,
+            "ticker": ticker,
+            "sebep": f"[SHADOW] BOT PAUSE: {pi.get('reason', 'N/A')}",
+            "zaman": now,
+            "giris": parsed.get("giris"),
+            "stop": parsed.get("stop"),
+            "tp1": parsed.get("tp1"),
+            "tp2": parsed.get("tp2"),
+            "marj": parsed.get("marj", 100),
+            "lev": parsed.get("lev", 10),
+            "kapat_oran": parsed.get("kapat_oran", 50),
+            "market_regime": parsed.get("market_regime"),
+            "market_detail": parsed.get("market_detail"),
+            "system": system_tag,
+            "system_code": system_code,
+            # Sanal sonuç takip alanları (ileride doldurulur)
+            "virtual_result": "BEKLENIYOR",  # BEKLENIYOR | TP1_HIT | TP2_HIT | STOP_HIT | TIMEOUT
+            "virtual_max_px": parsed.get("giris"),  # gördüğü en yüksek fiyat
+            "virtual_min_px": parsed.get("giris"),  # gördüğü en düşük fiyat
+            "virtual_check_until": (datetime.now() + timedelta(hours=12)).isoformat(),  # 12 saat sonra timeout
         })
         save_data(data)
         return {"status": "shadow_paused", "system_tag": system_tag}
@@ -2285,8 +2408,24 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
         if sk_key not in data:
             data[sk_key] = []
         data[sk_key].append({
-            "ticker": ticker, "sebep": f"[SHADOW] MAX {max_allowed} dolu",
-            "zaman": now, "giris": parsed.get("giris"), "system": system_tag,
+            "ticker": ticker,
+            "sebep": f"[SHADOW] MAX {max_allowed} dolu",
+            "zaman": now,
+            "giris": parsed.get("giris"),
+            "stop": parsed.get("stop"),
+            "tp1": parsed.get("tp1"),
+            "tp2": parsed.get("tp2"),
+            "marj": parsed.get("marj", 100),
+            "lev": parsed.get("lev", 10),
+            "kapat_oran": parsed.get("kapat_oran", 50),
+            "market_regime": parsed.get("market_regime"),
+            "market_detail": parsed.get("market_detail"),
+            "system": system_tag,
+            "system_code": system_code,
+            "virtual_result": "BEKLENIYOR",
+            "virtual_max_px": parsed.get("giris"),
+            "virtual_min_px": parsed.get("giris"),
+            "virtual_check_until": (datetime.now() + timedelta(hours=12)).isoformat(),
         })
         save_data(data)
         return {"status": "shadow_max_full", "system_tag": system_tag}
@@ -3146,6 +3285,7 @@ async def startup():
     asyncio.create_task(update_position_highs_lows())
     print(f"[BOOT] CAB Bot v6.7 Patch 1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
     asyncio.create_task(recovery_loop())  # v6.7: auto-recovery
+    asyncio.create_task(virtual_skipped_loop())  # v6.7: skipped sanal takip
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -3501,12 +3641,15 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
       </select>
       <input type="text" id="cab_searchSkip" class="searchBox" placeholder="🔍 Coin ara..." oninput="render()">
     </div>
-    <div class="tableWrap" style="max-height:250px">
+    <div class="tableWrap" style="max-height:300px">
       <table id="cabSkipTable">
         <thead><tr>
           <th data-sort="cab_skip:ticker" onclick="setSort('cab_skip','ticker')">Coin</th>
           <th>Sebep</th>
           <th data-sort="cab_skip:giris" onclick="setSort('cab_skip','giris')">Sinyal Fiyat</th>
+          <th data-sort="cab_skip:virtual_result" onclick="setSort('cab_skip','virtual_result')">Sanal Sonuç</th>
+          <th>Hareket</th>
+          <th data-sort="cab_skip:market_regime" onclick="setSort('cab_skip','market_regime')">Rejim</th>
           <th data-sort="cab_skip:zaman" onclick="setSort('cab_skip','zaman')">Zaman</th>
         </tr></thead>
         <tbody id="cabSkipBody"></tbody>
@@ -3647,12 +3790,15 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
       </select>
       <input type="text" id="ram_searchSkip" class="searchBox" placeholder="🔍 Coin ara..." oninput="render()">
     </div>
-    <div class="tableWrap" style="max-height:250px">
+    <div class="tableWrap" style="max-height:300px">
       <table id="ramSkipTable">
         <thead><tr>
           <th data-sort="ram_skip:ticker" onclick="setSort('ram_skip','ticker')">Coin</th>
           <th>Sebep</th>
           <th data-sort="ram_skip:giris" onclick="setSort('ram_skip','giris')">Sinyal Fiyat</th>
+          <th data-sort="ram_skip:virtual_result" onclick="setSort('ram_skip','virtual_result')">Sanal Sonuç</th>
+          <th>Hareket</th>
+          <th data-sort="ram_skip:market_regime" onclick="setSort('ram_skip','market_regime')">Rejim</th>
           <th data-sort="ram_skip:zaman" onclick="setSort('ram_skip','zaman')">Zaman</th>
         </tr></thead>
         <tbody id="ramSkipBody"></tbody>
@@ -3840,7 +3986,7 @@ async function updateDominance(){
   dominanceState.othersD = othersD;
 }
 
-// Açık poz fiyatlarını çek (her sistem için)
+// Açık poz fiyatlarını çek (her sistem için) + hh_pct güncelle
 async function updateOpenPrices(){
   const allTickers = new Set([
     ...Object.keys(DATA.open_positions || {}),
@@ -3849,7 +3995,19 @@ async function updateOpenPrices(){
   if(allTickers.size === 0) return;
   const promises = Array.from(allTickers).map(async sym => {
     const px = await fp(sym);
-    if(px !== null) openPrices[sym] = px;
+    if(px !== null){
+      openPrices[sym] = px;
+      // hh_pct: client-side hesap (en yüksek görülen fiyat)
+      const cab_p = (DATA.open_positions||{})[sym];
+      const ram_p = (DATA.ram_open_positions||{})[sym];
+      const p = cab_p || ram_p;
+      if(p && p.giris){
+        const cur_pct = (px - p.giris) / p.giris * 100;
+        if(!p.hh_pct || cur_pct > p.hh_pct){
+          p.hh_pct = cur_pct;
+        }
+      }
+    }
   });
   await Promise.all(promises);
   // Render açık pozları
@@ -4294,18 +4452,24 @@ function renderOpenTable(sys, open_pos){
       else if(sk < 5) skC = '#fbbf24';
       skCell = `<span style="color:${skC};font-weight:600">%${sk.toFixed(2)} ${sk<0?'↓':'uzak'}</span>`;
     }
-    // TRAIL kolonu
-    let trailCell = '<span style="color:#94a3b8;font-size:10px">— pasif</span>';
-    if(r.trailLevel !== null){
-      const tg = r.trailGap;
+    // TRAIL kolonu — sade ve anlatımlı
+    let trailCell = '<span style="color:#94a3b8;font-size:10px">— Pasif (TP1 öncesi)</span>';
+    if(p.tp1_hit && !p.tp2_hit){
+      // BE durumu
+      const beLevel = p.current_stop || giris;
+      const tg = (px && beLevel) ? (px - beLevel) / px * 100 : 0;
+      let bgC = tg < 1 ? '#f87171' : (tg < 3 ? '#fbbf24' : '#4ade80');
+      trailCell = `<span style="color:${bgC};font-weight:600;font-size:11px" title="TP1 vurdu, stop giriş seviyesine çekildi (Break-Even)">BE @ ${fmtNum(beLevel)}<br><span style="font-size:9px">%${tg.toFixed(2)} uzak</span></span>`;
+    } else if(p.tp2_hit){
+      // Trail aktif: ATR×2 chandelier
+      const trailLevel = p.current_stop || (giris * 1.05);
+      const tg = (px && trailLevel) ? (px - trailLevel) / px * 100 : 0;
       let tgC = '#a78bfa';
-      if(tg !== null){
-        if(tg <= 0) tgC = '#dc2626';
-        else if(tg < 2) tgC = '#f87171';
-        else if(tg < 4) tgC = '#fbbf24';
-      }
-      const status = p.tp2_hit ? 'TP2 sonrası' : (p.tp1_hit ? 'BE' : 'tahmini');
-      trailCell = `<span style="color:${tgC};font-weight:600;font-size:11px" title="${status}">${fmtNum(r.trailLevel)}<br><span style="font-size:9px">%${(tg||0).toFixed(2)} uzak</span></span>`;
+      if(tg <= 0) tgC = '#dc2626';
+      else if(tg < 2) tgC = '#f87171';
+      else if(tg < 4) tgC = '#fbbf24';
+      else tgC = '#4ade80';
+      trailCell = `<span style="color:${tgC};font-weight:600;font-size:11px" title="TP2 sonrası: highest(10mum) - ATR×2 chandelier trail. Fiyat yükseldikçe stop yukarı çekiliyor.">Trail @ ${fmtNum(trailLevel)}<br><span style="font-size:9px">%${tg.toFixed(2)} uzak (ATR×2)</span></span>`;
     }
     return `
     <tr>
@@ -4396,14 +4560,43 @@ function renderSkipTable(sys, skipped){
   const s = SORT[sys+'_skip'];
   arr = sortRows(arr, s.c, s.d);
   if(arr.length>100) arr=arr.slice(0,100);
-  body.innerHTML = arr.map(sk => `
+  body.innerHTML = arr.map(sk => {
+    // Sanal sonuç gösterimi
+    let resultCell = '<span style="color:#94a3b8;font-size:10px">—</span>';
+    let moveCell = '<span style="color:#94a3b8">—</span>';
+    const vr = sk.virtual_result || 'BEKLENIYOR';
+    if(vr === 'TP1_HIT'){
+      resultCell = '<span style="color:#4ade80;font-weight:600">✓ TP1 vurdu</span>';
+    } else if(vr === 'TP2_HIT'){
+      resultCell = '<span style="color:#22d3ee;font-weight:600">✓✓ TP2 vurdu</span>';
+    } else if(vr === 'STOP_HIT'){
+      resultCell = '<span style="color:#f87171;font-weight:600">✗ Stop yedi</span>';
+    } else if(vr === 'TIMEOUT'){
+      resultCell = '<span style="color:#a78bfa;font-weight:600">⏱ Timeout</span>';
+    } else {
+      resultCell = '<span style="color:#fbbf24;font-size:10px">⏳ Bekleniyor</span>';
+    }
+    // Hareket: max ve min görüldü
+    const giris = sk.giris || 0;
+    const vmax = sk.virtual_max_px;
+    const vmin = sk.virtual_min_px;
+    if(giris && (vmax || vmin)){
+      const upPct = vmax ? (vmax - giris) / giris * 100 : 0;
+      const downPct = vmin ? (vmin - giris) / giris * 100 : 0;
+      moveCell = `<span style="font-size:10px"><span style="color:#4ade80">▲%${upPct.toFixed(2)}</span> / <span style="color:#f87171">▼%${Math.abs(downPct).toFixed(2)}</span></span>`;
+    }
+    return `
     <tr>
       <td><a class="coinLink" onclick="openTV('${sk.ticker||''}')">${sk.ticker||'?'}</a></td>
-      <td style="font-size:10px">${(sk.sebep||'').slice(0,80)}</td>
+      <td style="font-size:10px">${(sk.sebep||'').slice(0,40)}</td>
       <td>${fmtNum(sk.giris)}</td>
+      <td>${resultCell}</td>
+      <td>${moveCell}</td>
+      <td>${regimeChip(sk.market_regime)}</td>
       <td style="font-size:10px">${(sk.zaman||'').slice(11,16)}</td>
     </tr>
-  `).join('');
+    `;
+  }).join('');
   updateSortArrows(sys+'SkipTable', sys+'_skip');
 }
 
