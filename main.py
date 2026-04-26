@@ -4224,7 +4224,7 @@ function updateRecoveryUI(sys){
   }
 }
 
-// Akıllı slot bilgisi (aktif risk vs garantili poz)
+// Akıllı slot bilgisi (aktif risk vs garantili poz) + değişim bilgisi
 function updateSlotInfo(sys){
   const openPos = sys==='cab' ? (DATA.open_positions||{}) : (DATA.ram_open_positions||{});
   let aktif = 0, garantiliTp1 = 0, garantiliTo = 0;
@@ -4234,14 +4234,35 @@ function updateSlotInfo(sys){
     else aktif++;
   });
   const garantili = garantiliTp1 + garantiliTo;
-  const total = aktif + garantili;
   const max = sys==='cab' ? (DATA.max_pos_state?.current || 7) : (DATA.ram_max_pos_state?.current || 7);
+  const maxState = sys==='cab' ? (DATA.max_pos_state||{}) : (DATA.ram_max_pos_state||{});
   const infoEl = document.getElementById(sys+'MaxInfo');
   if(!infoEl) return;
+
+  // Slot bilgisi
+  let slotPart = '';
   if(garantili > 0){
-    infoEl.innerHTML = `<span title="Akıllı slot: TP1 vurmuş ve timeout-BE'liler slot saymaz" style="color:#a5b4fc">aktif: ${aktif}/${max}</span> <span style="color:#94a3b8">+ ${garantili} garantili</span> <span style="color:#64748b">(min:3 max:12)</span>`;
+    slotPart = `<span title="Akıllı slot: TP1 vurmuş ve timeout-BE'liler slot saymaz" style="color:#a5b4fc;font-weight:600">aktif: ${aktif}/${max}</span> <span style="color:#94a3b8">+${garantili} garantili</span>`;
+  } else if(aktif > 0){
+    slotPart = `<span style="color:#a5b4fc;font-weight:600">aktif: ${aktif}/${max}</span>`;
+  }
+
+  // Değişim bilgisi
+  const changes = (maxState.change_history||[]).slice(-20);
+  const todayStr = now_tr_today();
+  const todayChanges = changes.filter(c => (c.ts||'').startsWith(todayStr)).length;
+  let changePart = '';
+  if(todayChanges > 0){
+    changePart = ` | <span style="color:#94a3b8">bugün ${todayChanges} değişim${maxState.auto_reduced?' (oto-azalmış)':''}</span>`;
+  }
+
+  // Genel info
+  const baseInfo = `<span style="color:#64748b">min:3 max:12</span>`;
+
+  if(slotPart){
+    infoEl.innerHTML = `${slotPart} ${baseInfo}${changePart}`;
   } else {
-    infoEl.innerHTML = `<span style="color:#a5b4fc">aktif: ${aktif}/${max}</span> <span style="color:#94a3b8">(min:3 max:12)</span>`;
+    infoEl.innerHTML = `${baseInfo}${changePart}`;
   }
 }
 
@@ -4359,13 +4380,9 @@ function renderSystem(sys, open_pos, closed, skipped, pause, maxState, mode){
     pBtn.className='btn btn-red btn-sm';
   }
 
-  // MAX POS
+  // MAX POS — updateSlotInfo akıllı slot bilgisini yazacak (render() sonra çağırıyor)
   const maxNum = maxState.current || 7;
   document.getElementById(sys+'MaxNum').textContent = maxNum;
-  const changes = (maxState.change_history||[]).slice(-5);
-  const todayChanges = changes.filter(c => (c.ts||'').startsWith(now_tr_today())).length;
-  document.getElementById(sys+'MaxInfo').textContent =
-    `min:3 max:12${todayChanges>0?' | bugün '+todayChanges+' değişim':''}${maxState.auto_reduced?' (otomatik azalmış)':''}`;
 
   // Stats
   document.getElementById(sys+'OpenN').textContent = openCount;
