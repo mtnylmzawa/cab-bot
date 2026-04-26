@@ -613,12 +613,16 @@ def now_tr_dt():
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
 
 # ============ AKILLI SLOT SAYIMI ============
-def count_active_risk():
-    """v6.1: Aktif risk taşıyan pozisyonları say (TP1 vurmuş VE timeout-BE'liler exempt)"""
+def count_active_risk(system="cab"):
+    """v6.1: Aktif risk taşıyan pozisyonları say (TP1 vurmuş VE timeout-BE'liler exempt)
+    v6.7: Sistem-aware (cab veya ram için ayrı sayım)
+    """
     aktif = 0
     garantili_tp1 = 0
     garantili_timeout = 0
-    for p in data["open_positions"].values():
+    open_key = _sys_key(system, "open_positions") if system != "cab" else "open_positions"
+    open_pos = data.get(open_key, {})
+    for p in open_pos.values():
         if p.get("tp1_hit"):
             garantili_tp1 += 1
         elif p.get("timeout_be"):
@@ -2398,18 +2402,21 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
         save_data(data)
         return {"status": "shadow_paused", "system_tag": system_tag}
 
-    # Max poz sınırı (system-aware)
+    # Max poz sınırı — AKILLI SLOT (sistem-aware)
+    # TP1 vurmuş VEYA timeout-BE'liler slot saymıyor (en kötü 0$ çıkacak)
     open_key = _sys_key(system_code, "open_positions")
     if open_key not in data:
         data[open_key] = {}
     max_allowed = get_max_positions(system_code)
-    if len(data[open_key]) >= max_allowed:
+    aktif_risk, gar_tp1, gar_to = count_active_risk(system_code)
+    garantili = gar_tp1 + gar_to
+    if aktif_risk >= max_allowed:
         sk_key = _sys_key(system_code, "skipped_signals")
         if sk_key not in data:
             data[sk_key] = []
         data[sk_key].append({
             "ticker": ticker,
-            "sebep": f"[SHADOW] MAX {max_allowed} dolu",
+            "sebep": f"[SHADOW] MAX {max_allowed} aktif risk dolu (+{garantili} garantili)",
             "zaman": now,
             "giris": parsed.get("giris"),
             "stop": parsed.get("stop"),
@@ -4217,6 +4224,27 @@ function updateRecoveryUI(sys){
   }
 }
 
+// Akıllı slot bilgisi (aktif risk vs garantili poz)
+function updateSlotInfo(sys){
+  const openPos = sys==='cab' ? (DATA.open_positions||{}) : (DATA.ram_open_positions||{});
+  let aktif = 0, garantiliTp1 = 0, garantiliTo = 0;
+  Object.values(openPos).forEach(p => {
+    if(p.tp1_hit) garantiliTp1++;
+    else if(p.timeout_be) garantiliTo++;
+    else aktif++;
+  });
+  const garantili = garantiliTp1 + garantiliTo;
+  const total = aktif + garantili;
+  const max = sys==='cab' ? (DATA.max_pos_state?.current || 7) : (DATA.ram_max_pos_state?.current || 7);
+  const infoEl = document.getElementById(sys+'MaxInfo');
+  if(!infoEl) return;
+  if(garantili > 0){
+    infoEl.innerHTML = `<span title="Akıllı slot: TP1 vurmuş ve timeout-BE'liler slot saymaz" style="color:#a5b4fc">aktif: ${aktif}/${max}</span> <span style="color:#94a3b8">+ ${garantili} garantili</span> <span style="color:#64748b">(min:3 max:12)</span>`;
+  } else {
+    infoEl.innerHTML = `<span style="color:#a5b4fc">aktif: ${aktif}/${max}</span> <span style="color:#94a3b8">(min:3 max:12)</span>`;
+  }
+}
+
 async function toggleAutoRecovery(sys){
   const enabled = sys==='cab' ? DATA.cab_auto_recovery : DATA.ram_auto_recovery;
   const target = !enabled;
@@ -4260,6 +4288,9 @@ function render(){
   // Auto-Recovery UI güncelle
   updateRecoveryUI('cab');
   updateRecoveryUI('ram');
+  // Akıllı slot bilgi (aktif risk vs garantili)
+  updateSlotInfo('cab');
+  updateSlotInfo('ram');
   // CAB
   renderSystem('cab',
     DATA.open_positions || {},
