@@ -4075,10 +4075,15 @@ function filterByDate(rows, dateFilter, dateKey){
 function filterByResult(rows, resultFilter){
   if(!resultFilter || resultFilter==='all') return rows;
   return rows.filter(r=>{
-    const s=(r.sonuc||'').toLowerCase();
-    if(resultFilter==='tp') return s.includes('tp') && !s.includes('stop');
-    if(resultFilter==='stop') return s.includes('stop');
+    const s = (r.sonuc||'').toLowerCase();
+    const kar = r.kar || 0;
+    // TP: kar pozitif (TP1+ varyantları, hatta TP1+TP2+Stop bile kar etmiş)
+    if(resultFilter==='tp') return kar > 0 && s.includes('tp');
+    // Stop: SADECE stop yedi (kar negatif), TP varyantları hariç
+    if(resultFilter==='stop') return kar < 0 && s.includes('stop') && !s.includes('tp');
+    // Trail: Trail kelimesi geçen (TP1+Trail veya TP1+TP2+Trail)
     if(resultFilter==='trail') return s.includes('trail');
+    // Timeout
     if(resultFilter==='timeout') return s.includes('timeout');
     return true;
   });
