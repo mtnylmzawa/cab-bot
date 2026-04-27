@@ -297,6 +297,141 @@ def schedule_max_pos_increase(system):
     print(f"[RECOVERY:{system.upper()}] MAX POS artış planlandı: 30 dk sonra")
 
 
+async def emergency_stop_check_loop():
+    """v6.7.2: ACİL STOP — Pine alarm tetiklenmediyse bot kendi kapatır.
+    Pine'ın 'inPlan' state'i kayıt yenilemesi ile sıfırlanabilir.
+    Bu durumda stop alarmı asla gelmez ve poz açık kalır.
+    Bu loop her 30 saniyede tüm açık pozları kontrol eder ve
+    fiyat stop'un %0.3 ALTINA düşmüşse bot kendi kapatır.
+    """
+    import asyncio
+    from datetime import datetime
+    EMERGENCY_TOLERANCE = 0.003  # %0.3 — anlık iğneleri filtrelemek için
+    CHECK_INTERVAL = 30  # saniye
+
+    while True:
+        try:
+            await asyncio.sleep(CHECK_INTERVAL)
+
+            # Hem CAB hem RAM açık pozlarını kontrol et
+            for system in ["cab", "ram"]:
+                open_key = _sys_key(system, "open_positions")
+                positions = data.get(open_key, {})
+                if not positions:
+                    continue
+
+                # Tickers'ı kopyala (iter sırasında değiştirme olabilir)
+                tickers_to_check = list(positions.keys())
+
+                for ticker in tickers_to_check:
+                    pos = positions.get(ticker)
+                    if not pos:
+                        continue
+
+                    # Aktif stop seviyesi (TP1 sonrası BE veya orijinal)
+                    current_stop = pos.get("current_stop") or pos.get("stop", 0)
+                    if not current_stop or current_stop <= 0:
+                        continue
+
+                    # Anlık fiyat çek
+                    try:
+                        cur_px = binance_get_mark_price(ticker)
+                    except Exception:
+                        cur_px = None
+
+                    if not cur_px or cur_px <= 0:
+                        continue
+
+                    # Stop'un %0.3 altına düştü mü?
+                    threshold = current_stop * (1 - EMERGENCY_TOLERANCE)
+                    if cur_px < threshold:
+                        # ACİL STOP — Bot kendi kapatır
+                        gap_pct = (cur_px - current_stop) / current_stop * 100
+                        print(f"[EMERGENCY_STOP] {system.upper()}:{ticker} | "
+                              f"px={cur_px} stop={current_stop} gap={gap_pct:.2f}% — Pine alarm gelmedi, bot kapatıyor")
+
+                        # Sentetik STOP mesajı oluştur (parse_stop'un anladığı format)
+                        synthetic_msg = (f"EMERGENCY STOP | {ticker} | "
+                                        f"Bot acil kapama (Pine alarm yok) | Tamami kapat | "
+                                        f"Stop:{current_stop}")
+                        # Sistem tag'ı pos'tan al
+                        system_tag = pos.get("system", f"{system.upper()} v?")
+
+                        # Direkt shadow_handle_stop_or_trail çağır (parse_stop bypass)
+                        try:
+                            # Manuel olarak closed_pos kayıt yapalım
+                            closed_key = _sys_key(system, "closed_positions")
+                            kapat_oran = pos.get("kapat_oran", 60)
+                            tp1_kar = pos.get("tp1_kar", 0)
+                            tp2_kar = pos.get("tp2_kar", 0)
+                            giris = pos.get("giris", 0)
+                            marj = pos.get("marj", 100)
+                            lev = pos.get("lev", 10)
+                            ps = marj * lev
+
+                            # Kalan oran kapat
+                            tp2_hit = pos.get("tp2_hit", False)
+                            tp1_hit = pos.get("tp1_hit", False)
+                            if tp2_hit:
+                                kalan_oran = 0.15  # TP2 sonrası kalan %15
+                            elif tp1_hit:
+                                kalan_oran = (100 - kapat_oran) / 100  # TP1 sonrası kalan
+                            else:
+                                kalan_oran = 1.0  # Tümünü kapat
+
+                            # Bot kendi mark price ile kapatıyor (anlık fiyat)
+                            exit_px = cur_px
+                            exit_pct = (exit_px - giris) / giris if giris else 0
+                            kalan_kar = ps * kalan_oran * exit_pct
+
+                            total_kar = tp1_kar + tp2_kar + kalan_kar
+
+                            # Sonuç etiketi
+                            if tp2_hit:
+                                sonuc = "TP1+TP2+Stop(Bot)"
+                            elif tp1_hit:
+                                sonuc = "TP1+Stop(Bot)"
+                            else:
+                                sonuc = "Stop(Bot)"
+
+                            closed_pos = {
+                                "ticker": ticker, "giris": giris,
+                                "marj": marj, "lev": lev,
+                                "sonuc": sonuc, "kar": total_kar,
+                                "tp1_kar": tp1_kar, "tp2_kar": tp2_kar,
+                                "trail_kar": kalan_kar,
+                                "hh_pct": pos.get("hh_pct", 0),
+                                "atr_skor": pos.get("atr_skor", 100),
+                                "kapat_oran": kapat_oran,
+                                "acilis": pos.get("acilis"),
+                                "kapanis": now_tr(),
+                                "exit_px": exit_px,
+                                "stop": current_stop,
+                                "system": system_tag,
+                                "system_code": system,
+                                "market_regime": pos.get("market_regime"),
+                                "market_detail": pos.get("market_detail"),
+                                "binance_pnl": None, "binance_fee": None,
+                                "shadow": True,
+                                "emergency_stop": True,  # ⚠️ İşaretle
+                            }
+
+                            if closed_key not in data:
+                                data[closed_key] = []
+                            data[closed_key].append(closed_pos)
+                            del data[open_key][ticker]
+                            save_data(data)
+                            print(f"[EMERGENCY_STOP] {ticker} kapatıldı: {total_kar:.2f}$ ({sonuc})")
+
+                            # Auto-pause kontrolü
+                            check_auto_reduce_max_pos(system)
+                        except Exception as e:
+                            print(f"[EMERGENCY_STOP ERR] {ticker}: {e}")
+
+        except Exception as e:
+            print(f"[emergency_stop_check_loop ERR] {e}")
+
+
 async def recovery_loop():
     """v6.7: Background task — her 5 dk auto-recovery kontrol"""
     import asyncio
@@ -3294,6 +3429,7 @@ async def startup():
     print(f"[BOOT] CAB Bot v6.7 Patch 1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
     asyncio.create_task(recovery_loop())  # v6.7: auto-recovery
     asyncio.create_task(virtual_skipped_loop())  # v6.7: skipped sanal takip
+    asyncio.create_task(emergency_stop_check_loop())  # v6.7.2: Pine alarm yedeği
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -4713,17 +4849,24 @@ function renderClosedTable(sys, closed){
   arr = sortRows(arr, s.c, s.d);
   // Limit 200 (performance)
   if(arr.length>200) arr = arr.slice(0,200);
-  body.innerHTML = arr.map(c => `
+  body.innerHTML = arr.map(c => {
+    // Emergency stop badge
+    const isEmergency = c.emergency_stop;
+    const emergencyBadge = isEmergency
+      ? '<span title="Bot acil kapama (Pine alarm gelmedi)" style="background:#dc2626;color:#fff;padding:1px 5px;border-radius:3px;font-size:9px;margin-left:4px;font-weight:700">⚡BOT</span>'
+      : '';
+    return `
     <tr>
       <td><a class="coinLink" onclick="openTV('${c.ticker}')">${c.ticker}</a></td>
-      <td>${c.sonuc||'—'}</td>
+      <td>${c.sonuc||'—'}${emergencyBadge}</td>
       <td>${fmtMoney(c.kar)}</td>
       <td>${fmtMoney(c.binance_pnl)}</td>
       <td>${regimeChip(c.market_regime)}</td>
       <td>${c.sure_dk ? (c.sure_dk<60 ? c.sure_dk+'dk' : Math.floor(c.sure_dk/60)+'s '+(c.sure_dk%60)+'dk') : '—'}</td>
       <td style="font-size:10px">${(c.kapanis||'').slice(5,16)}</td>
     </tr>
-  `).join('');
+  `;
+  }).join('');
   updateSortArrows(sys+'ClosedTable', sys+'_closed');
 }
 
