@@ -3397,6 +3397,31 @@ tr:hover{background:#16213a}
 .modalBox h2{margin:0 0 12px;color:#a5b4fc;font-size:18px}
 .modalClose{float:right;background:#dc2626;color:white;border:none;padding:6px 12px;border-radius:5px;cursor:pointer}
 
+/* Üst aksiyon bar (yeni layout) */
+.topActionBar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 14px;margin:8px 0}
+.topActionLeft{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:1;min-width:300px}
+.topActionRight{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.modBadge{color:#0f172a;padding:4px 10px;border-radius:6px;font-weight:700;font-size:12px}
+.perfCard{background:linear-gradient(135deg,#0f172a,#1e1b4b);border:1px solid #4c1d95;border-radius:8px;padding:8px 14px;min-width:240px;display:flex;flex-direction:column;gap:4px}
+.perfCard#cabPerfCard{border-color:#15803d;background:linear-gradient(135deg,#0f172a,#052e16)}
+.perfCard#ramPerfCard{border-color:#a16207;background:linear-gradient(135deg,#0f172a,#451a03)}
+.perfLabel{font-size:11px;font-weight:700;color:#a5b4fc;letter-spacing:0.5px}
+#cabPerfCard .perfLabel{color:#86efac}
+#ramPerfCard .perfLabel{color:#fcd34d}
+.perfRow{display:flex;gap:14px;align-items:center}
+.perfStat{display:flex;flex-direction:column;gap:1px;min-width:60px}
+.perfStatLabel{font-size:9px;color:#94a3b8;font-weight:600;letter-spacing:0.3px}
+.perfStatVal{font-size:14px;font-weight:700}
+.perfStatVal.up{color:#4ade80}
+.perfStatVal.down{color:#f87171}
+.perfStatVal.neutral{color:#a5b4fc}
+@media(max-width:720px){
+  .topActionBar{flex-direction:column;align-items:stretch}
+  .topActionRight{justify-content:space-between}
+  .perfCard{min-width:auto;flex:1}
+  .perfRow{justify-content:space-around}
+}
+
 /* Skipped özet kutusu */
 .skipSummary{background:#0f172a;border:1px solid #334155;border-radius:6px;padding:10px 14px;margin:8px 0;display:none;font-size:12px}
 .skipSummary.has-data{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
@@ -3505,14 +3530,54 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
   <span class="domItem"><b>OTHERS.D</b> <span id="othersDom">—</span> <span class="domChg" id="othersDomChg"></span></span>
 </div>
 
-<!-- Mod genel bilgi (üst) -->
-<div class="bar">
-  <span style="background:""" + cab_mod_color + r""";color:#0f172a;padding:4px 10px;border-radius:6px;font-weight:700;font-size:12px">CAB: """ + cab_mod_text + r"""</span>
-  <span style="background:""" + ram_mod_color + r""";color:#0f172a;padding:4px 10px;border-radius:6px;font-weight:700;font-size:12px">RAM: """ + ram_mod_text + r"""</span>
-  <button class="btn btn-purple btn-sm" onclick="openArchive()">📚 Arşiv</button>
-  <button class="btn btn-orange btn-sm" onclick="archiveAndReset()">🧹 Arşivle + Temizle</button>
-  <button class="btn btn-grey btn-sm" onclick="migratePnl()">🔥 Binance PNL Çek</button>
-  <button class="btn btn-sm" style="background:#0891b2" onclick="downloadReport()">📊 Rapor İndir</button>
+<!-- Mod genel bilgi + Üst Performans Kartları -->
+<div class="topActionBar">
+  <!-- Sol: Butonlar -->
+  <div class="topActionLeft">
+    <span class="modBadge" style="background:""" + cab_mod_color + r"""">CAB: """ + cab_mod_text + r"""</span>
+    <span class="modBadge" style="background:""" + ram_mod_color + r"""">RAM: """ + ram_mod_text + r"""</span>
+    <button class="btn btn-purple btn-sm" onclick="openArchive()">📚 Arşiv</button>
+    <button class="btn btn-orange btn-sm" onclick="archiveAndReset()">🧹 Arşivle + Temizle</button>
+    <button class="btn btn-grey btn-sm" onclick="migratePnl()">🔥 Binance PNL Çek</button>
+    <button class="btn btn-sm" style="background:#0891b2" onclick="downloadReport()">📊 Rapor İndir</button>
+  </div>
+  <!-- Sağ: Combine Performans Kartları (her sistem için) -->
+  <div class="topActionRight">
+    <div class="perfCard" id="cabPerfCard" title="CAB performansı">
+      <div class="perfLabel">🟢 CAB</div>
+      <div class="perfRow">
+        <div class="perfStat">
+          <div class="perfStatLabel">Net</div>
+          <div class="perfStatVal" id="cabPerfNet">$0</div>
+        </div>
+        <div class="perfStat">
+          <div class="perfStatLabel">WR</div>
+          <div class="perfStatVal" id="cabPerfWr">0%</div>
+        </div>
+        <div class="perfStat">
+          <div class="perfStatLabel">Ort/Poz</div>
+          <div class="perfStatVal" id="cabPerfAvg">$0</div>
+        </div>
+      </div>
+    </div>
+    <div class="perfCard" id="ramPerfCard" title="RAM performansı">
+      <div class="perfLabel">🌓 RAM</div>
+      <div class="perfRow">
+        <div class="perfStat">
+          <div class="perfStatLabel">Net</div>
+          <div class="perfStatVal" id="ramPerfNet">$0</div>
+        </div>
+        <div class="perfStat">
+          <div class="perfStatLabel">WR</div>
+          <div class="perfStatVal" id="ramPerfWr">0%</div>
+        </div>
+        <div class="perfStat">
+          <div class="perfStatLabel">Ort/Poz</div>
+          <div class="perfStatVal" id="ramPerfAvg">$0</div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- Sistem Sekmeleri -->
@@ -4269,6 +4334,52 @@ function updateSlotInfo(sys){
   }
 }
 
+// Üst performans kartı güncelle (Net Kar, WR, Ort/Poz)
+function updatePerfCard(sys){
+  const closed = sys==='cab' ? (DATA.closed_positions||[]) : (DATA.ram_closed_positions||[]);
+  const netEl = document.getElementById(sys+'PerfNet');
+  const wrEl = document.getElementById(sys+'PerfWr');
+  const avgEl = document.getElementById(sys+'PerfAvg');
+  if(!netEl) return;
+
+  if(closed.length === 0){
+    netEl.textContent = '—';
+    netEl.className = 'perfStatVal neutral';
+    wrEl.textContent = '—';
+    wrEl.className = 'perfStatVal neutral';
+    avgEl.textContent = '—';
+    avgEl.className = 'perfStatVal neutral';
+    return;
+  }
+
+  // Net Kar
+  let totalKar = 0, wins = 0;
+  closed.forEach(c => {
+    const k = c.kar || 0;
+    totalKar += k;
+    if(k > 0) wins++;
+  });
+  const wr = (wins / closed.length) * 100;
+  const avg = totalKar / closed.length;
+
+  // Net
+  const netCls = totalKar >= 0 ? 'up' : 'down';
+  const netSign = totalKar >= 0 ? '+' : '';
+  netEl.textContent = `${netSign}$${totalKar.toFixed(0)}`;
+  netEl.className = `perfStatVal ${netCls}`;
+
+  // WR
+  const wrCls = wr >= 50 ? 'up' : (wr >= 35 ? 'neutral' : 'down');
+  wrEl.textContent = `${wr.toFixed(0)}%`;
+  wrEl.className = `perfStatVal ${wrCls}`;
+
+  // Ort/Poz
+  const avgCls = avg >= 0 ? 'up' : 'down';
+  const avgSign = avg >= 0 ? '+' : '';
+  avgEl.textContent = `${avgSign}$${avg.toFixed(1)}`;
+  avgEl.className = `perfStatVal ${avgCls}`;
+}
+
 async function toggleAutoRecovery(sys){
   const enabled = sys==='cab' ? DATA.cab_auto_recovery : DATA.ram_auto_recovery;
   const target = !enabled;
@@ -4315,6 +4426,9 @@ function render(){
   // Akıllı slot bilgi (aktif risk vs garantili)
   updateSlotInfo('cab');
   updateSlotInfo('ram');
+  // Üst performans kartları
+  updatePerfCard('cab');
+  updatePerfCard('ram');
   // CAB
   renderSystem('cab',
     DATA.open_positions || {},
