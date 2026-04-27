@@ -12,7 +12,7 @@ app = FastAPI()
 TEST_MODE = False  # 🟢 CANLI MOD
 MAX_POSITIONS_DEFAULT = 7  # v6.1: 5 → 7 (akıllı slot ile pratikte daha fazla açık olabilir)
 MAX_POSITIONS_MIN = 3      # v6.6 Lite Patch 8: Hard limit
-MAX_POSITIONS_MAX = 12     # v6.6 Lite Patch 8: Hard limit
+MAX_POSITIONS_MAX = 14     # v6.7 Patch: 12 → 14 (daha fazla manevra alanı)
 DATA_FILE = os.environ.get("DATA_FILE", "/tmp/cab_data.json")
 TIMEOUT_HOURS = 12  # pozisyon timeout süresi (asgari)
 TIMEOUT_ABSOLUTE_HOURS = 24  # v6.4: mutlak limit — slot baskısı olmasa bile zorla kapat
@@ -2626,9 +2626,10 @@ async def webhook(req: Request):
     system_tag = None
     msg_kind = None  # "giris" | "tp1" | "tp2" | "stop" | "trail"
     
-    # Prefix tespit
-    for tag, code_sys in [("CAB v14", "cab"), ("CAB v13", "cab"),
-                          ("RAM v15", "ram"), ("RAM v14", "ram")]:
+    # Prefix tespit (v6.7.1: alt versiyonları da algılar — CAB v14.1, RAM v15.1 vs)
+    # Tag listesi: ana versiyonlar + alt versiyonlar (uzun tag'ler önce eşleşsin diye sıralı)
+    for tag, code_sys in [("CAB v14.1", "cab"), ("CAB v14", "cab"), ("CAB v13", "cab"),
+                          ("RAM v15.1", "ram"), ("RAM v15", "ram"), ("RAM v14", "ram")]:
         if msg.startswith(f"{tag} TP1 |"):
             system_tag, system_code, msg_kind = tag, code_sys, "tp1"; break
         if msg.startswith(f"{tag} TP2 |"):
@@ -2681,7 +2682,7 @@ async def webhook(req: Request):
             return shadow_handle_stop_or_trail(msg, system_tag, "TRAIL", system_code)
 
     # === CAB LIVE MODE (mevcut kod) ===
-    # CAB v13 veya CAB v14 mesajı + cab_mode="live"
+    # CAB v13/v14/v14.1 mesajı + cab_mode="live"
     # Eski kod "CAB v13 |" kontrolü yapıyor — onu bypass edip aynı kodu çalıştır
     if msg_kind == "giris":
         parsed = parse_giris(msg)
@@ -3563,7 +3564,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
     <button class="btn btn-grey btn-sm" onclick="setMaxPos('cab',-1)">−</button>
     <span class="maxNum" id="cabMaxNum">7</span>
     <button class="btn btn-grey btn-sm" onclick="setMaxPos('cab',+1)">+</button>
-    <span class="muted" style="margin-left:auto" id="cabMaxInfo">min:3 max:12</span>
+    <span class="muted" style="margin-left:auto" id="cabMaxInfo">min:3 max:14</span>
   </div>
 
   <!-- Stats -->
@@ -3666,6 +3667,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
           <th>Sebep</th>
           <th data-sort="cab_skip:giris" onclick="setSort('cab_skip','giris')">Sinyal Fiyat</th>
           <th data-sort="cab_skip:virtual_result" onclick="setSort('cab_skip','virtual_result')">Sanal Sonuç</th>
+          <th data-sort="cab_skip:virtual_pnl" onclick="setSort('cab_skip','virtual_pnl')">Sanal Kar</th>
           <th>Hareket</th>
           <th data-sort="cab_skip:market_regime" onclick="setSort('cab_skip','market_regime')">Rejim</th>
           <th data-sort="cab_skip:zaman" onclick="setSort('cab_skip','zaman')">Zaman</th>
@@ -3713,7 +3715,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
     <button class="btn btn-grey btn-sm" onclick="setMaxPos('ram',-1)">−</button>
     <span class="maxNum" id="ramMaxNum">7</span>
     <button class="btn btn-grey btn-sm" onclick="setMaxPos('ram',+1)">+</button>
-    <span class="muted" style="margin-left:auto" id="ramMaxInfo">min:3 max:12</span>
+    <span class="muted" style="margin-left:auto" id="ramMaxInfo">min:3 max:14</span>
   </div>
 
   <!-- Stats -->
@@ -3816,6 +3818,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
           <th>Sebep</th>
           <th data-sort="ram_skip:giris" onclick="setSort('ram_skip','giris')">Sinyal Fiyat</th>
           <th data-sort="ram_skip:virtual_result" onclick="setSort('ram_skip','virtual_result')">Sanal Sonuç</th>
+          <th data-sort="ram_skip:virtual_pnl" onclick="setSort('ram_skip','virtual_pnl')">Sanal Kar</th>
           <th>Hareket</th>
           <th data-sort="ram_skip:market_regime" onclick="setSort('ram_skip','market_regime')">Rejim</th>
           <th data-sort="ram_skip:zaman" onclick="setSort('ram_skip','zaman')">Zaman</th>
@@ -4257,7 +4260,7 @@ function updateSlotInfo(sys){
   }
 
   // Genel info
-  const baseInfo = `<span style="color:#64748b">min:3 max:12</span>`;
+  const baseInfo = `<span style="color:#64748b">min:3 max:14</span>`;
 
   if(slotPart){
     infoEl.innerHTML = `${slotPart} ${baseInfo}${changePart}`;
@@ -4693,7 +4696,7 @@ function renderSkipTable(sys, skipped){
   }
 
   if(!arr.length){
-    body.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:10px">Kaçırılan sinyal yok</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:10px">Kaçırılan sinyal yok</td></tr>';
     updateSortArrows(sys+'SkipTable', sys+'_skip');
     return;
   }
@@ -4705,6 +4708,7 @@ function renderSkipTable(sys, skipped){
     // Sanal sonuç gösterimi
     let resultCell = '<span style="color:#94a3b8;font-size:10px">—</span>';
     let moveCell = '<span style="color:#94a3b8">—</span>';
+    let pnlCell = '<span style="color:#94a3b8;font-size:10px">—</span>';
     const vr = sk.virtual_result || 'BEKLENIYOR';
     if(vr === 'TP1_HIT'){
       resultCell = '<span style="color:#4ade80;font-weight:600">✓ TP1 vurdu</span>';
@@ -4717,6 +4721,7 @@ function renderSkipTable(sys, skipped){
     } else {
       resultCell = '<span style="color:#fbbf24;font-size:10px">⏳ Bekleniyor</span>';
     }
+
     // Hareket: max ve min görüldü
     const giris = sk.giris || 0;
     const vmax = sk.virtual_max_px;
@@ -4726,12 +4731,54 @@ function renderSkipTable(sys, skipped){
       const downPct = vmin ? (vmin - giris) / giris * 100 : 0;
       moveCell = `<span style="font-size:10px"><span style="color:#4ade80">▲%${upPct.toFixed(2)}</span> / <span style="color:#f87171">▼%${Math.abs(downPct).toFixed(2)}</span></span>`;
     }
+
+    // SANAL KAR: vr ve Pine değerlerinden hesapla
+    const tp1Px = sk.tp1 || 0;
+    const tp2Px = sk.tp2 || 0;
+    const stopPx = sk.stop || 0;
+    const ps = (sk.marj || 100) * (sk.lev || 10);
+    const kapatOran = sk.kapat_oran || 50;
+    let virtualPnl = 0;
+    let pnlComputed = false;
+    if(giris > 0){
+      if(vr === 'TP1_HIT' && tp1Px){
+        // TP1: %50 kapat
+        virtualPnl = ps * (kapatOran/100) * (tp1Px - giris) / giris;
+        pnlComputed = true;
+      } else if(vr === 'TP2_HIT' && tp1Px && tp2Px){
+        // TP1 + TP2: %50 + %25 kümülatif
+        virtualPnl = ps * (kapatOran/100) * (tp1Px - giris) / giris;
+        virtualPnl += ps * 0.25 * (tp2Px - giris) / giris;
+        pnlComputed = true;
+      } else if(vr === 'STOP_HIT' && stopPx){
+        // Stop: tam zarar
+        virtualPnl = ps * (stopPx - giris) / giris;
+        pnlComputed = true;
+      }
+    }
+
+    if(pnlComputed){
+      const cls = virtualPnl >= 0 ? 'up' : 'down';
+      const color = virtualPnl >= 0 ? '#4ade80' : '#f87171';
+      const sign = virtualPnl >= 0 ? '+' : '';
+      pnlCell = `<span style="color:${color};font-weight:600">${sign}${virtualPnl.toFixed(1)}$</span>`;
+      // Sıralama için sk.virtual_pnl alanına yaz
+      sk.virtual_pnl = virtualPnl;
+    } else if(vr === 'TIMEOUT'){
+      pnlCell = '<span style="color:#a78bfa;font-size:10px">— (timeout)</span>';
+      sk.virtual_pnl = 0;
+    } else {
+      pnlCell = '<span style="color:#fbbf24;font-size:10px">⏳ ?</span>';
+      sk.virtual_pnl = null;
+    }
+
     return `
     <tr>
       <td><a class="coinLink" onclick="openTV('${sk.ticker||''}')">${sk.ticker||'?'}</a></td>
       <td style="font-size:10px">${(sk.sebep||'').slice(0,40)}</td>
       <td>${fmtNum(sk.giris)}</td>
       <td>${resultCell}</td>
+      <td>${pnlCell}</td>
       <td>${moveCell}</td>
       <td>${regimeChip(sk.market_regime)}</td>
       <td style="font-size:10px">${(sk.zaman||'').slice(11,16)}</td>
