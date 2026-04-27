@@ -3402,12 +3402,11 @@ tr:hover{background:#16213a}
 .topActionLeft{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:1;min-width:300px}
 .topActionRight{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 .modBadge{color:#0f172a;padding:4px 10px;border-radius:6px;font-weight:700;font-size:12px}
-.perfCard{background:linear-gradient(135deg,#0f172a,#1e1b4b);border:1px solid #4c1d95;border-radius:8px;padding:8px 14px;min-width:240px;display:flex;flex-direction:column;gap:4px}
-.perfCard#cabPerfCard{border-color:#15803d;background:linear-gradient(135deg,#0f172a,#052e16)}
-.perfCard#ramPerfCard{border-color:#a16207;background:linear-gradient(135deg,#0f172a,#451a03)}
+.perfCard{background:linear-gradient(135deg,#0f172a,#1e1b4b);border:1px solid #4c1d95;border-radius:8px;padding:10px 16px;min-width:380px;display:flex;flex-direction:column;gap:6px}
+.combinePerfCard{border-color:#0891b2;background:linear-gradient(135deg,#0f172a,#0c4a6e)}
+.combinePerfCard .perfLabel{color:#7dd3fc}
+.perfDivider{width:1px;height:30px;background:#334155;margin:0 4px}
 .perfLabel{font-size:11px;font-weight:700;color:#a5b4fc;letter-spacing:0.5px}
-#cabPerfCard .perfLabel{color:#86efac}
-#ramPerfCard .perfLabel{color:#fcd34d}
 .perfRow{display:flex;gap:14px;align-items:center}
 .perfStat{display:flex;flex-direction:column;gap:1px;min-width:60px}
 .perfStatLabel{font-size:9px;color:#94a3b8;font-weight:600;letter-spacing:0.3px}
@@ -3541,39 +3540,27 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
     <button class="btn btn-grey btn-sm" onclick="migratePnl()">🔥 Binance PNL Çek</button>
     <button class="btn btn-sm" style="background:#0891b2" onclick="downloadReport()">📊 Rapor İndir</button>
   </div>
-  <!-- Sağ: Combine Performans Kartları (her sistem için) -->
+  <!-- Sağ: COMBINE Performans Kartı (CAB + RAM TOPLAMI) -->
   <div class="topActionRight">
-    <div class="perfCard" id="cabPerfCard" title="CAB performansı">
-      <div class="perfLabel">🟢 CAB</div>
+    <div class="perfCard combinePerfCard" title="CAB + RAM combine performansı">
+      <div class="perfLabel">📊 TOPLAM (CAB + RAM)</div>
       <div class="perfRow">
         <div class="perfStat">
-          <div class="perfStatLabel">Net</div>
-          <div class="perfStatVal" id="cabPerfNet">$0</div>
+          <div class="perfStatLabel">Bugün</div>
+          <div class="perfStatVal" id="combineToday">$0</div>
+        </div>
+        <div class="perfDivider"></div>
+        <div class="perfStat">
+          <div class="perfStatLabel">Toplam Net</div>
+          <div class="perfStatVal" id="combineNet">$0</div>
         </div>
         <div class="perfStat">
           <div class="perfStatLabel">WR</div>
-          <div class="perfStatVal" id="cabPerfWr">0%</div>
+          <div class="perfStatVal" id="combineWr">0%</div>
         </div>
         <div class="perfStat">
-          <div class="perfStatLabel">Ort/Poz</div>
-          <div class="perfStatVal" id="cabPerfAvg">$0</div>
-        </div>
-      </div>
-    </div>
-    <div class="perfCard" id="ramPerfCard" title="RAM performansı">
-      <div class="perfLabel">🌓 RAM</div>
-      <div class="perfRow">
-        <div class="perfStat">
-          <div class="perfStatLabel">Net</div>
-          <div class="perfStatVal" id="ramPerfNet">$0</div>
-        </div>
-        <div class="perfStat">
-          <div class="perfStatLabel">WR</div>
-          <div class="perfStatVal" id="ramPerfWr">0%</div>
-        </div>
-        <div class="perfStat">
-          <div class="perfStatLabel">Ort/Poz</div>
-          <div class="perfStatVal" id="ramPerfAvg">$0</div>
+          <div class="perfStatLabel">Poz</div>
+          <div class="perfStatVal" id="combinePozCount">0</div>
         </div>
       </div>
     </div>
@@ -4334,35 +4321,48 @@ function updateSlotInfo(sys){
   }
 }
 
-// Üst performans kartı güncelle (Net Kar, WR, Ort/Poz)
-function updatePerfCard(sys){
-  const closed = sys==='cab' ? (DATA.closed_positions||[]) : (DATA.ram_closed_positions||[]);
-  const netEl = document.getElementById(sys+'PerfNet');
-  const wrEl = document.getElementById(sys+'PerfWr');
-  const avgEl = document.getElementById(sys+'PerfAvg');
+// COMBINE performans kartı (CAB + RAM toplamı)
+// Live mod: tek bakışta cüzdan durumu
+function updateCombinePerfCard(){
+  const cabClosed = DATA.closed_positions || [];
+  const ramClosed = DATA.ram_closed_positions || [];
+  const allClosed = cabClosed.concat(ramClosed);
+
+  const todayEl = document.getElementById('combineToday');
+  const netEl = document.getElementById('combineNet');
+  const wrEl = document.getElementById('combineWr');
+  const pozEl = document.getElementById('combinePozCount');
   if(!netEl) return;
 
-  if(closed.length === 0){
-    netEl.textContent = '—';
-    netEl.className = 'perfStatVal neutral';
-    wrEl.textContent = '—';
-    wrEl.className = 'perfStatVal neutral';
-    avgEl.textContent = '—';
-    avgEl.className = 'perfStatVal neutral';
+  if(allClosed.length === 0){
+    todayEl.textContent = '—'; todayEl.className = 'perfStatVal neutral';
+    netEl.textContent = '—'; netEl.className = 'perfStatVal neutral';
+    wrEl.textContent = '—'; wrEl.className = 'perfStatVal neutral';
+    pozEl.textContent = '0'; pozEl.className = 'perfStatVal neutral';
     return;
   }
 
-  // Net Kar
-  let totalKar = 0, wins = 0;
-  closed.forEach(c => {
+  // Toplam hesaplar
+  let totalKar = 0, wins = 0, todayKar = 0;
+  const today = now_tr_today();
+  allClosed.forEach(c => {
     const k = c.kar || 0;
     totalKar += k;
     if(k > 0) wins++;
+    // Bugün: kapanış tarihi bugün ise
+    if((c.kapanis||'').startsWith(today)){
+      todayKar += k;
+    }
   });
-  const wr = (wins / closed.length) * 100;
-  const avg = totalKar / closed.length;
+  const wr = (wins / allClosed.length) * 100;
 
-  // Net
+  // Bugün
+  const todayCls = todayKar > 0 ? 'up' : (todayKar < 0 ? 'down' : 'neutral');
+  const todaySign = todayKar > 0 ? '+' : '';
+  todayEl.textContent = todayKar !== 0 ? `${todaySign}$${todayKar.toFixed(0)}` : '$0';
+  todayEl.className = `perfStatVal ${todayCls}`;
+
+  // Toplam Net
   const netCls = totalKar >= 0 ? 'up' : 'down';
   const netSign = totalKar >= 0 ? '+' : '';
   netEl.textContent = `${netSign}$${totalKar.toFixed(0)}`;
@@ -4373,11 +4373,9 @@ function updatePerfCard(sys){
   wrEl.textContent = `${wr.toFixed(0)}%`;
   wrEl.className = `perfStatVal ${wrCls}`;
 
-  // Ort/Poz
-  const avgCls = avg >= 0 ? 'up' : 'down';
-  const avgSign = avg >= 0 ? '+' : '';
-  avgEl.textContent = `${avgSign}$${avg.toFixed(1)}`;
-  avgEl.className = `perfStatVal ${avgCls}`;
+  // Poz sayısı
+  pozEl.textContent = allClosed.length;
+  pozEl.className = 'perfStatVal neutral';
 }
 
 async function toggleAutoRecovery(sys){
@@ -4426,9 +4424,8 @@ function render(){
   // Akıllı slot bilgi (aktif risk vs garantili)
   updateSlotInfo('cab');
   updateSlotInfo('ram');
-  // Üst performans kartları
-  updatePerfCard('cab');
-  updatePerfCard('ram');
+  // Üst combine performans kartı (CAB + RAM toplam)
+  updateCombinePerfCard();
   // CAB
   renderSystem('cab',
     DATA.open_positions || {},
