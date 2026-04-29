@@ -297,21 +297,108 @@ def schedule_max_pos_increase(system):
     print(f"[RECOVERY:{system.upper()}] MAX POS artış planlandı: 30 dk sonra")
 
 
-async def emergency_stop_check_loop():
-    """v6.7.2: ACİL STOP — Pine alarm tetiklenmediyse bot kendi kapatır.
-    Pine'ın 'inPlan' state'i kayıt yenilemesi ile sıfırlanabilir.
-    Bu durumda stop alarmı asla gelmez ve poz açık kalır.
-    Bu loop her 30 saniyede tüm açık pozları kontrol eder ve
-    fiyat stop'un %0.3 ALTINA düşmüşse bot kendi kapatır.
+async def stop_watchdog_loop():
+    """v6.7.4: LIVE KRİTİK — Her 5 dakikada bir Binance'te stop emirleri kontrol et.
+    
+    v6.5 silent stop fail krizinin sürekli koruması:
+    Bot çalışırken bir poz var ama Binance'te stop emri yoksa,
+    bu kritik bir durum — sahibi haberdar edilmeli ve ideale stop yeniden konulmalı.
     """
     import asyncio
-    from datetime import datetime
-    EMERGENCY_TOLERANCE = 0.003  # %0.3 — anlık iğneleri filtrelemek için
-    CHECK_INTERVAL = 30  # saniye
-
+    CHECK_INTERVAL = 300  # 5 dakika
+    
+    await asyncio.sleep(60)  # Bot başladıktan 1dk sonra ilk kontrol
+    
     while True:
         try:
             await asyncio.sleep(CHECK_INTERVAL)
+            
+            # Sadece live mod için anlamlı
+            if get_system_mode("cab") != "live":
+                continue
+            
+            cab_open = data.get("open_positions", {})
+            if not cab_open:
+                continue
+            
+            problems = []
+            for ticker, pos in cab_open.items():
+                # Pos açıldıktan en az 30sn geçmiş olsun (race condition)
+                try:
+                    zaman_str = pos.get("zaman_full", "") or pos.get("acilis", "")
+                    if zaman_str:
+                        opn = datetime.strptime(zaman_str[:16], "%Y-%m-%d %H:%M")
+                        elapsed = (now_tr_dt() - opn).total_seconds()
+                        if elapsed < 60:
+                            continue
+                except Exception:
+                    pass
+                
+                has_stop = check_binance_stop(ticker)
+                if has_stop is False:  # Net olarak stop YOK
+                    problems.append(ticker)
+                    print(f"[STOP-WATCHDOG-ALARM] {ticker} pozisyonu var ama Binance'te STOP_MARKET emri YOK!")
+                    
+                    # Otomatik stop yeniden koy
+                    try:
+                        info = get_symbol_info(ticker)
+                        qty = binance_get_position_qty(ticker)
+                        stop_px = pos.get("current_stop") or pos.get("stop")
+                        if qty > 0 and stop_px and stop_px > 0:
+                            qty_rounded = round_qty(qty, info)
+                            sl_result = binance_stop_loss(ticker, qty_rounded, stop_px, info)
+                            if sl_result["success"]:
+                                pos["sl_order_id"] = sl_result.get("order_id")
+                                save_data(data)
+                                print(f"[STOP-WATCHDOG-FIX] {ticker} stop emri yeniden konuldu: {stop_px}")
+                            else:
+                                print(f"[STOP-WATCHDOG-ERR] {ticker} stop tekrar koyma başarısız: {sl_result.get('error')}")
+                    except Exception as e:
+                        print(f"[STOP-WATCHDOG-ERR] {ticker} fix denemesi hatası: {e}")
+            
+            if problems:
+                # Log kayıt
+                if "stop_watchdog_log" not in data:
+                    data["stop_watchdog_log"] = []
+                data["stop_watchdog_log"].append({
+                    "zaman": now_tr(),
+                    "problems": problems,
+                })
+                if len(data["stop_watchdog_log"]) > 50:
+                    data["stop_watchdog_log"] = data["stop_watchdog_log"][-50:]
+                save_data(data)
+        except Exception as e:
+            print(f"[stop_watchdog_loop ERR] {e}")
+
+
+async def emergency_stop_check_loop():
+    """v6.7.4: ACİL STOP — Pine alarm tetiklenmediyse bot kendi kapatır.
+    Pine'ın 'inPlan' state'i kayıt yenilemesi ile sıfırlanabilir.
+    Bu durumda stop alarmı asla gelmez ve poz açık kalır.
+    Bu loop her 30 saniyede tüm açık pozları kontrol eder ve
+    fiyat stop'un %0.5 ALTINA düşmüşse bot kendi kapatır.
+    
+    İyileştirmeler:
+    - Başlangıçta hemen tara (30sn bekleme yok)
+    - %0.5 tolerans (mark price sapması için)
+    - Auto-pause kill switch'e SAYMAZ (Pine bug'ı kullanıcının suçu değil)
+    - Son 50 emergency log tut
+    """
+    import asyncio
+    from datetime import datetime
+    EMERGENCY_TOLERANCE = 0.005  # v6.7.4: %0.3 → %0.5 (mark price sapması için)
+    CHECK_INTERVAL = 30  # saniye
+    INITIAL_DELAY = 5  # v6.7.4: ilk taramayı 5sn sonra yap (önceden 30sn idi)
+
+    # İlk başlangıç — bot startup sonrası hemen tara
+    await asyncio.sleep(INITIAL_DELAY)
+
+    first_iteration = True
+    while True:
+        try:
+            if not first_iteration:
+                await asyncio.sleep(CHECK_INTERVAL)
+            first_iteration = False
 
             # Hem CAB hem RAM açık pozlarını kontrol et
             for system in ["cab", "ram"]:
@@ -423,8 +510,26 @@ async def emergency_stop_check_loop():
                             save_data(data)
                             print(f"[EMERGENCY_STOP] {ticker} kapatıldı: {total_kar:.2f}$ ({sonuc})")
 
-                            # Auto-pause kontrolü
-                            check_auto_reduce_max_pos(system)
+                            # v6.7.4: Emergency stop kill switch'e SAYMAZ
+                            # Çünkü Pine state kayıp olması bot'umuzun bug'ı, kullanıcının suçu değil
+                            # Auto-pause çağrısı yapılmıyor
+
+                            # v6.7.4: Emergency stop log kaydı (son 50 tut)
+                            if "emergency_stop_log" not in data:
+                                data["emergency_stop_log"] = []
+                            data["emergency_stop_log"].append({
+                                "ticker": ticker,
+                                "system": system,
+                                "stop": current_stop,
+                                "exit_px": exit_px,
+                                "kar": round(total_kar, 2),
+                                "sonuc": sonuc,
+                                "zaman": now_tr(),
+                            })
+                            # Son 50 tut
+                            if len(data["emergency_stop_log"]) > 50:
+                                data["emergency_stop_log"] = data["emergency_stop_log"][-50:]
+                            save_data(data)
                         except Exception as e:
                             print(f"[EMERGENCY_STOP ERR] {ticker}: {e}")
 
@@ -725,9 +830,17 @@ def check_auto_reduce_max_pos(system="cab"):
         return
 
 
-# ============ VERİ YÖNETİMİ (devam) ============# v6.1: Skipped_signals key'i eski verilerde olmayabilir, garanti et
+# ============ VERİ YÖNETİMİ (devam) ============
+# v6.1: Skipped_signals key'i eski verilerde olmayabilir, garanti et
 if "skipped_signals" not in data:
     data["skipped_signals"] = []
+# v6.7.4: SİMETRİ — RAM init
+if "ram_skipped_signals" not in data:
+    data["ram_skipped_signals"] = []
+if "ram_open_positions" not in data:
+    data["ram_open_positions"] = {}
+if "ram_closed_positions" not in data:
+    data["ram_closed_positions"] = []
 # v6.5: Shadow Mode alanları
 if "shadow_positions" not in data:
     data["shadow_positions"] = {}
@@ -891,6 +1004,52 @@ def binance_stop_loss(symbol, qty, stop_price, info):
     except ClientError as e:
         print(f"[BINANCE ERR] Stop loss {symbol}: {e}")
         return {"success": False, "error": str(e)}
+
+def verify_stop_order(symbol, expected_stop_price=None, info=None):
+    """v6.7.4: LIVE KRİTİK — Stop emrinin gerçekten Binance'te olduğunu doğrula.
+    
+    v6.5'teki 'silent stop fail' krizinin önlemi:
+    Binance'te STOP_MARKET emri var mı? Yoksa pozisyon korunmasız!
+    
+    Returns:
+        {"verified": True, "stop_price": X, "order_id": Y} eğer doğrulandı
+        {"verified": False, "reason": "..."} eğer YOK veya hatalı
+    """
+    try:
+        # Binance'te aktif emirleri çek
+        open_orders = client.get_orders(symbol=symbol)
+        stop_orders = [o for o in open_orders if o.get("type") == "STOP_MARKET"]
+        
+        if not stop_orders:
+            return {"verified": False, "reason": "no_stop_order_found",
+                    "message": f"{symbol} için STOP_MARKET emri YOK!"}
+        
+        # En azından 1 stop emri var, fiyatı kontrol et
+        sp = float(stop_orders[0].get("stopPrice", 0))
+        oid = stop_orders[0].get("orderId")
+        
+        # Beklenen fiyatla yakın mı? (%1 tolerans)
+        if expected_stop_price and expected_stop_price > 0:
+            diff_pct = abs(sp - expected_stop_price) / expected_stop_price * 100
+            if diff_pct > 1.0:
+                return {"verified": False, "reason": "stop_price_mismatch",
+                        "message": f"{symbol} stop price beklenen:{expected_stop_price}, gerçek:{sp} ({diff_pct:.2f}% fark)",
+                        "stop_price": sp, "order_id": oid}
+        
+        return {"verified": True, "stop_price": sp, "order_id": oid}
+    except Exception as e:
+        return {"verified": False, "reason": "api_error", "message": str(e)}
+
+
+def check_binance_stop(symbol):
+    """v6.7.4: LIVE KRİTİK — Sembol için Binance'te stop emri var mı?
+    Periyodik kontrol için kısa cevap döner."""
+    try:
+        open_orders = client.get_orders(symbol=symbol)
+        return any(o.get("type") == "STOP_MARKET" for o in open_orders)
+    except Exception:
+        return None  # Bilinmiyor
+
 
 def binance_cancel_all(symbol):
     try:
@@ -1119,8 +1278,19 @@ def calc_trail_kar(pos, trail_px, tp_type="TP1"):
     kalan_oran = (100 - kapat_oran - 25) if tp_type == "TP2" else (100 - kapat_oran)
     return round(pos_size * (kalan_oran / 100.0) * (trail_px - giris) / giris, 2)
 
-def is_recently_closed(ticker, n=20):
-    return ticker in [c["ticker"] for c in data["closed_positions"][-n:]]
+def is_recently_closed(ticker, n=20, system=None):
+    """v6.7.4: SİMETRİ — sistem belirtilmezse her ikisinde de bak.
+    Belirtilirse sadece o sistemde."""
+    if system == "cab":
+        return ticker in [c.get("ticker") for c in data.get("closed_positions", [])[-n:]]
+    elif system == "ram":
+        return ticker in [c.get("ticker") for c in data.get("ram_closed_positions", [])[-n:]]
+    else:
+        # Her ikisi de
+        cab_closed = data.get("closed_positions", [])[-n:]
+        ram_closed = data.get("ram_closed_positions", [])[-n:]
+        all_tickers = [c.get("ticker") for c in cab_closed] + [c.get("ticker") for c in ram_closed]
+        return ticker in all_tickers
 
 # ============ TRADE EXECUTION ============
 def execute_entry(ticker, parsed):
@@ -1167,6 +1337,29 @@ def execute_entry(ticker, parsed):
 
     sl_result = binance_stop_loss(symbol, actual_qty, stop_px, info)
     sl_order_id = sl_result.get("order_id") if sl_result["success"] else None
+
+    # v6.7.4: LIVE KRİTİK — Stop emrini DOĞRULA (v6.5 silent stop fail korumasiı)
+    if not sl_result["success"]:
+        # Stop koymak başarısız oldu — KRİTİK durum
+        print(f"[CRITICAL] {symbol} STOP_LOSS YERLEŞTİRİLEMEDİ! Hata: {sl_result.get('error')}")
+        # Tekrar dene (1 kez)
+        import time
+        time.sleep(1)
+        retry_result = binance_stop_loss(symbol, actual_qty, stop_px, info)
+        if retry_result["success"]:
+            sl_order_id = retry_result.get("order_id")
+            print(f"[TRADE] {symbol} stop loss retry başarılı: orderId:{sl_order_id}")
+        else:
+            # Hâlâ başarısız → poz hâlâ açık ama stop yok!
+            print(f"[CRITICAL] {symbol} STOP RETRY DE BAŞARISIZ — POZİSYON KORUNMASIZ!")
+            print(f"[CRITICAL] Manuel müdahale gerek: Binance'e gir ve stop koy ya da kapat")
+
+    # Yerleştirildiyse sonradan doğrula (race condition koruması)
+    elif sl_order_id:
+        verify = verify_stop_order(symbol, expected_stop_price=stop_px, info=info)
+        if not verify["verified"]:
+            print(f"[CRITICAL] {symbol} stop verify başarısız: {verify.get('message')}")
+            # Doğrulanamadı — yine de devam ediyoruz, poz açık ama log var
 
     print(f"[TRADE] GIRIS OK: {symbol} | qty:{actual_qty} | px:{actual_price} | SL:{stop_px}")
     return {"qty": actual_qty, "avg_price": actual_price, "sl_order_id": sl_order_id}
@@ -1468,21 +1661,32 @@ async def test_binance():
 
 @app.post("/update_hh")
 async def update_hh(req: Request):
+    """v6.7.4: SİMETRİ — Hem CAB hem RAM açık pozları kontrol et"""
     body = await req.json()
     ticker = body.get("ticker")
     current_price = body.get("price")
     if not ticker or not current_price:
         return {"status": "missing"}
-    if ticker in data["open_positions"]:
-        pos = data["open_positions"][ticker]
-        giris = pos["giris"]
-        pct = (current_price - giris) / giris * 100.0
-        old_hh = pos.get("hh_pct", 0)
-        if pct > old_hh:
-            pos["hh_pct"] = round(pct, 2)
-            save_data(data)
-            print(f"[HH] {ticker}: {old_hh:.2f}% -> {pct:.2f}%")
-    return {"status": "ok"}
+
+    updated_systems = []
+    for system in ["cab", "ram"]:
+        open_key = _sys_key(system, "open_positions")
+        positions = data.get(open_key, {})
+        if ticker in positions:
+            pos = positions[ticker]
+            giris = pos.get("giris", 0)
+            if giris <= 0:
+                continue
+            pct = (current_price - giris) / giris * 100.0
+            old_hh = pos.get("hh_pct", 0)
+            if pct > old_hh:
+                pos["hh_pct"] = round(pct, 2)
+                updated_systems.append(system)
+                print(f"[HH:{system}] {ticker}: {old_hh:.2f}% -> {pct:.2f}%")
+
+    if updated_systems:
+        save_data(data)
+    return {"status": "ok", "updated": updated_systems}
 
 @app.get("/api/data")
 async def api_data():
@@ -1490,52 +1694,90 @@ async def api_data():
 
 @app.post("/api/fix_giris")
 async def fix_giris(req: Request):
+    """v6.7.4: SİMETRİ — Hem CAB hem RAM açık pozları kontrol et"""
     body = await req.json()
     ticker = body.get("ticker")
     new_giris = body.get("giris")
-    if ticker and new_giris and ticker in data["open_positions"]:
-        data["open_positions"][ticker]["giris"] = float(new_giris)
+    if not ticker or not new_giris:
+        return {"status": "missing"}
+    fixed_systems = []
+    for system in ["cab", "ram"]:
+        open_key = _sys_key(system, "open_positions")
+        positions = data.get(open_key, {})
+        if ticker in positions:
+            positions[ticker]["giris"] = float(new_giris)
+            fixed_systems.append(system)
+    if fixed_systems:
         save_data(data)
-        return {"status": "fixed", "ticker": ticker, "giris": new_giris}
+        return {"status": "fixed", "ticker": ticker, "giris": new_giris, "systems": fixed_systems}
     return {"status": "not_found"}
 
 @app.get("/api/fix_zero_giris")
 async def fix_zero_giris():
+    """v6.7.4: SİMETRİ — Her iki sistemin açık pozlarını Binance'le karşılaştır.
+    NOT: fix_zero_giris yalnızca LIVE modda anlamlıdır (Binance'te gerçek poz olmalı)."""
     fixed = []
-    for ticker, pos in data["open_positions"].items():
-        try:
-            positions = client.get_position_risk(symbol=ticker)
-            for p in positions:
-                if p["symbol"] == ticker and float(p.get("positionAmt", 0)) != 0:
-                    entry_price = float(p.get("entryPrice", 0))
-                    if entry_price > 0 and entry_price != pos["giris"]:
-                        old = pos["giris"]
-                        pos["giris"] = entry_price
-                        fixed.append({"ticker": ticker, "old": old, "new": entry_price})
-                        print(f"[FIX] {ticker} giris: {old} → {entry_price}")
-        except Exception as e:
-            print(f"[FIX ERR] {ticker}: {e}")
+    for system in ["cab", "ram"]:
+        # Sadece live mod için anlamlı
+        if get_system_mode(system) != "live":
+            continue
+        open_key = _sys_key(system, "open_positions")
+        positions = data.get(open_key, {})
+        for ticker, pos in positions.items():
+            try:
+                bin_positions = client.get_position_risk(symbol=ticker)
+                for p in bin_positions:
+                    if p["symbol"] == ticker and float(p.get("positionAmt", 0)) != 0:
+                        entry_price = float(p.get("entryPrice", 0))
+                        if entry_price > 0 and entry_price != pos.get("giris"):
+                            old = pos.get("giris")
+                            pos["giris"] = entry_price
+                            fixed.append({"system": system, "ticker": ticker, "old": old, "new": entry_price})
+                            print(f"[FIX:{system}] {ticker} giris: {old} → {entry_price}")
+            except Exception as e:
+                print(f"[FIX ERR:{system}] {ticker}: {e}")
     if fixed:
         save_data(data)
     return {"fixed": fixed, "count": len(fixed)}
 
 @app.post("/api/clear_old")
 async def api_clear_old(req: Request):
+    """v6.7.4: SİMETRİ — Her iki sistemin closed listesinde temizlik"""
     body = await req.json()
     days = int(body.get("days", 30))
+    system = body.get("system", "both")  # "cab" | "ram" | "both"
     cutoff = (datetime.now(timezone.utc) + timedelta(hours=3)) - timedelta(days=days)
     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M")
-    before = len(data["closed_positions"])
-    data["closed_positions"] = [c for c in data["closed_positions"] if c.get("kapanis", "") >= cutoff_str]
-    after = len(data["closed_positions"])
+    result = {}
+    systems = [system] if system in ["cab", "ram"] else ["cab", "ram"]
+    for s in systems:
+        closed_key = _sys_key(s, "closed_positions")
+        closed = data.get(closed_key, [])
+        before = len(closed)
+        data[closed_key] = [c for c in closed if c.get("kapanis", "") >= cutoff_str]
+        after = len(data[closed_key])
+        result[s] = {"removed": before - after, "remaining": after}
     save_data(data)
-    return {"removed": before - after, "remaining": after}
+    return result
 
 @app.post("/api/clear_skipped")
-async def api_clear_skipped():
-    if "skipped_signals" in data:
-        data["skipped_signals"] = []
-        save_data(data)
+async def api_clear_skipped(req: Request = None):
+    """v6.7.4: SİMETRİ — Hem CAB hem RAM kaçırılan listesi temizlenir"""
+    system = "both"
+    if req:
+        try:
+            body = await req.json()
+            system = body.get("system", "both")
+        except Exception:
+            pass
+    result = {}
+    systems = [system] if system in ["cab", "ram"] else ["cab", "ram"]
+    for s in systems:
+        skip_key = _sys_key(s, "skipped_signals")
+        before = len(data.get(skip_key, []))
+        data[skip_key] = []
+        result[s] = {"cleared": before}
+    save_data(data)
     return {"status": "ok"}
 
 @app.post("/api/clear_shadow")
@@ -2123,16 +2365,16 @@ async def archive_and_reset(req: Request):
         "legacy_closed": len(snapshot["legacy_shadow"]["shadow_closed"]),
     }
 
-    # Reset
+    # Reset (SİSTEM-AWARE)
     if reset_cab:
-        # Sadece kapanmış + kaçırılan sinyalleri sil (açık pozlar dokunulmaz!)
-        data["closed_positions"] = []
-        data["skipped_signals"] = []
+        # CAB: kapanmış + kaçırılan sinyaller sil (açık pozlar dokunulmaz, gerçek olabilir!)
+        data[_sys_key("cab", "closed_positions")] = []
+        data[_sys_key("cab", "skipped_signals")] = []
     if reset_ram:
-        data["ram_closed_positions"] = []
-        data["ram_skipped_signals"] = []
-        data["ram_open_positions"] = {}  # RAM açık pozlar sanaldır, sil
-        # legacy shadow da temizlensin
+        data[_sys_key("ram", "closed_positions")] = []
+        data[_sys_key("ram", "skipped_signals")] = []
+        data[_sys_key("ram", "open_positions")] = {}  # RAM açık pozlar sanaldır, sil
+        # legacy shadow temizlik
         data["shadow_positions"] = {}
         data["shadow_closed"] = []
         data["shadow_skipped"] = []
@@ -2187,8 +2429,15 @@ async def force_reopen_position(req: Request):
     except Exception:
         pass
     ticker = (body.get("ticker") or "").upper()
+    system = (body.get("system") or "cab").lower()  # v6.7.4: hangi sistem?
+    if system not in ["cab", "ram"]:
+        system = "cab"
     if not ticker:
         return JSONResponse({"success": False, "error": "ticker boş"})
+
+    # Force reopen sadece live mod için anlamlı
+    if get_system_mode(system) != "live":
+        return JSONResponse({"success": False, "error": f"{system.upper()} live modda değil — force_reopen sadece live için kullanılır"})
 
     # Binance'te gerçekten açık mı kontrol et
     try:
@@ -2210,15 +2459,20 @@ async def force_reopen_position(req: Request):
     if not binance_open:
         return JSONResponse({"success": False, "error": f"{ticker} Binance'te zaten kapalı, işlem yapılmadı"})
 
-    # Dashboard'da açıksa bir şey yapma
-    if ticker in data.get("open_positions", {}):
-        return JSONResponse({"success": False, "error": f"{ticker} dashboard'da zaten açık"})
+    # SİMETRİ — sisteme göre erişim
+    open_key = _sys_key(system, "open_positions")
+    closed_key = _sys_key(system, "closed_positions")
 
-    # Kapanan listesinde bul — en yenisini al, open_positions'a taşı
+    # Dashboard'da açıksa bir şey yapma
+    if ticker in data.get(open_key, {}):
+        return JSONResponse({"success": False, "error": f"{ticker} {system.upper()} dashboard'da zaten açık"})
+
+    # Kapanan listesinde bul — en yenisini al
     found_closed = None
-    for idx in range(len(data.get("closed_positions", [])) - 1, -1, -1):
-        if data["closed_positions"][idx].get("ticker") == ticker:
-            found_closed = data["closed_positions"][idx]
+    closed_list = data.get(closed_key, [])
+    for idx in range(len(closed_list) - 1, -1, -1):
+        if closed_list[idx].get("ticker") == ticker:
+            found_closed = closed_list[idx]
             break
 
     if not found_closed:
@@ -2257,12 +2511,15 @@ async def force_reopen_position(req: Request):
             "zaman_full": found_closed.get("acilis", now_tr()),
             "reopened_manual": True,
         }
-        # Kapanan listesinden sil
-        data["closed_positions"].remove(found_closed)
+        # Kapanan listesinden sil (SİSTEM-AWARE)
+        data[closed_key].remove(found_closed)
 
-    data["open_positions"][ticker] = reopened
+    # Açık listesine ekle (SİSTEM-AWARE)
+    if open_key not in data:
+        data[open_key] = {}
+    data[open_key][ticker] = reopened
     save_data(data)
-    print(f"[FORCE-REOPEN] {ticker} tekrar açık listesine alındı (qty:{binance_qty}, entry:{binance_entry})")
+    print(f"[FORCE-REOPEN:{system}] {ticker} tekrar açık listesine alındı (qty:{binance_qty}, entry:{binance_entry})")
     return JSONResponse({
         "success": True,
         "ticker": ticker,
@@ -3157,113 +3414,213 @@ async def webhook(req: Request):
         return {"status": "unknown"}
 
 # ============ TIMEOUT BACKGROUND TASK (v6.1: FIX EDİLDİ) ============
+# v6.7.3: TP1 vurmuş pozlar için MUTLAK uzun süre limiti (Pine state kayıp olursa diye)
+TP1_ABSOLUTE_HOURS = 168  # 7 gün — TP1+'lı poz bile bu kadar açıksa zorla kapat
+
 async def timeout_scan_once():
-    """v6.1: Tek seferlik timeout taraması — manuel ve background task tarafından çağrılır"""
+    """v6.1: Tek seferlik timeout taraması — manuel ve background task tarafından çağrılır
+    v6.7.3: SİMETRİK — Hem CAB hem RAM açık pozlarını tarar
+    v6.7.3: TP1 vurmuş pozlar 7 gün limit ile zorla kapanır
+    """
     scanned = 0
     actioned = []
     errors = []
 
     try:
-        now = now_tr_dt()  # v6.1: NAIVE datetime — strptime ile uyumlu
-        for ticker in list(data["open_positions"].keys()):
-            pos = data["open_positions"][ticker]
-
-            # TP1 vurmuş veya zaten timeout-BE → atla
-            if pos.get("tp1_hit") or pos.get("timeout_be"):
+        now = now_tr_dt()
+        # SİMETRİ: Her iki sistem için tara
+        for system in ["cab", "ram"]:
+            open_key = _sys_key(system, "open_positions")
+            positions = data.get(open_key, {})
+            if not positions:
                 continue
 
-            scanned += 1
+            for ticker in list(positions.keys()):
+                pos = positions[ticker]
 
-            try:
-                zaman_str = pos.get("zaman_full", "")
-                if not zaman_str:
-                    continue
-                acilis = datetime.strptime(zaman_str, "%Y-%m-%d %H:%M")  # naive
-                age_hours = (now - acilis).total_seconds() / 3600
-            except Exception as e:
-                errors.append(f"{ticker}: zaman parse hatası: {e}")
-                continue
-
-            if age_hours < TIMEOUT_HOURS:
-                continue
-
-            # v6.4: KOŞULLU TIMEOUT — slot baskısına göre karar ver
-            # MUTLAK LİMİT (24s+) → ne olursa olsun timeout
-            # 12s ≤ yaş < 24s arası → slot baskısı varsa timeout, yoksa skip
-            aktif_risk, gar_tp1, gar_to = count_active_risk()
-            slot_doluluk_pct = (aktif_risk / get_max_positions()) * 100
-
-            if age_hours < TIMEOUT_ABSOLUTE_HOURS:
-                # Henüz mutlak limite gelmedi → slot baskısına bak
-                if aktif_risk < TIMEOUT_PRESSURE_THRESHOLD:
-                    # Slot baskısı yok → pozisyona şans tanı, timeout YAPMA
-                    if scanned == 1:  # İlk kontrol için log yaz, spam etmeyelim
-                        print(f"[TIMEOUT-SKIP] {ticker} {age_hours:.1f}s açık ama aktif_risk:{aktif_risk}/{get_max_positions()} (eşik:{TIMEOUT_PRESSURE_THRESHOLD}) — bekle")
-                    continue
-                else:
-                    print(f"[TIMEOUT] {ticker} {age_hours:.1f}s açık | aktif_risk:{aktif_risk}/{get_max_positions()} (eşik:{TIMEOUT_PRESSURE_THRESHOLD}) — slot baskısı, akıllı kapama")
-            else:
-                print(f"[TIMEOUT] {ticker} {age_hours:.1f}s açık (MUTLAK limit:{TIMEOUT_ABSOLUTE_HOURS}s) — zorla akıllı kapama")
-
-            try:
-                action, kar = execute_smart_timeout(ticker, pos)
-            except Exception as e:
-                errors.append(f"{ticker}: smart timeout hatası: {e}")
-                print(f"[TIMEOUT ERR] {ticker}: {e}")
-                continue
-
-            if action == 'be':
-                # KÂRDA → BE stop'a çekildi, pozisyon devam, slot serbest
-                pos["timeout_be"] = True
-                pos["timeout_zaman"] = now_tr()
-                pos["timeout_kar_initial"] = kar
-                pos["stop"] = pos["giris"]  # BE
-                pos["durum"] = f"⏰ Timeout-BE (+{kar:.1f}$)"
-                save_data(data)
-                actioned.append({"ticker": ticker, "action": "BE", "unrealized_kar": kar, "age_hours": round(age_hours, 1)})
-                print(f"[TIMEOUT-BE] {ticker} → slot serbest, pozisyon BE'de bekliyor (kâr +{kar:.1f}$)")
-
-            elif action == 'close':
-                # ZARARDA veya hata → kapat, kapanan tabloya ekle
-                # v6.6 Lite: Binance'ten gerçek realized PNL çek
-                binance_pnl = None
-                binance_fee = None
                 try:
-                    acilis_str = pos.get("zaman_full", "")
-                    if acilis_str:
-                        dt = datetime.strptime(acilis_str, "%Y-%m-%d %H:%M")
-                        dt_utc = dt - timedelta(hours=3)
-                        start_ms = int(dt_utc.timestamp() * 1000) - 60000
-                        pnl_result = fetch_binance_realized_pnl(ticker, start_ms)
-                        if pnl_result.get("success") and pnl_result.get("count", 0) > 0:
-                            binance_pnl = pnl_result.get("net_pnl")
-                            binance_fee = pnl_result.get("fee", 0)
+                    zaman_str = pos.get("zaman_full", "") or pos.get("acilis", "")
+                    if not zaman_str:
+                        continue
+                    acilis = datetime.strptime(zaman_str[:16], "%Y-%m-%d %H:%M")
+                    age_hours = (now - acilis).total_seconds() / 3600
                 except Exception as e:
-                    print(f"[BINANCE-PNL ERR] {ticker} timeout: {e}")
+                    errors.append(f"{system}:{ticker}: zaman parse hatası: {e}")
+                    continue
 
-                closed = {
-                    "ticker": ticker, "giris": pos["giris"], "marj": pos["marj"], "lev": pos["lev"],
-                    "sonuc": "⏰ Timeout", "kar": round(kar, 2),
-                    "tp1_kar": 0, "tp2_kar": 0, "trail_kar": round(kar, 2),
-                    "tp1_kar_added": False, "tp2_kar_added": False,
-                    "hh_pct": pos.get("hh_pct", 0), "atr_skor": pos.get("atr_skor", 1.0),
-                    "kapat_oran": pos.get("kapat_oran", 60),
-                    "acilis": pos.get("zaman_full", ""), "kapanis": now_tr(),
-                    "binance_pnl": binance_pnl, "binance_fee": binance_fee,  # v6.6 Lite
-                }
-                # v6.7: market regime + system bilgileri pos'tan al
-                if isinstance(closed, dict):
-                    closed.setdefault("market_regime", pos.get("market_regime") if isinstance(pos, dict) else None)
-                    closed.setdefault("market_detail", pos.get("market_detail") if isinstance(pos, dict) else None)
-                    closed.setdefault("system", pos.get("system", "CAB v14") if isinstance(pos, dict) else "CAB v14")
-                    closed.setdefault("system_code", pos.get("system_code", "cab") if isinstance(pos, dict) else "cab")
-                data["closed_positions"].append(closed)
-                del data["open_positions"][ticker]
-                save_data(data)
-                actioned.append({"ticker": ticker, "action": "CLOSE", "kar": kar, "age_hours": round(age_hours, 1)})
-                print(f"[TIMEOUT-CLOSE] {ticker} → kapatıldı ({kar:+.1f}$)")
-                check_auto_pause_triggers()  # v6.6 Lite Patch 5
-                check_auto_reduce_max_pos()   # v6.6 Lite Patch 8
+                # v6.7.3: TP1 vurmuş ya da timeout-BE pozları
+                # Eskiden tamamen muaftı, şimdi 7 gün mutlak limit var (Pine state kayıp diye)
+                if pos.get("tp1_hit") or pos.get("timeout_be"):
+                    if age_hours >= TP1_ABSOLUTE_HOURS:
+                        print(f"[TIMEOUT-FORCE] {system}:{ticker} {age_hours:.1f}s açık (TP1'li, MUTLAK 7gün limit) — zorla kapat")
+                        # Forced close — emergency_stop_check_loop benzer mantık
+                        try:
+                            cur_px = binance_get_mark_price(ticker)
+                        except Exception:
+                            cur_px = None
+                        if cur_px and cur_px > 0:
+                            # Closed kaydı oluştur
+                            closed_key = _sys_key(system, "closed_positions")
+                            kapat_oran = pos.get("kapat_oran", 60)
+                            tp1_kar = pos.get("tp1_kar", 0)
+                            tp2_kar = pos.get("tp2_kar", 0)
+                            giris = pos.get("giris", 0)
+                            marj = pos.get("marj", 100)
+                            lev = pos.get("lev", 10)
+                            ps = marj * lev
+                            tp2_hit = pos.get("tp2_hit", False)
+
+                            if tp2_hit:
+                                kalan_oran = 0.15
+                                sonuc = "TP1+TP2+Timeout(7gün)"
+                            else:
+                                kalan_oran = (100 - kapat_oran) / 100
+                                sonuc = "TP1+Timeout(7gün)"
+
+                            exit_pct = (cur_px - giris) / giris if giris else 0
+                            kalan_kar = ps * kalan_oran * exit_pct
+                            total_kar = tp1_kar + tp2_kar + kalan_kar
+
+                            closed_pos = {
+                                "ticker": ticker, "giris": giris,
+                                "marj": marj, "lev": lev,
+                                "sonuc": sonuc, "kar": total_kar,
+                                "tp1_kar": tp1_kar, "tp2_kar": tp2_kar,
+                                "trail_kar": kalan_kar,
+                                "hh_pct": pos.get("hh_pct", 0),
+                                "kapat_oran": kapat_oran,
+                                "acilis": pos.get("acilis"),
+                                "kapanis": now_tr(),
+                                "exit_px": cur_px,
+                                "stop": pos.get("current_stop") or pos.get("stop"),
+                                "system": pos.get("system", f"{system.upper()} v?"),
+                                "system_code": system,
+                                "market_regime": pos.get("market_regime"),
+                                "binance_pnl": None, "binance_fee": None,
+                                "shadow": True,
+                                "force_timeout": True,
+                            }
+                            if closed_key not in data:
+                                data[closed_key] = []
+                            data[closed_key].append(closed_pos)
+                            del data[open_key][ticker]
+                            save_data(data)
+                            actioned.append(f"{system}:{ticker} (TP1-7gün)")
+                    continue
+
+                scanned += 1
+
+                if age_hours < TIMEOUT_HOURS:
+                    continue
+
+                # v6.4: KOŞULLU TIMEOUT — slot baskısına göre karar ver
+                aktif_risk, gar_tp1, gar_to = count_active_risk(system)
+                max_pos = get_max_positions(system)
+                slot_doluluk_pct = (aktif_risk / max_pos) * 100 if max_pos else 0
+
+                if age_hours < TIMEOUT_ABSOLUTE_HOURS:
+                    if aktif_risk < TIMEOUT_PRESSURE_THRESHOLD:
+                        if scanned == 1:
+                            print(f"[TIMEOUT-SKIP] {system}:{ticker} {age_hours:.1f}s — aktif_risk:{aktif_risk}/{max_pos} (eşik:{TIMEOUT_PRESSURE_THRESHOLD}) — bekle")
+                        continue
+                    else:
+                        print(f"[TIMEOUT] {system}:{ticker} {age_hours:.1f}s | aktif_risk:{aktif_risk}/{max_pos} — slot baskısı")
+                else:
+                    print(f"[TIMEOUT] {system}:{ticker} {age_hours:.1f}s (MUTLAK limit:{TIMEOUT_ABSOLUTE_HOURS}s)")
+
+                # Smart timeout — Bu fonksiyon hâlâ CAB-only olabilir, kontrol edelim
+                # v6.7.4: SİMETRİ FIX — sistem-aware timeout işleme
+                try:
+                    if system == "cab" and get_system_mode("cab") == "live":
+                        # CAB Live: gerçek Binance işlemi
+                        action, kar = execute_smart_timeout(ticker, pos)
+                    else:
+                        # CAB shadow veya RAM (her mod): manuel sanal kapama
+                        cur_px = binance_get_mark_price(ticker)
+                        if not cur_px or cur_px <= 0:
+                            errors.append(f"{system}:{ticker}: mark price yok, atla")
+                            continue
+                        giris = pos.get("giris", 0)
+                        if giris <= 0:
+                            errors.append(f"{system}:{ticker}: giris=0, atla")
+                            continue
+                        ps = pos.get("marj", 100) * pos.get("lev", 10)
+                        unrealized = ps * (cur_px - giris) / giris
+
+                        if unrealized > 0:
+                            # Kârda → BE'ye çek, slot serbest
+                            action, kar = ('be', unrealized)
+                        else:
+                            # Zararda → kapat
+                            action, kar = ('close', unrealized)
+                except Exception as e:
+                    errors.append(f"{system}:{ticker}: smart timeout hatası: {e}")
+                    print(f"[TIMEOUT ERR] {system}:{ticker}: {e}")
+                    continue
+
+                if action == 'be':
+                    # KÂRDA → BE stop'a çekildi, pozisyon devam, slot serbest
+                    pos["timeout_be"] = True
+                    pos["timeout_zaman"] = now_tr()
+                    pos["timeout_kar_initial"] = kar
+                    pos["stop"] = pos["giris"]  # BE
+                    pos["current_stop"] = pos["giris"]  # Emergency stop için de aynı
+                    pos["durum"] = f"⏰ Timeout-BE (+{kar:.1f}$)"
+                    save_data(data)
+                    actioned.append({"ticker": ticker, "system": system, "action": "BE",
+                                     "unrealized_kar": round(kar, 2), "age_hours": round(age_hours, 1)})
+                    print(f"[TIMEOUT-BE] {system}:{ticker} → BE'de bekliyor (+{kar:.1f}$)")
+
+                elif action == 'close':
+                    # ZARARDA → kapat, kapanan tabloya ekle (SİSTEM-AWARE)
+                    binance_pnl = None
+                    binance_fee = None
+                    if system == "cab" and get_system_mode("cab") == "live":
+                        # Sadece live mod için Binance PNL çek
+                        try:
+                            acilis_str = pos.get("zaman_full", "") or pos.get("acilis", "")
+                            if acilis_str:
+                                dt = datetime.strptime(acilis_str[:16], "%Y-%m-%d %H:%M")
+                                dt_utc = dt - timedelta(hours=3)
+                                start_ms = int(dt_utc.timestamp() * 1000) - 60000
+                                pnl_result = fetch_binance_realized_pnl(ticker, start_ms)
+                                if pnl_result.get("success") and pnl_result.get("count", 0) > 0:
+                                    binance_pnl = pnl_result.get("net_pnl")
+                                    binance_fee = pnl_result.get("fee", 0)
+                        except Exception as e:
+                            print(f"[BINANCE-PNL ERR] {ticker} timeout: {e}")
+
+                    closed = {
+                        "ticker": ticker, "giris": pos["giris"],
+                        "marj": pos.get("marj", 100), "lev": pos.get("lev", 10),
+                        "sonuc": "⏰ Timeout", "kar": round(kar, 2),
+                        "tp1_kar": 0, "tp2_kar": 0, "trail_kar": round(kar, 2),
+                        "tp1_kar_added": False, "tp2_kar_added": False,
+                        "hh_pct": pos.get("hh_pct", 0),
+                        "atr_skor": pos.get("atr_skor", 1.0),
+                        "kapat_oran": pos.get("kapat_oran", 60),
+                        "acilis": pos.get("zaman_full", "") or pos.get("acilis", ""),
+                        "kapanis": now_tr(),
+                        "binance_pnl": binance_pnl, "binance_fee": binance_fee,
+                        "market_regime": pos.get("market_regime"),
+                        "market_detail": pos.get("market_detail"),
+                        "system": pos.get("system", f"{system.upper()} v?"),
+                        "system_code": system,
+                        "shadow": (system == "ram" or get_system_mode(system) == "shadow"),
+                    }
+                    # SİSTEM-AWARE — doğru listeye ekle
+                    closed_key = _sys_key(system, "closed_positions")
+                    if closed_key not in data:
+                        data[closed_key] = []
+                    data[closed_key].append(closed)
+                    del data[open_key][ticker]
+                    save_data(data)
+                    actioned.append({"ticker": ticker, "system": system, "action": "CLOSE",
+                                     "kar": round(kar, 2), "age_hours": round(age_hours, 1)})
+                    print(f"[TIMEOUT-CLOSE] {system}:{ticker} → kapatıldı ({kar:+.1f}$)")
+                    # SİSTEM-AWARE auto-trigger
+                    check_auto_pause_triggers(system)
+                    check_auto_reduce_max_pos(system)
 
     except Exception as e:
         errors.append(f"global: {e}")
@@ -3316,35 +3673,42 @@ async def update_position_highs_lows():
             updated_open = 0
             updated_skipped = 0
 
-            # Açık pozisyonlar için
-            for ticker in list(data["open_positions"].keys()):
-                pos = data["open_positions"][ticker]
-                zaman_ms = parse_zaman_to_ms(pos.get("zaman_full", ""))
-                if not zaman_ms:
+            # v6.7.4: SİMETRİ — Hem CAB hem RAM açık pozisyonlar
+            for system in ["cab", "ram"]:
+                open_key = _sys_key(system, "open_positions")
+                positions = data.get(open_key, {})
+                for ticker in list(positions.keys()):
+                    pos = positions[ticker]
+                    zaman_str = pos.get("zaman_full", "") or pos.get("acilis", "")
+                    zaman_ms = parse_zaman_to_ms(zaman_str)
+                    if not zaman_ms:
+                        continue
+
+                    max_high, min_low = get_high_low_since(ticker, zaman_ms)
+                    if max_high is None:
+                        continue
+
+                    giris = pos.get("giris", 0)
+                    if giris <= 0:
+                        continue
+
+                    # HH% güncelle
+                    hh_pct = (max_high - giris) / giris * 100.0
+                    old_hh = pos.get("hh_pct", 0)
+                    if hh_pct > old_hh:
+                        pos["hh_pct"] = round(hh_pct, 2)
+                        updated_open += 1
+
+                    # max_seen ve min_seen kaydet
+                    pos["max_seen"] = max_high
+                    pos["min_seen"] = min_low
+
+            # v6.7.4: SİMETRİ — Hem CAB hem RAM kaçırılan sinyaller
+            for system in ["cab", "ram"]:
+                skip_key = _sys_key(system, "skipped_signals")
+                if skip_key not in data:
                     continue
-
-                max_high, min_low = get_high_low_since(ticker, zaman_ms)
-                if max_high is None:
-                    continue
-
-                giris = pos["giris"]
-                if giris <= 0:
-                    continue
-
-                # HH% güncelle
-                hh_pct = (max_high - giris) / giris * 100.0
-                old_hh = pos.get("hh_pct", 0)
-                if hh_pct > old_hh:
-                    pos["hh_pct"] = round(hh_pct, 2)
-                    updated_open += 1
-
-                # max_seen ve min_seen kaydet (gerçek poz için, ekstra bilgi)
-                pos["max_seen"] = max_high
-                pos["min_seen"] = min_low
-
-            # Kaçırılan sinyaller için
-            if "skipped_signals" in data:
-                for s in data["skipped_signals"]:
+                for s in data[skip_key]:
                     zaman_ms = parse_zaman_to_ms(s.get("zaman", ""))
                     if not zaman_ms:
                         continue
@@ -3359,7 +3723,7 @@ async def update_position_highs_lows():
 
                     # max_seen ve min_seen güncelle
                     old_max = s.get("max_seen", 0)
-                    old_min = s.get("min_seen", float('inf'))
+                    old_min = s.get("min_seen", float("inf"))
 
                     if max_high > old_max:
                         s["max_seen"] = max_high
@@ -3430,6 +3794,7 @@ async def startup():
     asyncio.create_task(recovery_loop())  # v6.7: auto-recovery
     asyncio.create_task(virtual_skipped_loop())  # v6.7: skipped sanal takip
     asyncio.create_task(emergency_stop_check_loop())  # v6.7.2: Pine alarm yedeği
+    asyncio.create_task(stop_watchdog_loop())  # v6.7.4: LIVE — Binance stop emri kontrolü
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -3666,6 +4031,24 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 </div>
 
 <!-- Mod genel bilgi + Üst Performans Kartları -->
+<!-- v6.7.4: Bot/Binance Uyumsuzluk Banner -->
+<div id="divergenceAlert" style="display:none;background:#7f1d1d;color:#fee2e2;padding:12px 16px;margin:8px 0;border-radius:8px;border-left:4px solid #dc2626;font-size:13px">
+  <div style="font-weight:700;margin-bottom:4px">⚠️ Bot/Binance Uyumsuzluk Tespit Edildi</div>
+  <div id="divergenceContent">—</div>
+</div>
+
+<!-- v6.7.4: Sistem Uyarıları Banner -->
+<div id="warningsAlert" style="display:none;background:#78350f;color:#fef3c7;padding:12px 16px;margin:8px 0;border-radius:8px;border-left:4px solid #f59e0b;font-size:13px">
+  <div style="font-weight:700;margin-bottom:6px">📋 Sistem Uyarıları</div>
+  <div id="warningsContent">—</div>
+</div>
+
+<!-- v6.7.4: CAB vs RAM Karşılaştırma Box -->
+<div id="compareBox" style="display:none;background:#0c4a6e;color:#e0f2fe;padding:12px 16px;margin:8px 0;border-radius:8px;border-left:4px solid #0891b2;font-size:12px">
+  <div style="font-weight:700;margin-bottom:8px;color:#67e8f9">⚖️ CAB vs RAM Karşılaştırma (Son 7 Gün)</div>
+  <div id="compareContent">—</div>
+</div>
+
 <div class="topActionBar">
   <!-- Sol: Butonlar -->
   <div class="topActionLeft">
@@ -3868,6 +4251,13 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 
 <!-- RAM Panel — TIPATIP AYNI yapı -->
 <div id="panelRam" class="sysPanel">
+<!-- v6.7.4: RAM Özel Stats Bar -->
+<div id="ramStatsBar" style="display:none;background:#451a03;color:#fef3c7;padding:8px 12px;border-radius:8px;margin:8px 0;border-left:3px solid #f59e0b;font-size:11px">
+  <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center" id="ramStatsContent">
+    <span>—</span>
+  </div>
+</div>
+
   <!-- Mode Toggle -->
   <div class="modeBox">
     <div>
@@ -4553,6 +4943,210 @@ async function loadData(){
   }
 }
 
+
+// v6.7.4: Bot/Binance uyumsuzluk tespiti (frontend heuristic)
+function detectDivergence(){
+  const alertEl = document.getElementById('divergenceAlert');
+  if(!alertEl) return;
+  const suspects = new Set();
+  const now = Date.now();
+
+  // Hem CAB hem RAM closed listesi
+  const allClosed = (DATA.closed_positions||[]).concat(DATA.ram_closed_positions||[]);
+  for(const c of allClosed.slice(-30)){
+    if(!c.kapanis) continue;
+    try{
+      const kapanis = new Date(c.kapanis.replace(' ','T')+':00+03:00');
+      const hoursAgo = (now - kapanis.getTime()) / 3600000;
+      if(hoursAgo > 24) continue;
+      // Şüpheli: Timeout sonuçlu + kar neredeyse 0 (+- 0.5$) + binance_pnl yok
+      if(c.sonuc && c.sonuc.includes('Timeout') && Math.abs(c.kar||0) < 0.5 && c.binance_pnl == null){
+        suspects.add(c.ticker);
+      }
+    }catch(e){}
+  }
+
+  if(suspects.size === 0){
+    alertEl.style.display = 'none';
+    return;
+  }
+  alertEl.style.display = 'block';
+  const list = [...suspects];
+  document.getElementById('divergenceContent').innerHTML =
+    `Son 24 saatte <b>${list.length} pozisyon</b> "Timeout +0$" olarak kapanmış — Binance'te hala açık olabilir!<br>`+
+    `Şüpheli: ${list.map(t=>'<code style="background:#0f172a;padding:2px 6px;border-radius:3px;margin:0 2px">'+t+'</code>').join('')}`;
+}
+
+// v6.7.4: Genel sistem uyarıları
+function checkWarnings(){
+  const alertEl = document.getElementById('warningsAlert');
+  if(!alertEl) return;
+  const warns = [];
+
+  // 1) Açık pozları kontrol — uzun süre açık olanlar
+  for(const sys of ['cab','ram']){
+    const openKey = sys==='cab' ? 'open_positions' : 'ram_open_positions';
+    const positions = DATA[openKey] || {};
+    for(const [ticker, pos] of Object.entries(positions)){
+      if(pos.tp1_hit || pos.timeout_be) continue;
+      try{
+        const ts = pos.zaman_full || pos.acilis || '';
+        if(!ts) continue;
+        const dt = new Date(ts.replace(' ','T')+':00+03:00');
+        const hoursOpen = (Date.now() - dt.getTime()) / 3600000;
+        if(hoursOpen > 24){
+          warns.push('⏰ '+sys.toUpperCase()+':'+ticker+' '+hoursOpen.toFixed(1)+' saat açık (TP1 hit yok)');
+        }
+      }catch(e){}
+    }
+  }
+
+  // 2) Pause durumu
+  if(DATA.pause_state && DATA.pause_state.paused){
+    warns.push('🛑 CAB pause modda: '+(DATA.pause_state.reason_text||DATA.pause_state.reason||'?'));
+  }
+  if(DATA.ram_pause_state && DATA.ram_pause_state.paused){
+    warns.push('🛑 RAM pause modda: '+(DATA.ram_pause_state.reason_text||DATA.ram_pause_state.reason||'?'));
+  }
+
+  // 3) Emergency stop logu var mı?
+  const emergLog = DATA.emergency_stop_log || [];
+  if(emergLog.length > 0){
+    const last = emergLog[emergLog.length-1];
+    const lastDate = new Date((last.zaman||'').replace(' ','T')+':00+03:00');
+    const hoursAgo = (Date.now() - lastDate.getTime()) / 3600000;
+    if(hoursAgo < 24){
+      warns.push('⚡ Son 24 saatte '+emergLog.filter(l => {
+        try{ const d=new Date((l.zaman||'').replace(' ','T')+':00+03:00');
+             return (Date.now()-d.getTime())/3600000 < 24; }catch(e){return false}
+      }).length+' emergency stop tetiklendi (Pine bug?)');
+    }
+  }
+
+  if(warns.length === 0){
+    alertEl.style.display = 'none';
+    return;
+  }
+  alertEl.style.display = 'block';
+  document.getElementById('warningsContent').innerHTML = warns.map(w => '• '+w).join('<br>');
+}
+
+// v6.7.4: CAB vs RAM detaylı karşılaştırma
+function renderCompare(){
+  const box = document.getElementById('compareBox');
+  if(!box) return;
+
+  const cabClosed = DATA.closed_positions || [];
+  const ramClosed = DATA.ram_closed_positions || [];
+
+  if(cabClosed.length === 0 && ramClosed.length === 0){
+    box.style.display = 'none';
+    return;
+  }
+  box.style.display = 'block';
+
+  // Son 7 gün filtrele
+  const d7 = new Date(); d7.setDate(d7.getDate()-7);
+  const d7str = d7.toISOString().slice(0,16).replace('T',' ');
+  const cab7 = cabClosed.filter(c => c.kapanis && c.kapanis >= d7str);
+  const ram7 = ramClosed.filter(c => c.kapanis && c.kapanis >= d7str);
+
+  // Bugün
+  const today = (new Date(Date.now()+3*3600000)).toISOString().slice(0,10);
+  const cabBugun = cabClosed.filter(c => c.kapanis && c.kapanis.startsWith(today));
+  const ramBugun = ramClosed.filter(c => c.kapanis && c.kapanis.startsWith(today));
+
+  const sumKar = arr => arr.reduce((s,c) => s + (c.binance_pnl != null ? c.binance_pnl : (c.kar||0)), 0);
+  const wr = arr => arr.length ? (arr.filter(c => (c.binance_pnl != null ? c.binance_pnl : c.kar) > 0).length / arr.length * 100).toFixed(0) : 0;
+  const fmtKar = v => {
+    const c = v > 0 ? '#4ade80' : (v < 0 ? '#f87171' : '#e5e7eb');
+    return '<span style="color:'+c+';font-weight:700">'+(v>=0?'+':'')+'$'+v.toFixed(0)+'</span>';
+  };
+
+  const html = `
+    <table style="width:100%;border-collapse:collapse;font-size:11px">
+      <thead><tr style="background:#075985">
+        <th style="padding:6px;text-align:left;border:1px solid #0e7490">Metrik</th>
+        <th style="padding:6px;text-align:center;border:1px solid #0e7490;color:#86efac">CAB</th>
+        <th style="padding:6px;text-align:center;border:1px solid #0e7490;color:#fcd34d">RAM</th>
+      </tr></thead>
+      <tbody>
+        <tr><td style="padding:5px;border:1px solid #0e7490">Bugün net</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">${fmtKar(sumKar(cabBugun))}</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">${fmtKar(sumKar(ramBugun))}</td></tr>
+        <tr><td style="padding:5px;border:1px solid #0e7490">Bugün poz</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">${cabBugun.length}</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">${ramBugun.length}</td></tr>
+        <tr><td style="padding:5px;border:1px solid #0e7490">7 gün net</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">${fmtKar(sumKar(cab7))}</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">${fmtKar(sumKar(ram7))}</td></tr>
+        <tr><td style="padding:5px;border:1px solid #0e7490">7 gün WR</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">%${wr(cab7)} (${cab7.length} poz)</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">%${wr(ram7)} (${ram7.length} poz)</td></tr>
+        <tr><td style="padding:5px;border:1px solid #0e7490">Tüm zamanlar net</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">${fmtKar(sumKar(cabClosed))}</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">${fmtKar(sumKar(ramClosed))}</td></tr>
+        <tr><td style="padding:5px;border:1px solid #0e7490">Toplam WR</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">%${wr(cabClosed)} (${cabClosed.length} poz)</td>
+            <td style="padding:5px;border:1px solid #0e7490;text-align:center">%${wr(ramClosed)} (${ramClosed.length} poz)</td></tr>
+      </tbody>
+    </table>
+  `;
+  document.getElementById('compareContent').innerHTML = html;
+}
+
+
+// v6.7.4: RAM özel stats bar — RAM aktifken görünür
+function renderRamStatsBar(){
+  const bar = document.getElementById('ramStatsBar');
+  const content = document.getElementById('ramStatsContent');
+  if(!bar || !content) return;
+
+  const ramClosed = DATA.ram_closed_positions || [];
+  const ramOpen = DATA.ram_open_positions || {};
+
+  // Veri yoksa gizle
+  if(ramClosed.length === 0 && Object.keys(ramOpen).length === 0){
+    bar.style.display = 'none';
+    return;
+  }
+
+  // Sonuç dağılımı
+  let tp1Count = 0, tp2Count = 0, stopCount = 0, trailCount = 0, emergencyCount = 0;
+  let bigWins = 0, bigWinSum = 0;  // 50+ kazanç
+  ramClosed.forEach(c => {
+    const sonuc = c.sonuc || '';
+    if(sonuc.includes('TP1+TP2+Stop')) tp2Count++;
+    else if(sonuc.includes('TP1+Trail')) trailCount++;
+    else if(sonuc.includes('TP1+Stop')) tp1Count++;
+    else if(sonuc.includes('Stop')) stopCount++;
+    if(c.emergency_stop) emergencyCount++;
+    if((c.kar||0) >= 50){
+      bigWins++;
+      bigWinSum += c.kar;
+    }
+  });
+
+  bar.style.display = 'block';
+  content.innerHTML =
+    '<span><b style="color:#fbbf24">RAM Detay:</b></span>' +
+    '<span>Açık: <b style="color:#fcd34d">'+Object.keys(ramOpen).length+'</b></span>' +
+    '<span>TP1+TP2: <b style="color:#86efac">'+tp2Count+'</b></span>' +
+    '<span>TP1+Stop: <b style="color:#a3e635">'+tp1Count+'</b></span>' +
+    '<span>TP1+Trail: <b style="color:#67e8f9">'+trailCount+'</b></span>' +
+    '<span>Stop: <b style="color:#fca5a5">'+stopCount+'</b></span>' +
+    (emergencyCount > 0 ? '<span>⚡Bot: <b style="color:#fca5a5">'+emergencyCount+'</b></span>' : '') +
+    (bigWins > 0 ? '<span>🚀 50$+ Kazanç: <b style="color:#4ade80">'+bigWins+' poz, +$'+bigWinSum.toFixed(0)+'</b></span>' : '');
+}
+
+// v6.7.4: Tab badge'leri (CAB ve RAM açık poz sayısı) — mevcut elementlere
+function updateTabBadges(){
+  const cabBadge = document.getElementById('cabBadge');
+  const ramBadge = document.getElementById('ramBadge');
+  if(cabBadge) cabBadge.textContent = Object.keys(DATA.open_positions || {}).length;
+  if(ramBadge) ramBadge.textContent = Object.keys(DATA.ram_open_positions || {}).length;
+}
+
 function render(){
   // Auto-Recovery UI güncelle
   updateRecoveryUI('cab');
@@ -4580,6 +5174,12 @@ function render(){
     DATA.ram_max_pos_state || {},
     DATA.ram_mode || 'shadow'
   );
+  // v6.7.4: Eski özellikler geri eklendi
+  detectDivergence();
+  checkWarnings();
+  renderCompare();
+  updateTabBadges();
+  renderRamStatsBar();
   // Üst banner mode'lar
   applyTopMode();
 }
