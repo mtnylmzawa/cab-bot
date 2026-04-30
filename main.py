@@ -498,6 +498,11 @@ async def emergency_stop_check_loop():
                                 "system_code": system,
                                 "market_regime": pos.get("market_regime"),
                                 "market_detail": pos.get("market_detail"),
+                                # v6.7.8: Pine v15.2/v14.2
+                                "hibrit_kademe": pos.get("hibrit_kademe"),
+                                "saat_tr": pos.get("saat_tr"),
+                                "atr_stop_carpan": pos.get("atr_stop_carpan"),
+                                "btc_ema_change_pct": pos.get("btc_ema_change_pct"),
                                 # v6.7.7: market snapshot (açılış + kapanış)
                                 "market_snapshot_acilis": pos.get("market_snapshot_acilis"),
                                 "market_snapshot_kapanis": capture_market_snapshot(),
@@ -1571,6 +1576,11 @@ def parse_giris(msg):
             "rs_spread": float(kv.get("RS", 0)),  # v6.5: RAM için göreceli güç spread
             "market_regime": _parse_field(msg, "MktRej"),  # v6.7: market rejim
             "market_detail": _parse_market_detail(msg),    # v6.7: detay
+            # v6.7.8: Pine v15.2/v14.2 alanları
+            "hibrit_kademe": _parse_field(msg, "Kademe"),
+            "saat_tr": _parse_field_num(msg, "SaatTR"),
+            "atr_stop_carpan": _parse_field_num(msg, "AtrSX"),
+            "btc_ema_change_pct": _parse_field_num(msg, "BtcEMA%"),
         }
     except Exception as e:
         print(f"[PARSE ERR GIRIS] {e}")
@@ -2836,6 +2846,21 @@ def _parse_field(msg, key):
     except Exception:
         return None
 
+def _parse_field_num(msg, key):
+    """Alarm mesajından 'key:N.NN' şeklinde sayı çıkar. v6.7.8: kademe ve saat için."""
+    try:
+        import re as _re
+        m = _re.search(rf"{key}:([\-\d\.]+)", msg)
+        if m:
+            try:
+                return float(m.group(1))
+            except (ValueError, TypeError):
+                return None
+        return None
+    except Exception:
+        return None
+
+
 def _parse_market_detail(msg):
     """USDTD:X|BTCD:Y|OTHD:Z|ETHBTC:W şeklindeki detayı parse eder."""
     try:
@@ -2906,6 +2931,11 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
             "kapat_oran": parsed.get("kapat_oran", 50),
             "market_regime": parsed.get("market_regime"),
             "market_detail": parsed.get("market_detail"),
+            # v6.7.8: Pine v15.2/v14.2
+            "hibrit_kademe": parsed.get("hibrit_kademe"),
+            "saat_tr": parsed.get("saat_tr"),
+            "atr_stop_carpan": parsed.get("atr_stop_carpan"),
+            "btc_ema_change_pct": parsed.get("btc_ema_change_pct"),
             "system": system_tag,
             "system_code": system_code,
             # Sanal sonuç takip alanları (ileride doldurulur)
@@ -2942,6 +2972,11 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
             "kapat_oran": parsed.get("kapat_oran", 50),
             "market_regime": parsed.get("market_regime"),
             "market_detail": parsed.get("market_detail"),
+            # v6.7.8: Pine v15.2/v14.2
+            "hibrit_kademe": parsed.get("hibrit_kademe"),
+            "saat_tr": parsed.get("saat_tr"),
+            "atr_stop_carpan": parsed.get("atr_stop_carpan"),
+            "btc_ema_change_pct": parsed.get("btc_ema_change_pct"),
             "system": system_tag,
             "system_code": system_code,
             "virtual_result": "BEKLENIYOR",
@@ -2975,6 +3010,11 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
         # v6.7 market regime (Pine mesajından gelirse)
         "market_regime": _parse_field(msg, "MktRej"),
         "market_detail": _parse_market_detail(msg),
+        # v6.7.8: Pine v15.2/v14.2 yeni alanlar
+        "hibrit_kademe": _parse_field(msg, "Kademe"),  # GEVSEK | NORMAL | SIKI
+        "saat_tr": _parse_field_num(msg, "SaatTR"),  # 0-23
+        "atr_stop_carpan": _parse_field_num(msg, "AtrSX"),  # 0.5/0.7/1.0 (RAM only)
+        "btc_ema_change_pct": _parse_field_num(msg, "BtcEMA%"),  # CAB only
         # v6.7.7: AÇILIŞ market snapshot (sayısal BTC/ETH/ETH-BTC)
         "market_snapshot_acilis": capture_market_snapshot(),
     }
@@ -3107,6 +3147,16 @@ def shadow_handle_stop_or_trail(msg, system_tag, kind="STOP", system_code=None):
         "system_code": system_code,
         "market_regime": pos.get("market_regime"),
         "market_detail": pos.get("market_detail"),
+        # v6.7.8: Pine v15.2/v14.2
+        "hibrit_kademe": pos.get("hibrit_kademe"),
+        "saat_tr": pos.get("saat_tr"),
+        "atr_stop_carpan": pos.get("atr_stop_carpan"),
+        "btc_ema_change_pct": pos.get("btc_ema_change_pct"),
+        # v6.7.8: Pine v15.2/v14.2 yeni alanlar
+        "hibrit_kademe": pos.get("hibrit_kademe"),
+        "saat_tr": pos.get("saat_tr"),
+        "atr_stop_carpan": pos.get("atr_stop_carpan"),
+        "btc_ema_change_pct": pos.get("btc_ema_change_pct"),
         # v6.7.7: Açılış + Kapanış market snapshot (sayısal BTC/ETH/ETH-BTC)
         "market_snapshot_acilis": pos.get("market_snapshot_acilis"),
         "market_snapshot_kapanis": capture_market_snapshot(),
@@ -3290,6 +3340,11 @@ async def webhook(req: Request):
             # v6.7: market regime ve sistem etiketi
             "market_regime": parsed.get("market_regime"),
             "market_detail": parsed.get("market_detail"),
+            # v6.7.8: Pine v15.2/v14.2
+            "hibrit_kademe": parsed.get("hibrit_kademe"),
+            "saat_tr": parsed.get("saat_tr"),
+            "atr_stop_carpan": parsed.get("atr_stop_carpan"),
+            "btc_ema_change_pct": parsed.get("btc_ema_change_pct"),
             "system": system_tag,
             "system_code": system_code,
         }
@@ -3440,6 +3495,10 @@ async def webhook(req: Request):
         # v6.7: market regime + system bilgileri pos'tan al
         if isinstance(closed, dict):
             closed.setdefault("market_regime", pos.get("market_regime") if isinstance(pos, dict) else None)
+            closed.setdefault("hibrit_kademe", pos.get("hibrit_kademe") if isinstance(pos, dict) else None)
+            closed.setdefault("saat_tr", pos.get("saat_tr") if isinstance(pos, dict) else None)
+            closed.setdefault("atr_stop_carpan", pos.get("atr_stop_carpan") if isinstance(pos, dict) else None)
+            closed.setdefault("btc_ema_change_pct", pos.get("btc_ema_change_pct") if isinstance(pos, dict) else None)
             closed.setdefault("market_detail", pos.get("market_detail") if isinstance(pos, dict) else None)
             closed.setdefault("system", pos.get("system", "CAB v14") if isinstance(pos, dict) else "CAB v14")
             closed.setdefault("system_code", pos.get("system_code", "cab") if isinstance(pos, dict) else "cab")
@@ -3527,6 +3586,10 @@ async def webhook(req: Request):
         # v6.7: market regime + system bilgileri pos'tan al
         if isinstance(closed, dict):
             closed.setdefault("market_regime", pos.get("market_regime") if isinstance(pos, dict) else None)
+            closed.setdefault("hibrit_kademe", pos.get("hibrit_kademe") if isinstance(pos, dict) else None)
+            closed.setdefault("saat_tr", pos.get("saat_tr") if isinstance(pos, dict) else None)
+            closed.setdefault("atr_stop_carpan", pos.get("atr_stop_carpan") if isinstance(pos, dict) else None)
+            closed.setdefault("btc_ema_change_pct", pos.get("btc_ema_change_pct") if isinstance(pos, dict) else None)
             closed.setdefault("market_detail", pos.get("market_detail") if isinstance(pos, dict) else None)
             closed.setdefault("system", pos.get("system", "CAB v14") if isinstance(pos, dict) else "CAB v14")
             closed.setdefault("system_code", pos.get("system_code", "cab") if isinstance(pos, dict) else "cab")
@@ -3736,6 +3799,11 @@ async def timeout_scan_once():
                         "binance_pnl": binance_pnl, "binance_fee": binance_fee,
                         "market_regime": pos.get("market_regime"),
                         "market_detail": pos.get("market_detail"),
+                        # v6.7.8: Pine v15.2/v14.2
+                        "hibrit_kademe": pos.get("hibrit_kademe"),
+                        "saat_tr": pos.get("saat_tr"),
+                        "atr_stop_carpan": pos.get("atr_stop_carpan"),
+                        "btc_ema_change_pct": pos.get("btc_ema_change_pct"),
                         # v6.7.7: market snapshot
                         "market_snapshot_acilis": pos.get("market_snapshot_acilis"),
                         "market_snapshot_kapanis": capture_market_snapshot(),
