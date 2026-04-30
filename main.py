@@ -4099,6 +4099,13 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 </div>
 
 <!-- CAB Panel -->
+<!-- v6.7.5: CAB Özel Stats Bar (SİMETRİ) -->
+<div id="cabStatsBar" style="display:none;background:#052e16;color:#dcfce7;padding:8px 12px;border-radius:8px;margin:8px 0;border-left:3px solid #15803d;font-size:11px">
+  <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center" id="cabStatsContent">
+    <span>—</span>
+  </div>
+</div>
+
 <div id="panelCab" class="sysPanel active">
   <!-- Mode Toggle -->
   <div class="modeBox">
@@ -5096,29 +5103,33 @@ function renderCompare(){
 }
 
 
-// v6.7.4: RAM özel stats bar — RAM aktifken görünür
-function renderRamStatsBar(){
-  const bar = document.getElementById('ramStatsBar');
-  const content = document.getElementById('ramStatsContent');
+// v6.7.5: SİMETRİ — Hem CAB hem RAM için stats bar (genel fonksiyon)
+function renderSysStatsBar(sys){
+  const bar = document.getElementById(sys+'StatsBar');
+  const content = document.getElementById(sys+'StatsContent');
   if(!bar || !content) return;
 
-  const ramClosed = DATA.ram_closed_positions || [];
-  const ramOpen = DATA.ram_open_positions || {};
+  const closedKey = sys==='cab' ? 'closed_positions' : 'ram_closed_positions';
+  const openKey = sys==='cab' ? 'open_positions' : 'ram_open_positions';
+  const closed = DATA[closedKey] || [];
+  const open = DATA[openKey] || {};
 
   // Veri yoksa gizle
-  if(ramClosed.length === 0 && Object.keys(ramOpen).length === 0){
+  if(closed.length === 0 && Object.keys(open).length === 0){
     bar.style.display = 'none';
     return;
   }
 
-  // Sonuç dağılımı
+  // Sonuç dağılımı (her iki sistem aynı sonuç tipleri)
   let tp1Count = 0, tp2Count = 0, stopCount = 0, trailCount = 0, emergencyCount = 0;
   let bigWins = 0, bigWinSum = 0;  // 50+ kazanç
-  ramClosed.forEach(c => {
+  let timeoutCount = 0;
+  closed.forEach(c => {
     const sonuc = c.sonuc || '';
     if(sonuc.includes('TP1+TP2+Stop')) tp2Count++;
     else if(sonuc.includes('TP1+Trail')) trailCount++;
     else if(sonuc.includes('TP1+Stop')) tp1Count++;
+    else if(sonuc.includes('Timeout')) timeoutCount++;
     else if(sonuc.includes('Stop')) stopCount++;
     if(c.emergency_stop) emergencyCount++;
     if((c.kar||0) >= 50){
@@ -5127,14 +5138,19 @@ function renderRamStatsBar(){
     }
   });
 
+  // Etiket: CAB veya RAM
+  const label = sys.toUpperCase();
+  const labelColor = sys==='cab' ? '#86efac' : '#fbbf24';
+
   bar.style.display = 'block';
   content.innerHTML =
-    '<span><b style="color:#fbbf24">RAM Detay:</b></span>' +
-    '<span>Açık: <b style="color:#fcd34d">'+Object.keys(ramOpen).length+'</b></span>' +
+    '<span><b style="color:'+labelColor+'">'+label+' Detay:</b></span>' +
+    '<span>Açık: <b style="color:'+labelColor+'">'+Object.keys(open).length+'</b></span>' +
     '<span>TP1+TP2: <b style="color:#86efac">'+tp2Count+'</b></span>' +
     '<span>TP1+Stop: <b style="color:#a3e635">'+tp1Count+'</b></span>' +
     '<span>TP1+Trail: <b style="color:#67e8f9">'+trailCount+'</b></span>' +
     '<span>Stop: <b style="color:#fca5a5">'+stopCount+'</b></span>' +
+    (timeoutCount > 0 ? '<span>⏰Timeout: <b style="color:#fca5a5">'+timeoutCount+'</b></span>' : '') +
     (emergencyCount > 0 ? '<span>⚡Bot: <b style="color:#fca5a5">'+emergencyCount+'</b></span>' : '') +
     (bigWins > 0 ? '<span>🚀 50$+ Kazanç: <b style="color:#4ade80">'+bigWins+' poz, +$'+bigWinSum.toFixed(0)+'</b></span>' : '');
 }
@@ -5179,7 +5195,8 @@ function render(){
   checkWarnings();
   renderCompare();
   updateTabBadges();
-  renderRamStatsBar();
+  renderSysStatsBar('cab');
+  renderSysStatsBar('ram');
   // Üst banner mode'lar
   applyTopMode();
 }
