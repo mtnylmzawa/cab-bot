@@ -3206,8 +3206,8 @@ async def webhook(req: Request):
     
     # Prefix tespit (v6.7.1: alt versiyonları da algılar — CAB v14.1, RAM v15.1 vs)
     # Tag listesi: ana versiyonlar + alt versiyonlar (uzun tag'ler önce eşleşsin diye sıralı)
-    for tag, code_sys in [("CAB v14.1", "cab"), ("CAB v14", "cab"), ("CAB v13", "cab"),
-                          ("RAM v15.1", "ram"), ("RAM v15", "ram"), ("RAM v14", "ram")]:
+    for tag, code_sys in [("CAB v14.2", "cab"), ("CAB v14.1", "cab"), ("CAB v14", "cab"), ("CAB v13", "cab"),
+                          ("RAM v15.2", "ram"), ("RAM v15.1", "ram"), ("RAM v15", "ram"), ("RAM v14", "ram")]:
         if msg.startswith(f"{tag} TP1 |"):
             system_tag, system_code, msg_kind = tag, code_sys, "tp1"; break
         if msg.startswith(f"{tag} TP2 |"):
