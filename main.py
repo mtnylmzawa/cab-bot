@@ -4099,14 +4099,14 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 </div>
 
 <!-- CAB Panel -->
-<!-- v6.7.5: CAB Özel Stats Bar (SİMETRİ) -->
+<div id="panelCab" class="sysPanel active">
+<!-- v6.7.5: CAB Özel Stats Bar (SİMETRİ — panelCab İÇİNDE, RAM ile aynı yapı) -->
 <div id="cabStatsBar" style="display:none;background:#052e16;color:#dcfce7;padding:8px 12px;border-radius:8px;margin:8px 0;border-left:3px solid #15803d;font-size:11px">
   <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center" id="cabStatsContent">
     <span>—</span>
   </div>
 </div>
 
-<div id="panelCab" class="sysPanel active">
   <!-- Mode Toggle -->
   <div class="modeBox">
     <div>
