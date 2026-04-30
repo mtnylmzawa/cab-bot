@@ -498,6 +498,9 @@ async def emergency_stop_check_loop():
                                 "system_code": system,
                                 "market_regime": pos.get("market_regime"),
                                 "market_detail": pos.get("market_detail"),
+                                # v6.7.7: market snapshot (açılış + kapanış)
+                                "market_snapshot_acilis": pos.get("market_snapshot_acilis"),
+                                "market_snapshot_kapanis": capture_market_snapshot(),
                                 "binance_pnl": None, "binance_fee": None,
                                 "shadow": True,
                                 "emergency_stop": True,  # ⚠️ İşaretle
@@ -1217,6 +1220,70 @@ def binance_get_klines(symbol, interval="1m", limit=60):
             print(f"[KLINES ERR] {symbol} {interval}: {e}")
         return None
 
+def capture_market_snapshot():
+    """v6.7.7: Anlık BTC, ETH, ETH/BTC fiyatlarını Binance'ten çek.
+    Pozisyon açılış/kapanış anında çağrılır, sayısal kayıt amaçlı."""
+    try:
+        btc = binance_get_mark_price("BTCUSDT")
+        eth = binance_get_mark_price("ETHUSDT")
+        ethbtc_ratio = (eth / btc) if (btc and eth and btc > 0) else None
+
+        return {
+            "btc_price": round(btc, 2) if btc else None,
+            "eth_price": round(eth, 2) if eth else None,
+            "eth_btc_ratio": round(ethbtc_ratio, 6) if ethbtc_ratio else None,
+            "captured_at": now_tr(),
+            "source": "live",
+        }
+    except Exception as e:
+        print(f"[MARKET-SNAPSHOT ERR] {e}")
+        return None
+
+
+def fetch_historical_market_snapshot(timestamp_str):
+    """v6.7.7: Geçmiş bir zaman için BTC/ETH/ETH-BTC fiyatlarını çek.
+    timestamp_str: '2026-04-27 14:30' formatında TR saati.
+    Binance Klines API'sinden 1m mum verisi çeker."""
+    try:
+        if not timestamp_str:
+            return None
+        # TR saatini UTC'ye çevir
+        dt = datetime.strptime(timestamp_str[:16], "%Y-%m-%d %H:%M")
+        dt_utc = dt - timedelta(hours=3)
+        target_ms = int(dt_utc.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+        # 1m mum: o ana en yakın 5 dakika içindeki bar
+        start_ms = target_ms - 60000  # 1 dk önce
+        end_ms = target_ms + 240000   # 4 dk sonra
+
+        # BTCUSDT klines
+        btc_klines = client.klines(symbol="BTCUSDT", interval="1m",
+                                    startTime=start_ms, endTime=end_ms, limit=5)
+        eth_klines = client.klines(symbol="ETHUSDT", interval="1m",
+                                    startTime=start_ms, endTime=end_ms, limit=5)
+
+        if not btc_klines or not eth_klines:
+            return None
+
+        # İlk barın close fiyatını al (en yakın)
+        btc_price = float(btc_klines[0][4])  # Close index 4
+        eth_price = float(eth_klines[0][4])
+        ethbtc_ratio = eth_price / btc_price if btc_price > 0 else None
+
+        return {
+            "btc_price": round(btc_price, 2),
+            "eth_price": round(eth_price, 2),
+            "eth_btc_ratio": round(ethbtc_ratio, 6) if ethbtc_ratio else None,
+            "captured_at": timestamp_str,
+            "source": "historical",
+        }
+    except Exception as e:
+        print(f"[HISTORICAL-SNAPSHOT ERR] {timestamp_str}: {e}")
+        return None
+
+
+
+
 def get_high_low_since(symbol, since_ms, interval="1m"):
     """v6.4: Belirli bir zamandan beri görülen MAX high ve MIN low'u döndür.
     since_ms: milisaniye cinsinden timestamp
@@ -1759,6 +1826,62 @@ async def api_clear_old(req: Request):
         result[s] = {"removed": before - after, "remaining": after}
     save_data(data)
     return result
+
+@app.post("/api/migrate_market_snapshots")
+async def migrate_market_snapshots(req: Request = None):
+    """v6.7.7: Eski closed pozları için BTC/ETH/ETH-BTC fiyatlarını geri doldur.
+    Pozun acilis/kapanis zamanlarına göre Binance Klines'tan çekilir.
+    
+    Body: {"system": "cab|ram|both", "limit": 50}  (limit: kaç poz geri doldur)
+    Default: both, 100
+    """
+    body = {}
+    if req:
+        try:
+            body = await req.json()
+        except Exception:
+            pass
+    system = body.get("system", "both")
+    limit = int(body.get("limit", 100))
+
+    systems = [system] if system in ["cab", "ram"] else ["cab", "ram"]
+    result = {}
+
+    for s in systems:
+        closed_key = _sys_key(s, "closed_positions")
+        closed = data.get(closed_key, [])
+        # Snapshot eksik olanları (en son N tanesi)
+        candidates = [c for c in closed[-limit:] if not c.get("market_snapshot_acilis")]
+        result[s] = {"total_closed": len(closed), "missing": len(candidates), "filled": 0, "errors": 0}
+
+        for c in candidates:
+            try:
+                acilis_str = c.get("acilis")
+                kapanis_str = c.get("kapanis")
+                
+                if acilis_str and not c.get("market_snapshot_acilis"):
+                    snap = fetch_historical_market_snapshot(acilis_str)
+                    if snap:
+                        c["market_snapshot_acilis"] = snap
+                
+                if kapanis_str and not c.get("market_snapshot_kapanis"):
+                    snap = fetch_historical_market_snapshot(kapanis_str)
+                    if snap:
+                        c["market_snapshot_kapanis"] = snap
+                
+                if c.get("market_snapshot_acilis") or c.get("market_snapshot_kapanis"):
+                    result[s]["filled"] += 1
+                
+                # Rate limit (Binance Klines için saniye başı 6000 istek limit, ama nezaket)
+                import time
+                time.sleep(0.05)
+            except Exception as e:
+                print(f"[MIGRATE-SNAPSHOT ERR] {s}:{c.get('ticker')}: {e}")
+                result[s]["errors"] += 1
+
+    save_data(data)
+    return JSONResponse({"success": True, "result": result, "msg": f"{sum(r['filled'] for r in result.values())} poz geri dolduruldu"})
+
 
 @app.post("/api/clear_skipped")
 async def api_clear_skipped(req: Request = None):
@@ -2852,11 +2975,14 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
         # v6.7 market regime (Pine mesajından gelirse)
         "market_regime": _parse_field(msg, "MktRej"),
         "market_detail": _parse_market_detail(msg),
+        # v6.7.7: AÇILIŞ market snapshot (sayısal BTC/ETH/ETH-BTC)
+        "market_snapshot_acilis": capture_market_snapshot(),
     }
 
     data[open_key][ticker] = pos
     save_data(data)
-    print(f"[SHADOW:{system_code.upper()}:{system_tag}] GIRIS {ticker} @ {pos['giris']} | MR:{pos.get('market_regime')}")
+    snap = pos.get("market_snapshot_acilis") or {}
+    print(f"[SHADOW:{system_code.upper()}:{system_tag}] GIRIS {ticker} @ {pos['giris']} | MR:{pos.get('market_regime')} | BTC:{snap.get('btc_price')} ETH:{snap.get('eth_price')}")
     return {"status": "shadow_opened", "shadow": True, "system_tag": system_tag, "ticker": ticker}
 
 
@@ -2981,6 +3107,9 @@ def shadow_handle_stop_or_trail(msg, system_tag, kind="STOP", system_code=None):
         "system_code": system_code,
         "market_regime": pos.get("market_regime"),
         "market_detail": pos.get("market_detail"),
+        # v6.7.7: Açılış + Kapanış market snapshot (sayısal BTC/ETH/ETH-BTC)
+        "market_snapshot_acilis": pos.get("market_snapshot_acilis"),
+        "market_snapshot_kapanis": capture_market_snapshot(),
         # Shadow'da binance_pnl olmaz
         "binance_pnl": None, "binance_fee": None,
         "shadow": True,  # işaretle
@@ -3496,6 +3625,9 @@ async def timeout_scan_once():
                                 "system": pos.get("system", f"{system.upper()} v?"),
                                 "system_code": system,
                                 "market_regime": pos.get("market_regime"),
+                                # v6.7.7: market snapshot
+                                "market_snapshot_acilis": pos.get("market_snapshot_acilis"),
+                                "market_snapshot_kapanis": capture_market_snapshot(),
                                 "binance_pnl": None, "binance_fee": None,
                                 "shadow": True,
                                 "force_timeout": True,
@@ -3604,6 +3736,9 @@ async def timeout_scan_once():
                         "binance_pnl": binance_pnl, "binance_fee": binance_fee,
                         "market_regime": pos.get("market_regime"),
                         "market_detail": pos.get("market_detail"),
+                        # v6.7.7: market snapshot
+                        "market_snapshot_acilis": pos.get("market_snapshot_acilis"),
+                        "market_snapshot_kapanis": capture_market_snapshot(),
                         "system": pos.get("system", f"{system.upper()} v?"),
                         "system_code": system,
                         "shadow": (system == "ram" or get_system_mode(system) == "shadow"),
@@ -4057,6 +4192,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
     <button class="btn btn-purple btn-sm" onclick="openArchive()">📚 Arşiv</button>
     <button class="btn btn-orange btn-sm" onclick="archiveAndReset()">🧹 Arşivle + Temizle</button>
     <button class="btn btn-grey btn-sm" onclick="migratePnl()">🔥 Binance PNL Çek</button>
+    <button class="btn btn-sm" style="background:#0e7490" onclick="migrateMarketSnapshots()">📈 BTC/ETH Geri Doldur</button>
     <button class="btn btn-sm" style="background:#0891b2" onclick="downloadReport()">📊 Rapor İndir</button>
   </div>
   <!-- Sağ: COMBINE Performans Kartı (CAB + RAM TOPLAMI) -->
@@ -5882,6 +6018,33 @@ async function downloadReport(){
 }
 
 // ═══════════════ MIGRATE PNL (background, mevcut Patch 14.2 mantığı) ═══════════════
+
+// v6.7.7: Eski pozlar için BTC/ETH/ETH-BTC fiyatlarını geri doldur
+async function migrateMarketSnapshots(){
+  if(!confirm('Eski kapanmış pozlar için BTC ve ETH fiyatları Binance\'ten çekilecek. Bu birkaç dakika sürebilir. Devam?')){
+    return;
+  }
+  toast('📈 Market snapshot doldurma başladı...');
+  try {
+    const r = await fetch('/api/migrate_market_snapshots', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({system: 'both', limit: 200})
+    });
+    const j = await r.json();
+    if(j.success){
+      const cab = j.result.cab || {};
+      const ram = j.result.ram || {};
+      alert('✅ Tamamlandı!\n\nCAB: ' + (cab.filled||0) + '/' + (cab.missing||0) + ' poz dolduruldu\nRAM: ' + (ram.filled||0) + '/' + (ram.missing||0) + ' poz dolduruldu\n\nRaporu indirip tekrar atabilirsin.');
+      loadData();
+    } else {
+      alert('❌ Hata: ' + (j.error || 'bilinmeyen'));
+    }
+  } catch(e){
+    alert('❌ Hata: ' + e.message);
+  }
+}
+
 async function migratePnl(){
   const refreshExisting = confirm('Gerçek Binance PNL çek?\n\n• TAMAM: TÜM pozları yeniden hesapla\n• İPTAL: Sadece güncellenmemiş olanları çek');
   try{
