@@ -2498,15 +2498,22 @@ async def archive_and_reset(req: Request):
         "legacy_closed": len(snapshot["legacy_shadow"]["shadow_closed"]),
     }
 
-    # Reset (SİSTEM-AWARE)
+    # Reset (SİSTEM-AWARE) — v6.7.9: shadow modunda CAB açık pozlar da temizlenir
     if reset_cab:
-        # CAB: kapanmış + kaçırılan sinyaller sil (açık pozlar dokunulmaz, gerçek olabilir!)
         data[_sys_key("cab", "closed_positions")] = []
         data[_sys_key("cab", "skipped_signals")] = []
+        # v6.7.9: CAB shadow modunda ise açık pozlar da sanal — temizle
+        # Live modda KESİNLİKLE silme (gerçek pozlar olabilir)
+        if get_system_mode("cab") == "shadow":
+            data[_sys_key("cab", "open_positions")] = {}
+            print("[ARCHIVE] CAB shadow modda — açık pozlar da temizlendi (sanal)")
+        else:
+            print("[ARCHIVE] CAB live modda — açık pozlar KORUNDU (gerçek)")
     if reset_ram:
         data[_sys_key("ram", "closed_positions")] = []
         data[_sys_key("ram", "skipped_signals")] = []
-        data[_sys_key("ram", "open_positions")] = {}  # RAM açık pozlar sanaldır, sil
+        # RAM her zaman shadow (Pine v15.2 design)
+        data[_sys_key("ram", "open_positions")] = {}
         # legacy shadow temizlik
         data["shadow_positions"] = {}
         data["shadow_closed"] = []
@@ -4632,7 +4639,10 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
   <div class="modalBox" style="max-width:1000px">
     <button class="modalClose" onclick="closeArchDetail()">✕ Kapat</button>
     <h2 id="archDetailTitle">Arşiv Detay</h2>
-    <div id="archDetailContent" style="margin-top:14px">Yükleniyor...</div>
+    <div style="margin-top:8px">
+        <button id="archDownloadBtn" class="btn btn-sm" style="background:#0891b2;display:none" onclick="downloadCurrentArchive()">📥 Bu Arşivi İndir (JSON)</button>
+      </div>
+      <div id="archDetailContent" style="margin-top:14px">Yükleniyor...</div>
   </div>
 </div>
 
@@ -6000,6 +6010,11 @@ async function viewArchive(index){
     const r = await fetch('/api/archive_get/'+index);
     const j = await r.json();
     if(!j) {document.getElementById('archDetailContent').innerHTML='Veri yok'; return;}
+    
+    // v6.7.9: arşiv verisini sakla, indirme butonunu göster
+    _currentArchiveData = j;
+    const dlBtn = document.getElementById('archDownloadBtn');
+    if(dlBtn){ dlBtn.style.display='inline-block'; dlBtn.dataset.archIndex = index; }
 
     const cabClosed = j.cab?.closed_positions || [];
     const ramClosed = j.ram?.closed_positions || [];
@@ -6040,7 +6055,33 @@ async function viewArchive(index){
     document.getElementById('archDetailContent').innerHTML = '<div style="color:#f87171">Hata: '+e.message+'</div>';
   }
 }
-function closeArchDetail(){document.getElementById('archDetailModal').classList.remove('show');}
+function closeArchDetail(){
+  document.getElementById('archDetailModal').classList.remove('show');
+  const btn = document.getElementById('archDownloadBtn');
+  if(btn){ btn.style.display='none'; btn.dataset.archIndex=''; }
+}
+
+// v6.7.9: Aktif arşivi JSON olarak indir
+let _currentArchiveData = null;
+async function downloadCurrentArchive(){
+  if(!_currentArchiveData){
+    alert('Arşiv verisi yok, lütfen önce arşivi açın');
+    return;
+  }
+  try{
+    const blob = new Blob([JSON.stringify(_currentArchiveData, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const t = (_currentArchiveData.archived_at||'').replace(/[: ]/g,'-');
+    a.href = url;
+    a.download = `cab_ram_arsiv_${t}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('📥 Arşiv indirildi');
+  }catch(e){
+    alert('İndirme hatası: '+e.message);
+  }
+}
 
 function exportCSV(sys, type){
   let rows;
