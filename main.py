@@ -298,11 +298,13 @@ def schedule_max_pos_increase(system):
 
 
 async def stop_watchdog_loop():
-    """v6.7.4: LIVE KRİTİK — Her 5 dakikada bir Binance'te stop emirleri kontrol et.
+    """v6.8: LIVE KRİTİK — Her 5 dakikada bir Binance'te stop emirleri kontrol et.
     
     v6.5 silent stop fail krizinin sürekli koruması:
     Bot çalışırken bir poz var ama Binance'te stop emri yoksa,
     bu kritik bir durum — sahibi haberdar edilmeli ve ideale stop yeniden konulmalı.
+    
+    v6.8: CAB ve RAM her ikisi için sistem-aware kontrol.
     """
     import asyncio
     CHECK_INTERVAL = 300  # 5 dakika
@@ -313,60 +315,64 @@ async def stop_watchdog_loop():
         try:
             await asyncio.sleep(CHECK_INTERVAL)
             
-            # Sadece live mod için anlamlı
-            if get_system_mode("cab") != "live":
-                continue
-            
-            cab_open = data.get("open_positions", {})
-            if not cab_open:
-                continue
-            
-            problems = []
-            for ticker, pos in cab_open.items():
-                # Pos açıldıktan en az 30sn geçmiş olsun (race condition)
-                try:
-                    zaman_str = pos.get("zaman_full", "") or pos.get("acilis", "")
-                    if zaman_str:
-                        opn = datetime.strptime(zaman_str[:16], "%Y-%m-%d %H:%M")
-                        elapsed = (now_tr_dt() - opn).total_seconds()
-                        if elapsed < 60:
-                            continue
-                except Exception:
-                    pass
+            # Hem CAB hem RAM live ise her ikisini kontrol et
+            for sys in ["cab", "ram"]:
+                if get_system_mode(sys) != "live":
+                    continue
                 
-                has_stop = check_binance_stop(ticker)
-                if has_stop is False:  # Net olarak stop YOK
-                    problems.append(ticker)
-                    print(f"[STOP-WATCHDOG-ALARM] {ticker} pozisyonu var ama Binance'te STOP_MARKET emri YOK!")
-                    
-                    # Otomatik stop yeniden koy
+                open_key = _sys_key(sys, "open_positions")
+                sys_open = data.get(open_key, {})
+                if not sys_open:
+                    continue
+                
+                problems = []
+                for ticker, pos in sys_open.items():
+                    # Pos açıldıktan en az 30sn geçmiş olsun (race condition)
                     try:
-                        info = get_symbol_info(ticker)
-                        qty = binance_get_position_qty(ticker)
-                        stop_px = pos.get("current_stop") or pos.get("stop")
-                        if qty > 0 and stop_px and stop_px > 0:
-                            qty_rounded = round_qty(qty, info)
-                            sl_result = binance_stop_loss(ticker, qty_rounded, stop_px, info)
-                            if sl_result["success"]:
-                                pos["sl_order_id"] = sl_result.get("order_id")
-                                save_data(data)
-                                print(f"[STOP-WATCHDOG-FIX] {ticker} stop emri yeniden konuldu: {stop_px}")
-                            else:
-                                print(f"[STOP-WATCHDOG-ERR] {ticker} stop tekrar koyma başarısız: {sl_result.get('error')}")
-                    except Exception as e:
-                        print(f"[STOP-WATCHDOG-ERR] {ticker} fix denemesi hatası: {e}")
+                        zaman_str = pos.get("zaman_full", "") or pos.get("acilis", "")
+                        if zaman_str:
+                            opn = datetime.strptime(zaman_str[:16], "%Y-%m-%d %H:%M")
+                            elapsed = (now_tr_dt() - opn).total_seconds()
+                            if elapsed < 60:
+                                continue
+                    except Exception:
+                        pass
+                    
+                    has_stop = check_binance_stop(ticker)
+                    if has_stop is False:  # Net olarak stop YOK
+                        problems.append(ticker)
+                        print(f"[STOP-WATCHDOG-ALARM:{sys.upper()}] {ticker} pozisyonu var ama Binance'te STOP_MARKET emri YOK!")
+                        
+                        # Otomatik stop yeniden koy
+                        try:
+                            info = get_symbol_info(ticker)
+                            qty = binance_get_position_qty(ticker)
+                            stop_px = pos.get("current_stop") or pos.get("stop")
+                            if qty > 0 and stop_px and stop_px > 0:
+                                qty_rounded = round_qty(qty, info)
+                                sl_result = binance_stop_loss(ticker, qty_rounded, stop_px, info)
+                                if sl_result["success"]:
+                                    pos["sl_order_id"] = sl_result.get("order_id")
+                                    save_data(data)
+                                    print(f"[STOP-WATCHDOG-FIX:{sys.upper()}] {ticker} stop emri yeniden konuldu: {stop_px}")
+                                else:
+                                    print(f"[STOP-WATCHDOG-ERR:{sys.upper()}] {ticker} stop tekrar koyma başarısız: {sl_result.get('error')}")
+                        except Exception as e:
+                            print(f"[STOP-WATCHDOG-ERR:{sys.upper()}] {ticker} fix denemesi hatası: {e}")
             
-            if problems:
-                # Log kayıt
-                if "stop_watchdog_log" not in data:
-                    data["stop_watchdog_log"] = []
-                data["stop_watchdog_log"].append({
-                    "zaman": now_tr(),
-                    "problems": problems,
-                })
-                if len(data["stop_watchdog_log"]) > 50:
-                    data["stop_watchdog_log"] = data["stop_watchdog_log"][-50:]
-                save_data(data)
+                if problems:
+                    # Log kayıt — sistem-aware
+                    log_key = "stop_watchdog_log"  # Tek log, sistem etiketli
+                    if log_key not in data:
+                        data[log_key] = []
+                    data[log_key].append({
+                        "zaman": now_tr(),
+                        "system": sys.upper(),
+                        "problems": problems,
+                    })
+                    if len(data[log_key]) > 50:
+                        data[log_key] = data[log_key][-50:]
+                    save_data(data)
         except Exception as e:
             print(f"[stop_watchdog_loop ERR] {e}")
 
@@ -1673,7 +1679,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.7 — Dual System Edition (CAB+RAM symmetric)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions()} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.8 — Dual System Edition (CAB+RAM symmetric)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions("cab")} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -1731,7 +1737,7 @@ async def test_binance():
     all_ok = all("✅" in str(v) for k, v in results.items() if k.endswith("_status"))
     results["SONUC"] = "🟢 TÜM TESTLER BAŞARILI — Gerçek mod için hazır!" if all_ok else "🔴 BAZI TESTLER BAŞARISIZ — Kontrol et!"
     results["test_mode"] = TEST_MODE
-    results["max_positions"] = get_max_positions()
+    results["max_positions"] = get_max_positions("cab")
     results["timeout_hours"] = TIMEOUT_HOURS
 
     return JSONResponse(results)
@@ -1994,7 +2000,7 @@ async def export_report():
     
     return JSONResponse({
         "report_generated_at": now_tr(),
-        "version": "v6.7 Dual System (symmetric, mode toggle, archive)",
+        "version": "v6.8 Live-Ready Hibrit (CAB v14.3 + RAM v15.3)",
         "config": {
             "cab_max_positions": get_max_positions("cab"),
             "ram_max_positions": get_max_positions("ram"),
@@ -2358,6 +2364,14 @@ async def api_set_max_pos(req: Request):
 
 
 # ═══════════════ v6.7: YENİ ENDPOINT'LER ═══════════════
+# ============ VERSION ============
+APP_VERSION = "v6.8 Live-Ready Hibrit (CAB v14.3 + RAM v15.3)"
+
+@app.get("/api/version")
+async def get_version():
+    return {"version": APP_VERSION}
+
+
 @app.get("/api/mode_status")
 async def get_mode_status():
     """v6.7: Hem CAB hem RAM için mode durumu"""
@@ -2499,6 +2513,7 @@ async def archive_and_reset(req: Request):
     }
 
     # Reset (SİSTEM-AWARE) — v6.7.9: shadow modunda CAB açık pozlar da temizlenir
+    # v6.8: MAX_POS state ve pause state de reset edilir
     if reset_cab:
         data[_sys_key("cab", "closed_positions")] = []
         data[_sys_key("cab", "skipped_signals")] = []
@@ -2509,15 +2524,27 @@ async def archive_and_reset(req: Request):
             print("[ARCHIVE] CAB shadow modda — açık pozlar da temizlendi (sanal)")
         else:
             print("[ARCHIVE] CAB live modda — açık pozlar KORUNDU (gerçek)")
+        # v6.8: Stop streak temiz başlangıç — CAB MAX_POS'u 7'ye geri al
+        data["max_pos_state"] = {"current": 7, "auto_reduced": False}
+        # Pause varsa kaldır (sıfır başlangıç)
+        data["pause_state"] = {"paused": False, "reason": None, "reason_text": None, "paused_at": None, "auto_triggered": False}
+        # Recovery state temiz
+        data["recovery_state"] = {}
+        print("[ARCHIVE] CAB MAX_POS=7'ye reset, pause kaldırıldı")
     if reset_ram:
         data[_sys_key("ram", "closed_positions")] = []
         data[_sys_key("ram", "skipped_signals")] = []
         # RAM her zaman shadow (Pine v15.2 design)
         data[_sys_key("ram", "open_positions")] = {}
+        # v6.8: RAM için de aynı reset
+        data["ram_max_pos_state"] = {"current": 7, "auto_reduced": False}
+        data["ram_pause_state"] = {"paused": False, "reason": None, "reason_text": None, "paused_at": None, "auto_triggered": False}
+        data["ram_recovery_state"] = {}
         # legacy shadow temizlik
         data["shadow_positions"] = {}
         data["shadow_closed"] = []
         data["shadow_skipped"] = []
+        print("[ARCHIVE] RAM MAX_POS=7'ye reset, pause kaldırıldı")
 
     save_data(data)
     return JSONResponse({
@@ -3206,8 +3233,8 @@ async def webhook(req: Request):
     
     # Prefix tespit (v6.7.1: alt versiyonları da algılar — CAB v14.1, RAM v15.1 vs)
     # Tag listesi: ana versiyonlar + alt versiyonlar (uzun tag'ler önce eşleşsin diye sıralı)
-    for tag, code_sys in [("CAB v14.2", "cab"), ("CAB v14.1", "cab"), ("CAB v14", "cab"), ("CAB v13", "cab"),
-                          ("RAM v15.2", "ram"), ("RAM v15.1", "ram"), ("RAM v15", "ram"), ("RAM v14", "ram")]:
+    for tag, code_sys in [("CAB v14.3", "cab"), ("CAB v14.2", "cab"), ("CAB v14.1", "cab"), ("CAB v14", "cab"), ("CAB v13", "cab"),
+                          ("RAM v15.3", "ram"), ("RAM v15.2", "ram"), ("RAM v15.1", "ram"), ("RAM v15", "ram"), ("RAM v14", "ram")]:
         if msg.startswith(f"{tag} TP1 |"):
             system_tag, system_code, msg_kind = tag, code_sys, "tp1"; break
         if msg.startswith(f"{tag} TP2 |"):
@@ -3243,23 +3270,15 @@ async def webhook(req: Request):
             return shadow_handle_stop_or_trail(msg, system_tag, "TRAIL", system_code)
 
     # LIVE MODE → canlı handler
-    # NOT: Şu an canlı handler sadece CAB için. RAM için canlı
-    # handler YAPILMADI (henüz test edilmemiş bir strateji).
-    # RAM mode="live" denerse uyarı veririz.
-    if system_code == "ram" and current_mode == "live":
-        print(f"[WARN] RAM live mode henüz test edilmedi — shadow'a düşürüyorum")
-        if msg_kind == "giris":
-            return shadow_handle_giris(msg, system_tag, system_code)
-        elif msg_kind == "tp1":
-            return shadow_handle_tp1(msg, system_tag, system_code)
-        elif msg_kind == "tp2":
-            return shadow_handle_tp2(msg, system_tag, system_code)
-        elif msg_kind == "stop":
-            return shadow_handle_stop_or_trail(msg, system_tag, "STOP", system_code)
-        elif msg_kind == "trail":
-            return shadow_handle_stop_or_trail(msg, system_tag, "TRAIL", system_code)
+    # v6.8: Hem CAB hem RAM için sistem-aware. Tek kod, iki sistem.
+    # Eskiden RAM live denenirse shadow'a düşürülüyordu — artık RAM Live destekli.
 
-    # === CAB LIVE MODE (mevcut kod) ===
+    # === SİSTEM-AWARE LIVE HANDLER (CAB + RAM) ===
+    # v6.8: open_key ve closed_key sistem-aware
+    open_key = _sys_key(system_code, "open_positions")
+    closed_key = _sys_key(system_code, "closed_positions")
+    skipped_key = _sys_key(system_code, "skipped_signals")
+
     # CAB v13/v14/v14.1 mesajı + cab_mode="live"
     # Eski kod "CAB v13 |" kontrolü yapıyor — onu bypass edip aynı kodu çalıştır
     if msg_kind == "giris":
@@ -3270,11 +3289,12 @@ async def webhook(req: Request):
         ticker = parsed["ticker"]
 
         # v6.6 Lite Patch 5: Pause kontrolü — bot pause'daysa yeni poz açma
-        if is_paused():
-            pi = get_pause_info()
+        # v6.8: explicit "cab" — live handler sadece CAB için
+        if is_paused(system_code):
+            pi = get_pause_info(system_code)
             if "skipped_signals" not in data:
-                data["skipped_signals"] = []
-            data["skipped_signals"].append({
+                data[skipped_key] = []
+            data[skipped_key].append({
                 "ticker": ticker,
                 "giris": parsed["giris"],
                 "stop": parsed["stop"],
@@ -3298,10 +3318,10 @@ async def webhook(req: Request):
         aktif_risk, gar_tp1, gar_to = count_active_risk()
         garantili = gar_tp1 + gar_to
 
-        if aktif_risk >= get_max_positions():
+        if aktif_risk >= get_max_positions(system_code):
             if "skipped_signals" not in data:
-                data["skipped_signals"] = []
-            data["skipped_signals"].append({
+                data[skipped_key] = []
+            data[skipped_key].append({
                 "ticker": ticker,
                 "giris": parsed["giris"],
                 "stop": parsed["stop"],
@@ -3313,16 +3333,22 @@ async def webhook(req: Request):
                 "kapat_oran": parsed["kapat_oran"],
                 "atr_skor": parsed["atr_skor"],
                 "zaman": now_tr(),
-                "sebep": f"Max {get_max_positions()} aktif risk dolu (+{garantili} garantili)"
+                "sebep": f"Max {get_max_positions(system_code)} aktif risk dolu (+{garantili} garantili)"
             })
-            if len(data["skipped_signals"]) > 50:
-                data["skipped_signals"] = data["skipped_signals"][-50:]
+            if len(data[skipped_key]) > 50:
+                data[skipped_key] = data[skipped_key][-50:]
             save_data(data)
-            print(f"[LIMIT] Aktif risk {aktif_risk}/{get_max_positions()} (+{gar_tp1} TP1 +{gar_to} TO-BE) — {ticker} atlandı (kaydedildi)")
+            print(f"[LIMIT] Aktif risk {aktif_risk}/{get_max_positions(system_code)} (+{gar_tp1} TP1 +{gar_to} TO-BE) — {ticker} atlandı (kaydedildi)")
             return {"status": "limit"}
-        if ticker in data["open_positions"]:
-            print(f"[DUP] {ticker} zaten açık")
+        if ticker in data[open_key]:
+            print(f"[DUP] {ticker} zaten {system_code.upper()}'da açık")
             return {"status": "duplicate"}
+
+        # v6.8: Çapraz sistem kontrolü — diğer sistem aynı sembolü live'da tutuyorsa uyarı
+        other_sys = "ram" if system_code == "cab" else "cab"
+        other_open_key = _sys_key(other_sys, "open_positions")
+        if ticker in data.get(other_open_key, {}) and get_system_mode(other_sys) == "live":
+            print(f"[CROSS-SYSTEM WARN] {ticker} {other_sys.upper()} live'da da açık — Binance pozları birleşecek, dikkat!")
 
         trade_result = None
         if not TEST_MODE:
@@ -3331,7 +3357,7 @@ async def webhook(req: Request):
                 print(f"[TRADE FAIL] {ticker} giriş başarısız!")
                 return {"status": "trade_failed"}
 
-        data["open_positions"][ticker] = {
+        data[open_key][ticker] = {
             "giris": trade_result["avg_price"] if (trade_result and trade_result["avg_price"] > 0) else parsed["giris"],
             "stop": parsed["stop"],
             "tp1": parsed["tp1"], "tp2": parsed["tp2"],
@@ -3352,11 +3378,13 @@ async def webhook(req: Request):
             "saat_tr": parsed.get("saat_tr"),
             "atr_stop_carpan": parsed.get("atr_stop_carpan"),
             "btc_ema_change_pct": parsed.get("btc_ema_change_pct"),
+            # v6.8: market snapshot açılış (live mode'da da gerekli)
+            "market_snapshot_acilis": capture_market_snapshot(),
             "system": system_tag,
             "system_code": system_code,
         }
         save_data(data)
-        print(f"{mode_tag} GIRIS: {ticker} | {parsed['giris']} | Marj:{parsed['marj']}$ | {parsed['lev']}x")
+        print(f"{mode_tag} GIRIS: {ticker} | {parsed['giris']} | Marj:{parsed['marj']}$ | {parsed['lev']}x | snap:cap")
         return {"status": "opened"}
 
     # === TP1 ===
@@ -3367,8 +3395,8 @@ async def webhook(req: Request):
         print(f"[PARSE] {parsed}")
         ticker = parsed["ticker"]
 
-        if is_recently_closed(ticker) and ticker not in data["open_positions"]:
-            for c in reversed(data["closed_positions"][-20:]):
+        if is_recently_closed(ticker) and ticker not in data[open_key]:
+            for c in reversed(data[closed_key][-20:]):
                 if c["ticker"] == ticker and not c.get("tp1_kar_added"):
                     pos_size = c["marj"] * c.get("lev", 10)
                     tp1_kar = round(pos_size * (parsed["kapat_oran"] / 100.0) * (parsed["tp1"] - c["giris"]) / c["giris"], 2)
@@ -3380,10 +3408,10 @@ async def webhook(req: Request):
                     return {"status": "reconciled"}
             return {"status": "already_reconciled"}
 
-        if ticker not in data["open_positions"]:
+        if ticker not in data[open_key]:
             return {"status": "not_found"}
 
-        pos = data["open_positions"][ticker]
+        pos = data[open_key][ticker]
 
         if not TEST_MODE:
             execute_tp1_close(ticker, pos)
@@ -3411,8 +3439,8 @@ async def webhook(req: Request):
         print(f"[PARSE] {parsed}")
         ticker = parsed["ticker"]
 
-        if is_recently_closed(ticker) and ticker not in data["open_positions"]:
-            for c in reversed(data["closed_positions"][-20:]):
+        if is_recently_closed(ticker) and ticker not in data[open_key]:
+            for c in reversed(data[closed_key][-20:]):
                 if c["ticker"] == ticker and not c.get("tp2_kar_added"):
                     pos_size = c["marj"] * c.get("lev", 10)
                     tp2_kar = round(pos_size * 0.25 * (parsed["tp2"] - c["giris"]) / c["giris"], 2)
@@ -3426,10 +3454,10 @@ async def webhook(req: Request):
                     return {"status": "reconciled"}
             return {"status": "already_reconciled"}
 
-        if ticker not in data["open_positions"]:
+        if ticker not in data[open_key]:
             return {"status": "not_found"}
 
-        pos = data["open_positions"][ticker]
+        pos = data[open_key][ticker]
 
         if not TEST_MODE:
             execute_tp2_close(ticker, pos)
@@ -3455,10 +3483,10 @@ async def webhook(req: Request):
         if is_recently_closed(ticker):
             print(f"[WARN] TRAIL: {ticker} zaten kapalı")
             return {"status": "already_closed"}
-        if ticker not in data["open_positions"]:
+        if ticker not in data[open_key]:
             return {"status": "not_found"}
 
-        pos = data["open_positions"][ticker]
+        pos = data[open_key][ticker]
 
         if not TEST_MODE:
             execute_full_close(ticker, "TRAIL")
@@ -3507,14 +3535,17 @@ async def webhook(req: Request):
             closed.setdefault("atr_stop_carpan", pos.get("atr_stop_carpan") if isinstance(pos, dict) else None)
             closed.setdefault("btc_ema_change_pct", pos.get("btc_ema_change_pct") if isinstance(pos, dict) else None)
             closed.setdefault("market_detail", pos.get("market_detail") if isinstance(pos, dict) else None)
-            closed.setdefault("system", pos.get("system", "CAB v14") if isinstance(pos, dict) else "CAB v14")
-            closed.setdefault("system_code", pos.get("system_code", "cab") if isinstance(pos, dict) else "cab")
-        data["closed_positions"].append(closed)
-        del data["open_positions"][ticker]
+            closed.setdefault("system", pos.get("system", system_tag) if isinstance(pos, dict) else system_tag)
+            closed.setdefault("system_code", pos.get("system_code", system_code) if isinstance(pos, dict) else system_code)
+            # v6.7.16: market snapshot eksikti — açılış pozdan, kapanış canlı
+            closed.setdefault("market_snapshot_acilis", pos.get("market_snapshot_acilis") if isinstance(pos, dict) else None)
+            closed.setdefault("market_snapshot_kapanis", capture_market_snapshot())
+        data[closed_key].append(closed)
+        del data[open_key][ticker]
         save_data(data)
         print(f"{mode_tag} TRAIL({parsed['tp_type']}): {ticker} | {sonuc} | dashboard:+{total_kar}$ binance:{binance_pnl}$")
-        check_auto_pause_triggers()  # v6.6 Lite Patch 5
-        check_auto_reduce_max_pos()   # v6.6 Lite Patch 8
+        check_auto_pause_triggers(system_code)  # v6.6 Lite Patch 5
+        check_auto_reduce_max_pos(system_code)   # v6.6 Lite Patch 8
         return {"status": "trail_closed"}
 
     # === STOP ===
@@ -3527,10 +3558,10 @@ async def webhook(req: Request):
 
         if is_recently_closed(ticker):
             return {"status": "already_closed"}
-        if ticker not in data["open_positions"]:
+        if ticker not in data[open_key]:
             return {"status": "not_found"}
 
-        pos = data["open_positions"][ticker]
+        pos = data[open_key][ticker]
 
         if not TEST_MODE:
             remaining = binance_get_position_qty(ticker)
@@ -3598,14 +3629,17 @@ async def webhook(req: Request):
             closed.setdefault("atr_stop_carpan", pos.get("atr_stop_carpan") if isinstance(pos, dict) else None)
             closed.setdefault("btc_ema_change_pct", pos.get("btc_ema_change_pct") if isinstance(pos, dict) else None)
             closed.setdefault("market_detail", pos.get("market_detail") if isinstance(pos, dict) else None)
-            closed.setdefault("system", pos.get("system", "CAB v14") if isinstance(pos, dict) else "CAB v14")
-            closed.setdefault("system_code", pos.get("system_code", "cab") if isinstance(pos, dict) else "cab")
-        data["closed_positions"].append(closed)
-        del data["open_positions"][ticker]
+            closed.setdefault("system", pos.get("system", system_tag) if isinstance(pos, dict) else system_tag)
+            closed.setdefault("system_code", pos.get("system_code", system_code) if isinstance(pos, dict) else system_code)
+            # v6.7.16: market snapshot eksikti — açılış pozdan, kapanış canlı
+            closed.setdefault("market_snapshot_acilis", pos.get("market_snapshot_acilis") if isinstance(pos, dict) else None)
+            closed.setdefault("market_snapshot_kapanis", capture_market_snapshot())
+        data[closed_key].append(closed)
+        del data[open_key][ticker]
         save_data(data)
         print(f"{mode_tag} STOP: {ticker} | {sonuc} | dashboard:{total_kar}$ binance:{binance_pnl}$")
-        check_auto_pause_triggers()  # v6.6 Lite Patch 5
-        check_auto_reduce_max_pos()   # v6.6 Lite Patch 8
+        check_auto_pause_triggers(system_code)  # v6.6 Lite Patch 5
+        check_auto_reduce_max_pos(system_code)   # v6.6 Lite Patch 8
         return {"status": "stopped"}
 
     else:
@@ -4000,7 +4034,7 @@ async def update_position_highs_lows():
 async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
-    print(f"[BOOT] CAB Bot v6.7 Patch 1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions()} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
+    print(f"[BOOT] CAB Bot v6.8 Patch 1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions("cab")} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
     asyncio.create_task(recovery_loop())  # v6.7: auto-recovery
     asyncio.create_task(virtual_skipped_loop())  # v6.7: skipped sanal takip
     asyncio.create_task(emergency_stop_check_loop())  # v6.7.2: Pine alarm yedeği
@@ -4022,7 +4056,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.7 — Dual System Dashboard</title>
+<title>CAB Bot v6.8 — Dual System Dashboard</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:10px}
@@ -4210,7 +4244,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.7 — Dual System</h1>
+<h1>🤖 CAB Bot v6.8 — Dual System</h1>
 <div class="muted">⟳ <span id="lastUpdate">—</span> | Veri 10sn'de yenilenir</div>
 
 <!-- Üst Fiyat Çubuğu (Coin fiyatları) -->
