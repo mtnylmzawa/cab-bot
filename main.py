@@ -1679,7 +1679,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.8 — Dual System Edition (CAB+RAM symmetric)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions("cab")} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.8 — Dual System Edition (CAB+RAM symmetric)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions('cab')} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -4034,7 +4034,7 @@ async def update_position_highs_lows():
 async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
-    print(f"[BOOT] CAB Bot v6.8 Patch 1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions("cab")} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
+    print(f"[BOOT] CAB Bot v6.8 Patch 1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions('cab')} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
     asyncio.create_task(recovery_loop())  # v6.7: auto-recovery
     asyncio.create_task(virtual_skipped_loop())  # v6.7: skipped sanal takip
     asyncio.create_task(emergency_stop_check_loop())  # v6.7.2: Pine alarm yedeği
