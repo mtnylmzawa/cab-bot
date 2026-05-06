@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from binance.um_futures import UMFutures
 from binance.error import ClientError
@@ -2365,7 +2365,7 @@ async def api_set_max_pos(req: Request):
 
 # ═══════════════ v6.7: YENİ ENDPOINT'LER ═══════════════
 # ============ VERSION ============
-APP_VERSION = "v6.8 Live-Ready Hibrit (CAB v14.3 + RAM v15.3)"
+APP_VERSION = "v6.8 Patch 2 — Async Webhook (CAB v14.3 + RAM v15.3)"
 
 @app.get("/api/version")
 async def get_version():
@@ -3216,9 +3216,23 @@ def shadow_handle_stop_or_trail(msg, system_tag, kind="STOP", system_code=None):
 
 
 @app.post("/webhook")
-async def webhook(req: Request):
+async def webhook(req: Request, background_tasks: BackgroundTasks):
+    """v6.8 Patch 2: ASYNC BACKGROUND TASK
+    
+    SORUN: Webhook handler 4-7 saniye sürüyordu (Binance API call'lar, PnL fetch).
+           TradingView 5sn'de timeout yapıyor → %47 alarm fail.
+    
+    ÇÖZÜM: Webhook hemen "queued" döner, asıl iş arka planda yapılır.
+    Sonuç: TradingView memnun (instant 200 OK), bot işine devam.
+    """
     msg = (await req.body()).decode()
-    print(f"[ALERT] {msg}")
+    print(f"[ALERT-RECV] {msg[:120]}")
+    background_tasks.add_task(process_webhook_sync, msg)
+    return {"status": "queued"}
+
+
+def process_webhook_sync(msg: str):
+    """v6.8 Patch 2: Webhook'un asıl işi — arka planda çalışır, timeout etkilemez."""
     mode_tag = "[CANLI]" if not TEST_MODE else "[TEST]"
 
     # ═══════════════ v6.7: MODE-AWARE ROUTING ═══════════════
