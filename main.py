@@ -1850,7 +1850,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.8 Patch 5 — Mega Update (CAB+RAM symmetric)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions('cab')} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.8 Patch 6 — Piyasa Skoru + Saat Veriye Dayalı (CAB v14.5 + RAM v15.5)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions('cab')} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -2171,7 +2171,7 @@ async def export_report():
     
     return JSONResponse({
         "report_generated_at": now_tr(),
-        "version": "v6.8 Patch 5 — Mega Update (CAB v14.4 + RAM v15.4)",
+        "version": "v6.8 Patch 6 — Piyasa Skoru + Saat Veriye Dayalı (CAB v14.5 + RAM v15.5)",
         "config": {
             "cab_max_positions": get_max_positions("cab"),
             "ram_max_positions": get_max_positions("ram"),
@@ -4478,7 +4478,7 @@ async def startup():
         except Exception as e:
             print(f"[DYNAMIC-MAX-ERR] {e}")
     
-    print(f"[BOOT] CAB Bot v6.8 Patch 5 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions('cab')} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON | Dynamic:{DYNAMIC_MAX_POS_ENABLED}")
+    print(f"[BOOT] CAB Bot v6.8 Patch 6 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions('cab')} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON | Dynamic:{DYNAMIC_MAX_POS_ENABLED}")
     asyncio.create_task(recovery_loop())  # v6.7: auto-recovery
     asyncio.create_task(virtual_skipped_loop())  # v6.7: skipped sanal takip
     asyncio.create_task(emergency_stop_check_loop())  # v6.7.2: Pine alarm yedeği
@@ -4651,7 +4651,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.8 Patch 5 — Mega Update Dashboard</title>
+<title>CAB Bot v6.8 Patch 6 — Piyasa Skoru Dashboard</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:10px}
@@ -4839,7 +4839,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.8 Patch 5 — Mega Update</h1>
+<h1>🤖 CAB Bot v6.8 Patch 6 — Piyasa Skoru + Saat Veriye Dayalı</h1>
 <div class="muted">⟳ <span id="lastUpdate">—</span> | Veri 10sn'de yenilenir</div>
 
 <!-- Üst Fiyat Çubuğu (Coin fiyatları) -->
