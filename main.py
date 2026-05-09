@@ -1668,11 +1668,11 @@ _KIND_BY_TAG_SUFFIX = {
     "TRAIL": "trail",
 }
 
-# Sistem tag'leri — uzun olanlar önce eşleşsin (CAB v14.3 < CAB v14)
+# Sistem tag'leri — uzun olanlar önce eşleşsin (CAB v14.5 < CAB v14.3 < CAB v14)
 _SYSTEM_TAGS = [
-    ("CAB v14.4", "cab"), ("CAB v14.3", "cab"), ("CAB v14.2", "cab"), ("CAB v14.1", "cab"),
+    ("CAB v14.5", "cab"), ("CAB v14.4", "cab"), ("CAB v14.3", "cab"), ("CAB v14.2", "cab"), ("CAB v14.1", "cab"),
     ("CAB v14", "cab"), ("CAB v13", "cab"),
-    ("RAM v15.4", "ram"), ("RAM v15.3", "ram"), ("RAM v15.2", "ram"), ("RAM v15.1", "ram"),
+    ("RAM v15.5", "ram"), ("RAM v15.4", "ram"), ("RAM v15.3", "ram"), ("RAM v15.2", "ram"), ("RAM v15.1", "ram"),
     ("RAM v15", "ram"), ("RAM v14", "ram"),
 ]
 
