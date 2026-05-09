@@ -521,6 +521,13 @@ async def emergency_stop_check_loop():
                                 "saat_tr": pos.get("saat_tr"),
                                 "atr_stop_carpan": pos.get("atr_stop_carpan"),
                                 "btc_ema_change_pct": pos.get("btc_ema_change_pct"),
+        # v6.8 Patch 6: Pine v14.5/v15.5
+        "piyasa_skor": pos.get("piyasa_skor"),
+        "rr_saat": pos.get("rr_saat"),
+        "rr_piyasa_ek": pos.get("rr_piyasa_ek"),
+        "rr_vol_ek": pos.get("rr_vol_ek"),
+        "rr_final": pos.get("rr_final"),
+        "btc_vol_4h": pos.get("btc_vol_4h"),
                                 # v6.7.7: market snapshot (açılış + kapanış)
                                 "market_snapshot_acilis": pos.get("market_snapshot_acilis"),
                                 "market_snapshot_kapanis": capture_market_snapshot(),
@@ -1736,6 +1743,13 @@ def parse_giris(msg):
             "saat_tr": _parse_field_num(msg, "SaatTR"),
             "atr_stop_carpan": _parse_field_num(msg, "AtrSX"),
             "btc_ema_change_pct": _parse_field_num(msg, "BtcEMA%"),
+            # v6.8 Patch 6: Pine v14.5/v15.5 PIYASA SKOR + EK RR PUAN
+            "piyasa_skor": _parse_field_num(msg, "Skor"),
+            "rr_saat": _parse_field_num(msg, "RRsaat"),
+            "rr_piyasa_ek": _parse_field_num(msg, "RRpiyasa"),
+            "rr_vol_ek": _parse_field_num(msg, "RRvol"),
+            "rr_final": _parse_field_num(msg, "RRfinal"),
+            "btc_vol_4h": _parse_field_num(msg, "BtcVol4h"),
         }
     except Exception as e:
         print(f"[PARSE ERR GIRIS] {e}")
@@ -2522,7 +2536,129 @@ async def api_set_max_pos(req: Request):
 
 # ═══════════════ v6.7: YENİ ENDPOINT'LER ═══════════════
 # ============ VERSION ============
-APP_VERSION = "v6.8 Patch 5 — Mega Update (CAB v14.4 + RAM v15.4)"
+APP_VERSION = "v6.8 Patch 6 — Piyasa Skoru + Saat Veriye Dayalı (CAB v14.5 + RAM v15.5)"
+
+# ═══════════════════════════════════════════════════════════════════════
+# v6.8 Patch 6: Açık pozları "doğru saat × doğru piyasa × doğru RR" 
+# kombinasyonunda mı açıldı kontrol eden endpoint
+# ═══════════════════════════════════════════════════════════════════════
+# v14.5/v15.5 saat tanımları (Pine'la SENKRON)
+GEVSEK_SAATLER = [0, 4, 7, 8, 11, 14]
+SIKI_SAATLER = [5, 6, 10, 12, 13, 15, 16, 22, 23]
+
+def _kademe_for_saat(saat):
+    if saat is None: return "?"
+    saat = int(saat)
+    if saat in GEVSEK_SAATLER: return "GEVSEK"
+    if saat in SIKI_SAATLER: return "SIKI"
+    return "NORMAL"
+
+def _validate_pos(pos, ticker):
+    """Bir pozun açıldığı durum doğru mu kontrol et"""
+    saat = pos.get("saat_tr")
+    kademe = pos.get("hibrit_kademe", "?")
+    skor = pos.get("piyasa_skor")
+    rr_saat = pos.get("rr_saat")
+    rr_piy = pos.get("rr_piyasa_ek", 0) or 0
+    rr_vol = pos.get("rr_vol_ek", 0) or 0
+    rr_final = pos.get("rr_final")
+    btc_vol = pos.get("btc_vol_4h")
+    md = pos.get("market_detail", {}) or {}
+    
+    # Beklenen kademe (saate göre)
+    beklenen_kademe = _kademe_for_saat(saat)
+    kademe_uyumlu = (kademe == beklenen_kademe) if (kademe != "?" and saat is not None) else None
+    
+    # Skor durumu
+    if skor is None:
+        skor_durum = "?"
+    elif skor >= 1.5:
+        skor_durum = "EN_IYI"  # USDTD UP + BTCD DOWN
+    elif skor >= 0.5:
+        skor_durum = "IYI"
+    elif skor >= -0.5:
+        skor_durum = "ORTA"
+    elif skor >= -1.2:
+        skor_durum = "KOTU"
+    else:
+        skor_durum = "EN_KOTU"  # USDTD DOWN + BTCD UP
+    
+    # Genel doğrulama
+    if kademe_uyumlu is False:
+        durum = "MISMATCH"  # Pine ile uyumsuz
+        renk = "red"
+        mesaj = f"⚠️ Saat {saat:02d}h için Pine'da {kademe} ama olması gereken {beklenen_kademe}"
+    elif skor_durum in ["EN_KOTU", "KOTU"] and rr_final is not None and rr_final < 1.5:
+        durum = "RISKY"  # Kötü piyasada düşük RR
+        renk = "orange"
+        mesaj = f"⚠️ Kötü piyasa skor={skor} ama RR={rr_final} düşük"
+    elif skor_durum == "EN_IYI" and kademe == "GEVSEK":
+        durum = "PERFECT"  # En iyi kombinasyon
+        renk = "green"
+        mesaj = f"💎 ALTIN: en iyi piyasa + gevşek saat"
+    elif rr_final is not None and rr_final >= 1.0:
+        durum = "OK"
+        renk = "blue"
+        mesaj = f"✅ Normal kombo"
+    else:
+        durum = "OLD"  # Eski sistem
+        renk = "gray"
+        mesaj = "Patch 6 öncesi açıldı (yeni alan yok)"
+    
+    return {
+        "ticker": ticker,
+        "saat_tr": saat,
+        "kademe": kademe,
+        "kademe_beklenen": beklenen_kademe,
+        "kademe_uyumlu": kademe_uyumlu,
+        "piyasa_skor": skor,
+        "skor_durum": skor_durum,
+        "market_detail": md,
+        "rr_saat": rr_saat,
+        "rr_piyasa_ek": rr_piy,
+        "rr_vol_ek": rr_vol,
+        "rr_final": rr_final,
+        "btc_vol_4h": btc_vol,
+        "durum": durum,
+        "renk": renk,
+        "mesaj": mesaj,
+        "acilis": pos.get("zaman") or pos.get("acilis"),
+        "giris": pos.get("giris"),
+        "stop": pos.get("stop"),
+        "tp1": pos.get("tp1"),
+    }
+
+@app.get("/api/pos_validation")
+async def pos_validation_endpoint():
+    """v6.8 Patch 6: Açık pozları kademe/skor/RR doğrulamasıyla göster"""
+    sonuc = {"cab": [], "ram": []}
+    for sistem in ["cab", "ram"]:
+        open_key = _sys_key(sistem, "open_positions")
+        for ticker, pos in data.get(open_key, {}).items():
+            sonuc[sistem].append(_validate_pos(pos, ticker))
+    
+    # Özet sayılar
+    ozet = {"perfect": 0, "ok": 0, "risky": 0, "mismatch": 0, "old": 0}
+    for liste in sonuc.values():
+        for v in liste:
+            d = v["durum"].lower()
+            if d == "perfect": ozet["perfect"] += 1
+            elif d == "ok": ozet["ok"] += 1
+            elif d == "risky": ozet["risky"] += 1
+            elif d == "mismatch": ozet["mismatch"] += 1
+            elif d == "old": ozet["old"] += 1
+    
+    return JSONResponse({
+        "version": APP_VERSION,
+        "now": now_tr(),
+        "ozet": ozet,
+        "cab": sonuc["cab"],
+        "ram": sonuc["ram"],
+        "config": {
+            "gevsek_saatler": GEVSEK_SAATLER,
+            "siki_saatler": SIKI_SAATLER,
+        }
+    })
 
 @app.get("/api/version")
 async def get_version():
@@ -3127,6 +3263,13 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
             "saat_tr": parsed.get("saat_tr"),
             "atr_stop_carpan": parsed.get("atr_stop_carpan"),
             "btc_ema_change_pct": parsed.get("btc_ema_change_pct"),
+            # v6.8 Patch 6: Pine v14.5/v15.5 PIYASA SKOR + EK RR PUAN
+            "piyasa_skor": parsed.get("piyasa_skor"),
+            "rr_saat": parsed.get("rr_saat"),
+            "rr_piyasa_ek": parsed.get("rr_piyasa_ek"),
+            "rr_vol_ek": parsed.get("rr_vol_ek"),
+            "rr_final": parsed.get("rr_final"),
+            "btc_vol_4h": parsed.get("btc_vol_4h"),
             "system": system_tag,
             "system_code": system_code,
             # Sanal sonuç takip alanları (ileride doldurulur)
@@ -3168,6 +3311,13 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
             "saat_tr": parsed.get("saat_tr"),
             "atr_stop_carpan": parsed.get("atr_stop_carpan"),
             "btc_ema_change_pct": parsed.get("btc_ema_change_pct"),
+            # v6.8 Patch 6: Pine v14.5/v15.5 PIYASA SKOR + EK RR PUAN
+            "piyasa_skor": parsed.get("piyasa_skor"),
+            "rr_saat": parsed.get("rr_saat"),
+            "rr_piyasa_ek": parsed.get("rr_piyasa_ek"),
+            "rr_vol_ek": parsed.get("rr_vol_ek"),
+            "rr_final": parsed.get("rr_final"),
+            "btc_vol_4h": parsed.get("btc_vol_4h"),
             "system": system_tag,
             "system_code": system_code,
             "virtual_result": "BEKLENIYOR",
@@ -3206,6 +3356,13 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
         "saat_tr": _parse_field_num(msg, "SaatTR"),  # 0-23
         "atr_stop_carpan": _parse_field_num(msg, "AtrSX"),  # 0.5/0.7/1.0 (RAM only)
         "btc_ema_change_pct": _parse_field_num(msg, "BtcEMA%"),  # CAB only
+        # v6.8 Patch 6: Pine v14.5/v15.5 PIYASA SKOR + EK RR PUAN sistemi
+        "piyasa_skor": _parse_field_num(msg, "Skor"),  # +2.0 ... -1.5
+        "rr_saat": _parse_field_num(msg, "RRsaat"),  # 1.0/1.1/1.2
+        "rr_piyasa_ek": _parse_field_num(msg, "RRpiyasa"),  # +0/+0.3/+0.5/+1.0
+        "rr_vol_ek": _parse_field_num(msg, "RRvol"),  # +0/+0.5/+1.0
+        "rr_final": _parse_field_num(msg, "RRfinal"),  # toplam RR eşiği
+        "btc_vol_4h": _parse_field_num(msg, "BtcVol4h"),  # %X.XX
         # v6.7.7: AÇILIŞ market snapshot (sayısal BTC/ETH/ETH-BTC)
         "market_snapshot_acilis": capture_market_snapshot(),
     }
@@ -3351,11 +3508,25 @@ def shadow_handle_stop_or_trail(msg, system_tag, kind="STOP", system_code=None):
         "saat_tr": pos.get("saat_tr"),
         "atr_stop_carpan": pos.get("atr_stop_carpan"),
         "btc_ema_change_pct": pos.get("btc_ema_change_pct"),
+        # v6.8 Patch 6: Pine v14.5/v15.5
+        "piyasa_skor": pos.get("piyasa_skor"),
+        "rr_saat": pos.get("rr_saat"),
+        "rr_piyasa_ek": pos.get("rr_piyasa_ek"),
+        "rr_vol_ek": pos.get("rr_vol_ek"),
+        "rr_final": pos.get("rr_final"),
+        "btc_vol_4h": pos.get("btc_vol_4h"),
         # v6.7.8: Pine v15.2/v14.2 yeni alanlar
         "hibrit_kademe": pos.get("hibrit_kademe"),
         "saat_tr": pos.get("saat_tr"),
         "atr_stop_carpan": pos.get("atr_stop_carpan"),
         "btc_ema_change_pct": pos.get("btc_ema_change_pct"),
+        # v6.8 Patch 6: Pine v14.5/v15.5
+        "piyasa_skor": pos.get("piyasa_skor"),
+        "rr_saat": pos.get("rr_saat"),
+        "rr_piyasa_ek": pos.get("rr_piyasa_ek"),
+        "rr_vol_ek": pos.get("rr_vol_ek"),
+        "rr_final": pos.get("rr_final"),
+        "btc_vol_4h": pos.get("btc_vol_4h"),
         # v6.7.7: Açılış + Kapanış market snapshot (sayısal BTC/ETH/ETH-BTC)
         "market_snapshot_acilis": pos.get("market_snapshot_acilis"),
         "market_snapshot_kapanis": capture_market_snapshot(),
@@ -3583,6 +3754,13 @@ def process_webhook_sync(msg: str):
             "saat_tr": parsed.get("saat_tr"),
             "atr_stop_carpan": parsed.get("atr_stop_carpan"),
             "btc_ema_change_pct": parsed.get("btc_ema_change_pct"),
+            # v6.8 Patch 6: Pine v14.5/v15.5 PIYASA SKOR + EK RR PUAN
+            "piyasa_skor": parsed.get("piyasa_skor"),
+            "rr_saat": parsed.get("rr_saat"),
+            "rr_piyasa_ek": parsed.get("rr_piyasa_ek"),
+            "rr_vol_ek": parsed.get("rr_vol_ek"),
+            "rr_final": parsed.get("rr_final"),
+            "btc_vol_4h": parsed.get("btc_vol_4h"),
             # v6.8: market snapshot açılış (live mode'da da gerekli)
             "market_snapshot_acilis": capture_market_snapshot(),
             "system": system_tag,
@@ -3745,6 +3923,13 @@ def process_webhook_sync(msg: str):
             # v6.7.16: market snapshot eksikti — açılış pozdan, kapanış canlı
             closed.setdefault("market_snapshot_acilis", pos.get("market_snapshot_acilis") if isinstance(pos, dict) else None)
             closed.setdefault("market_snapshot_kapanis", capture_market_snapshot())
+            # v6.8 Patch 6: Pine v14.5/v15.5 alanları (LIVE closed)
+            closed.setdefault("piyasa_skor", pos.get("piyasa_skor") if isinstance(pos, dict) else None)
+            closed.setdefault("rr_saat", pos.get("rr_saat") if isinstance(pos, dict) else None)
+            closed.setdefault("rr_piyasa_ek", pos.get("rr_piyasa_ek") if isinstance(pos, dict) else None)
+            closed.setdefault("rr_vol_ek", pos.get("rr_vol_ek") if isinstance(pos, dict) else None)
+            closed.setdefault("rr_final", pos.get("rr_final") if isinstance(pos, dict) else None)
+            closed.setdefault("btc_vol_4h", pos.get("btc_vol_4h") if isinstance(pos, dict) else None)
         data[closed_key].append(closed)
         del data[open_key][ticker]
         save_data(data)
@@ -3841,6 +4026,13 @@ def process_webhook_sync(msg: str):
             # v6.7.16: market snapshot eksikti — açılış pozdan, kapanış canlı
             closed.setdefault("market_snapshot_acilis", pos.get("market_snapshot_acilis") if isinstance(pos, dict) else None)
             closed.setdefault("market_snapshot_kapanis", capture_market_snapshot())
+            # v6.8 Patch 6: Pine v14.5/v15.5 alanları (LIVE closed)
+            closed.setdefault("piyasa_skor", pos.get("piyasa_skor") if isinstance(pos, dict) else None)
+            closed.setdefault("rr_saat", pos.get("rr_saat") if isinstance(pos, dict) else None)
+            closed.setdefault("rr_piyasa_ek", pos.get("rr_piyasa_ek") if isinstance(pos, dict) else None)
+            closed.setdefault("rr_vol_ek", pos.get("rr_vol_ek") if isinstance(pos, dict) else None)
+            closed.setdefault("rr_final", pos.get("rr_final") if isinstance(pos, dict) else None)
+            closed.setdefault("btc_vol_4h", pos.get("btc_vol_4h") if isinstance(pos, dict) else None)
         data[closed_key].append(closed)
         del data[open_key][ticker]
         save_data(data)
@@ -4052,6 +4244,13 @@ async def timeout_scan_once():
                         "saat_tr": pos.get("saat_tr"),
                         "atr_stop_carpan": pos.get("atr_stop_carpan"),
                         "btc_ema_change_pct": pos.get("btc_ema_change_pct"),
+        # v6.8 Patch 6: Pine v14.5/v15.5
+        "piyasa_skor": pos.get("piyasa_skor"),
+        "rr_saat": pos.get("rr_saat"),
+        "rr_piyasa_ek": pos.get("rr_piyasa_ek"),
+        "rr_vol_ek": pos.get("rr_vol_ek"),
+        "rr_final": pos.get("rr_final"),
+        "btc_vol_4h": pos.get("btc_vol_4h"),
                         # v6.7.7: market snapshot
                         "market_snapshot_acilis": pos.get("market_snapshot_acilis"),
                         "market_snapshot_kapanis": capture_market_snapshot(),
@@ -4288,6 +4487,156 @@ async def startup():
 
 
 # ============ DASHBOARD v6.1 PRO ============
+@app.get("/validation", response_class=HTMLResponse)
+async def validation_page():
+    """v6.8 Patch 6: Açık pozları kademe + skor + RR doğrulamasıyla göster"""
+    return """<!DOCTYPE html>
+<html lang="tr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🎯 Pozisyon Doğrulama Paneli</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:0;font-size:13px;line-height:1.5}
+.header{background:linear-gradient(90deg,#7c3aed,#a855f7);padding:14px 18px;border-bottom:3px solid #c4b5fd;position:sticky;top:0;z-index:100}
+.title{font-size:18px;color:#fff;font-weight:800;margin:0 0 4px}
+.subtitle{font-size:12px;color:#ede9fe}
+.content{padding:14px 18px}
+.ozet{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.ozet-card{background:#1e293b;padding:10px 14px;border-radius:6px;border-left:3px solid #6b7280;flex:1;min-width:130px}
+.ozet-card.perfect{border-left-color:#16a34a}
+.ozet-card.ok{border-left-color:#0891b2}
+.ozet-card.risky{border-left-color:#ca8a04}
+.ozet-card.mismatch{border-left-color:#dc2626}
+.ozet-card.old{border-left-color:#6b7280}
+.ozet-label{font-size:11px;color:#94a3b8}
+.ozet-value{font-size:18px;font-weight:700}
+.section{background:#1e293b;border-radius:8px;padding:14px;margin:10px 0;border-left:4px solid #a855f7}
+.section h2{margin:0 0 10px;font-size:15px}
+.pos-card{background:#0f172a;padding:10px 14px;border-radius:6px;margin:6px 0;border-left:3px solid #6b7280}
+.pos-card.green{border-left-color:#16a34a;background:#05231640}
+.pos-card.blue{border-left-color:#0891b2;background:#082f4940}
+.pos-card.orange{border-left-color:#ca8a04;background:#854d0e40}
+.pos-card.red{border-left-color:#dc2626;background:#7f1d1d40}
+.pos-card.gray{border-left-color:#6b7280;background:#1e293b}
+.pos-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px}
+.ticker{font-weight:700;font-size:14px;color:#fbbf24}
+.badge{padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase}
+.badge.GEVSEK{background:#16a34a;color:#fff}
+.badge.NORMAL{background:#0891b2;color:#fff}
+.badge.SIKI{background:#dc2626;color:#fff}
+.badge.\\?{background:#6b7280;color:#fff}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:6px;font-size:11px;margin-top:6px}
+.metric{background:#1e293b;padding:6px 8px;border-radius:4px}
+.metric-label{color:#94a3b8;font-size:10px;display:block}
+.metric-value{font-weight:600;color:#e5e7eb}
+.metric-value.good{color:#86efac}
+.metric-value.bad{color:#fca5a5}
+.metric-value.warn{color:#fbbf24}
+.mesaj{margin-top:8px;padding:6px 10px;background:#0a0e1a;border-radius:4px;font-size:11.5px;font-style:italic}
+.refresh{position:fixed;bottom:20px;right:20px;background:#7c3aed;color:#fff;border:none;padding:10px 16px;border-radius:50%;cursor:pointer;font-size:18px;width:48px;height:48px;box-shadow:0 4px 12px rgba(0,0,0,0.4)}
+.empty{text-align:center;color:#6b7280;padding:30px;font-style:italic}
+</style></head><body>
+
+<div class="header">
+  <h1 class="title">🎯 Pozisyon Doğrulama Paneli</h1>
+  <div class="subtitle"><span id="ver">yükleniyor...</span> · son güncelleme: <span id="now">-</span></div>
+</div>
+
+<div class="content">
+
+<div class="ozet" id="ozet"></div>
+
+<div class="section">
+  <h2 style="color:#67e8f9">🔵 CAB Açık Pozları</h2>
+  <div id="cab-list"><div class="empty">yükleniyor...</div></div>
+</div>
+
+<div class="section">
+  <h2 style="color:#fca5a5">🔴 RAM Açık Pozları</h2>
+  <div id="ram-list"><div class="empty">yükleniyor...</div></div>
+</div>
+
+<div class="section">
+  <h2 style="color:#fbbf24">📋 Pine v14.5/v15.5 Saat Tanımları</h2>
+  <div style="font-size:12px;line-height:1.8">
+    💎 <b style="color:#86efac">GEVŞEK saatler:</b> <span id="gevsek-saatler">-</span> (RR=1.0)<br>
+    🔥 <b style="color:#fca5a5">SIKI saatler:</b> <span id="siki-saatler">-</span> (RR=1.2)<br>
+    🟡 <b style="color:#7dd3fc">NORMAL saatler:</b> diğer tüm saatler (RR=1.1)
+  </div>
+</div>
+
+</div>
+
+<button class="refresh" onclick="load()">🔄</button>
+
+<script>
+async function load() {
+  try {
+    const r = await fetch('/api/pos_validation');
+    const d = await r.json();
+    
+    document.getElementById('ver').textContent = d.version || '?';
+    document.getElementById('now').textContent = d.now || '-';
+    
+    // Özet
+    const ozetEl = document.getElementById('ozet');
+    ozetEl.innerHTML = `
+      <div class="ozet-card perfect"><div class="ozet-label">💎 Perfect</div><div class="ozet-value">${d.ozet.perfect}</div></div>
+      <div class="ozet-card ok"><div class="ozet-label">✅ OK</div><div class="ozet-value">${d.ozet.ok}</div></div>
+      <div class="ozet-card risky"><div class="ozet-label">⚠️ Risky</div><div class="ozet-value">${d.ozet.risky}</div></div>
+      <div class="ozet-card mismatch"><div class="ozet-label">❌ Mismatch</div><div class="ozet-value">${d.ozet.mismatch}</div></div>
+      <div class="ozet-card old"><div class="ozet-label">📦 Old</div><div class="ozet-value">${d.ozet.old}</div></div>
+    `;
+    
+    // Saat listeleri
+    document.getElementById('gevsek-saatler').textContent = (d.config?.gevsek_saatler || []).map(h=>String(h).padStart(2,'0')+'h').join(', ');
+    document.getElementById('siki-saatler').textContent = (d.config?.siki_saatler || []).map(h=>String(h).padStart(2,'0')+'h').join(', ');
+    
+    renderList('cab-list', d.cab);
+    renderList('ram-list', d.ram);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function renderList(elId, list) {
+  const el = document.getElementById(elId);
+  if (!list || list.length === 0) {
+    el.innerHTML = '<div class="empty">Açık poz yok</div>';
+    return;
+  }
+  el.innerHTML = list.map(p => {
+    const md = p.market_detail || {};
+    const skorRenk = p.piyasa_skor === null ? 'gray' : (p.piyasa_skor >= 1.5 ? 'good' : (p.piyasa_skor >= 0 ? 'warn' : 'bad'));
+    const rrRenk = p.rr_final === null ? 'gray' : (p.rr_final <= 1.2 ? 'good' : (p.rr_final <= 1.7 ? 'warn' : 'bad'));
+    
+    return `<div class="pos-card ${p.renk}">
+      <div class="pos-header">
+        <span class="ticker">${p.ticker}</span>
+        <span class="badge ${p.kademe}">${p.kademe} (${p.saat_tr !== null ? String(p.saat_tr).padStart(2,'0')+'h' : '?'})</span>
+      </div>
+      <div class="metrics">
+        <div class="metric"><span class="metric-label">Piyasa Skor</span><span class="metric-value ${skorRenk}">${p.piyasa_skor ?? '?'}</span></div>
+        <div class="metric"><span class="metric-label">USDT.D</span><span class="metric-value">${md.usdtd || '?'}</span></div>
+        <div class="metric"><span class="metric-label">BTC.D</span><span class="metric-value">${md.btcd || '?'}</span></div>
+        <div class="metric"><span class="metric-label">RR Saat</span><span class="metric-value">${p.rr_saat ?? '?'}</span></div>
+        <div class="metric"><span class="metric-label">+ Piyasa</span><span class="metric-value warn">+${p.rr_piyasa_ek ?? 0}</span></div>
+        <div class="metric"><span class="metric-label">+ BTC Vol</span><span class="metric-value warn">+${p.rr_vol_ek ?? 0}</span></div>
+        <div class="metric"><span class="metric-label">RR FINAL</span><span class="metric-value ${rrRenk}">${p.rr_final ?? '?'}</span></div>
+        <div class="metric"><span class="metric-label">BTC Vol 4h</span><span class="metric-value">${p.btc_vol_4h ?? '?'}%</span></div>
+      </div>
+      <div class="mesaj">${p.mesaj}</div>
+    </div>`;
+  }).join('');
+}
+
+load();
+setInterval(load, 30000);  // 30sn'de bir yenile
+</script>
+
+</body></html>"""
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     """v6.7: Simetrik iki sistem (CAB + RAM) dashboard"""
