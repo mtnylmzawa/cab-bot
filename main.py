@@ -19,6 +19,18 @@ TIMEOUT_ABSOLUTE_HOURS = 24  # v6.4: mutlak limit — slot baskısı olmasa bile
 TIMEOUT_PRESSURE_THRESHOLD = 5  # v6.4: aktif_risk bu eşikten azsa timeout pas geç (slot bol)
 TIMEOUT_CHECK_INTERVAL_SEC = 300  # her 5 dakika
 
+# v6.8 Patch 5 (Adım 2): WEBHOOK CACHE + THROTTLE
+WEBHOOK_CACHE_TTL_SEC = 30      # Aynı mesaj 30 saniye içinde tekrar gelirse "duplicate"
+WEBHOOK_THROTTLE_SEC = 5         # Aynı ticker'a 5 saniye throttle (anti-storm)
+_webhook_cache = {}              # {msg_hash: timestamp}
+_ticker_throttle = {}            # {ticker: timestamp}
+
+# v6.8 Patch 5 (Adım 6): DİNAMİK MAX_POS
+DYNAMIC_MAX_POS_ENABLED = True   # Cüzdan büyüklüğüne göre MAX_POS otomatik ayar
+DYNAMIC_MAX_POS_DIVISOR = 200    # max_pos = wallet_size / 200
+DYNAMIC_MAX_POS_FLOOR = 3        # Minimum (cüzdan çok küçükse)
+DYNAMIC_MAX_POS_CEIL = 10        # Maksimum (cüzdan çok büyükse)
+
 # v6.6 Lite Patch 5: KILL SWITCH / PAUSE MODE ayarları
 KILL_SWITCH_ENABLED = True       # Otomatik durdurma açık mı?
 STOP_STREAK_WINDOW = 5           # Son kaç pozu kontrol et?
@@ -817,6 +829,83 @@ def set_max_positions(new_val, reason="manual", system="cab"):
     return {"changed": True, "value": new_val, "from": old_val}
 
 
+# v6.8 Patch 5 (Adım 6): DİNAMİK MAX_POS — yardımcı fonksiyonlar
+def get_wallet_balance_safe():
+    """Binance'tan toplam cüzdan dengesi (USDT) — hata olursa None döner."""
+    try:
+        if TEST_MODE:
+            return None
+        info = client.account()
+        # USDT bakiyesini bul
+        for asset in info.get("assets", []):
+            if asset.get("asset") == "USDT":
+                # walletBalance + unrealizedProfit
+                wallet = float(asset.get("walletBalance", 0))
+                unrealized = float(asset.get("unrealizedProfit", 0))
+                return wallet + unrealized
+        return None
+    except Exception as e:
+        print(f"[WALLET-ERR] {e}")
+        return None
+
+
+async def dynamic_max_pos_loop():
+    """v6.8 Patch 5 (Adım 6): Her saat cüzdan büyüklüğüne göre MAX_POS ayar.
+    
+    Formül: max_pos = wallet_size / DYNAMIC_MAX_POS_DIVISOR
+    Sınırlar: DYNAMIC_MAX_POS_FLOOR ile DYNAMIC_MAX_POS_CEIL arası
+    
+    Cüzdan büyüdükçe MAX_POS artar, küçüldükçe azalır.
+    Manuel set edilen değer 30 dakika korunur (override).
+    """
+    if not DYNAMIC_MAX_POS_ENABLED:
+        return
+    
+    await asyncio.sleep(300)  # boot sonrası 5 dk bekle
+    
+    while True:
+        try:
+            wallet_size = get_wallet_balance_safe()
+            if wallet_size and wallet_size > 0:
+                dynamic_max = int(wallet_size / DYNAMIC_MAX_POS_DIVISOR)
+                dynamic_max = max(DYNAMIC_MAX_POS_FLOOR, min(DYNAMIC_MAX_POS_CEIL, dynamic_max))
+                
+                for _system in ["cab", "ram"]:
+                    _key = _sys_key(_system, "max_pos_state")
+                    if _key not in data:
+                        continue
+                    
+                    # Manuel override kontrol — son 30 dakikada manuel değişiklik varsa pas geç
+                    last_change = data[_key].get("last_change_at")
+                    history = data[_key].get("change_history", [])
+                    if history:
+                        last_reason = history[-1].get("reason", "")
+                        if last_reason == "manual" or last_reason.startswith("dashboard"):
+                            try:
+                                last_ts_str = history[-1].get("ts", "")
+                                if last_ts_str:
+                                    last_dt = datetime.strptime(last_ts_str[:16], "%Y-%m-%d %H:%M")
+                                    age_min = (now_tr_dt() - last_dt).total_seconds() / 60
+                                    if age_min < 30:
+                                        continue  # manuel set, override yapma
+                            except Exception:
+                                pass
+                    
+                    _cur = data[_key].get("current", MAX_POSITIONS_DEFAULT)
+                    if _cur != dynamic_max:
+                        data[_key]["current"] = dynamic_max
+                        hist = data[_key].get("change_history", [])
+                        hist.append({"ts": now_tr(), "from": _cur, "to": dynamic_max, 
+                                     "reason": f"dynamic_wallet_{wallet_size:.0f}"})
+                        data[_key]["change_history"] = hist[-50:]
+                        print(f"[DYNAMIC-MAX:{_system.upper()}] {_cur} → {dynamic_max} (cüzdan ${wallet_size:.0f})")
+                save_data(data)
+        except Exception as e:
+            print(f"[DYNAMIC-MAX-LOOP-ERR] {e}")
+        
+        await asyncio.sleep(3600)  # her 1 saat
+
+
 def check_auto_reduce_max_pos(system="cab"):
     """v6.7: Sistem-aware. Her sistem kendi closed_positions'una göre"""
     if is_paused(system):
@@ -1561,6 +1650,65 @@ def execute_smart_timeout(ticker, pos):
         return ('close', round(unrealized, 2))
 
 # ============ PARSE ============
+
+# v6.8 Patch 5 (Adım 3): MESAJ SINIFLANDIRMA — tag-based, dict lookup
+# Eski: if/elif zinciri, substring kontrol (yavaş + hatalı olabilir)
+# Yeni: parts[0]'dan tag çıkar, dict lookup → sabit zaman, doğru tespit
+_KIND_BY_TAG_SUFFIX = {
+    "TP1": "tp1",
+    "TP2": "tp2",
+    "STOP": "stop",
+    "TRAIL": "trail",
+}
+
+# Sistem tag'leri — uzun olanlar önce eşleşsin (CAB v14.3 < CAB v14)
+_SYSTEM_TAGS = [
+    ("CAB v14.4", "cab"), ("CAB v14.3", "cab"), ("CAB v14.2", "cab"), ("CAB v14.1", "cab"),
+    ("CAB v14", "cab"), ("CAB v13", "cab"),
+    ("RAM v15.4", "ram"), ("RAM v15.3", "ram"), ("RAM v15.2", "ram"), ("RAM v15.1", "ram"),
+    ("RAM v15", "ram"), ("RAM v14", "ram"),
+]
+
+def classify_msg(msg):
+    """v6.8 Patch 5 (Adım 3): Mesajı sınıflandır.
+    
+    Returns: (system_tag, system_code, msg_kind) veya (None, None, None) bilinmiyorsa.
+    
+    Tag formatı: "CAB v14.3 TP1 | TICKER | ..." veya "CAB v14.3 | TICKER | ..."
+    parts[0] = "CAB v14.3 TP1" (TP/STOP/TRAIL için)
+            = "CAB v14.3"      (GIRIS için)
+    """
+    if not msg or "|" not in msg:
+        return (None, None, None)
+    
+    # parts[0]'i çıkar (ilk | öncesi)
+    first_part = msg.split("|", 1)[0].strip()
+    
+    # Sistem tag'i bul
+    system_tag = None
+    system_code = None
+    for tag, code_sys in _SYSTEM_TAGS:
+        if first_part.startswith(tag):
+            system_tag = tag
+            system_code = code_sys
+            break
+    
+    if system_code is None:
+        return (None, None, None)
+    
+    # Tag sonrası ekleme: "TP1", "TP2", "STOP", "TRAIL" veya boş (GIRIS)
+    suffix = first_part[len(system_tag):].strip()
+    
+    if not suffix:
+        msg_kind = "giris"
+    else:
+        msg_kind = _KIND_BY_TAG_SUFFIX.get(suffix.upper())
+        if msg_kind is None:
+            return (None, None, None)
+    
+    return (system_tag, system_code, msg_kind)
+
+
 def parse_giris(msg):
     try:
         parts = [p.strip() for p in msg.split("|")]
@@ -1577,7 +1725,8 @@ def parse_giris(msg):
             "tp1": float(kv.get("TP1", 0)), "tp2": float(kv.get("TP2", 0)),
             "marj": float(kv.get("Marj", 0)), "lev": int(float(kv.get("Lev", 10))),
             "risk": float(kv.get("Risk", 0)),
-            "kapat_oran": int(float(kv.get("Kapat", 60))),
+            "kapat_oran": int(float(kv.get("Kapat", 50))),  # v6.8 Patch 3: default 50 (Pine min)
+            "kapat_oran_tp2": int(float(kv.get("KapatTP2", 25))),  # v6.8 Patch 4: TP2 yüzdesi (tam simetri)
             "atr_skor": float(kv.get("ATR", 100)) / 100.0,
             "rs_spread": float(kv.get("RS", 0)),  # v6.5: RAM için göreceli güç spread
             "market_regime": _parse_field(msg, "MktRej"),  # v6.7: market rejim
@@ -1605,7 +1754,7 @@ def parse_tp1(msg):
         return {
             "type": "TP1", "ticker": ticker,
             "tp1": float(kv.get("TP1", 0)), "stop": float(kv.get("YeniStop", 0)),
-            "kapat_oran": int(float(kv.get("Kapat", 60))),
+            "kapat_oran": int(float(kv.get("Kapat", 50))),  # v6.8 Patch 3: default 50 (Pine min)
             "tp1_kar": float(kv.get("TP1Kar", 0)),
         }
     except Exception as e:
@@ -1622,9 +1771,17 @@ def parse_tp2(msg):
             if ":" in tok:
                 k, v = tok.split(":", 1)
                 kv[k] = v
+        # v6.8 Patch 4: TP2 yüzdesini parts[3]'ten oku ("%X kapat" formatı)
+        tp2_kapat_oran = 25
+        if len(parts) > 3:
+            import re as _re
+            _m = _re.search(r"%(\d+)\s+kapat", parts[3])
+            if _m:
+                tp2_kapat_oran = int(_m.group(1))
         return {
             "type": "TP2", "ticker": ticker,
             "tp2": float(kv.get("TP2", 0)), "tp2_kar": float(kv.get("TP2Kar", 0)),
+            "kapat_oran_tp2": tp2_kapat_oran,  # v6.8 Patch 4
         }
     except Exception as e:
         print(f"[PARSE ERR TP2] {e}")
@@ -1679,7 +1836,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.8 — Dual System Edition (CAB+RAM symmetric)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions('cab')} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.8 Patch 5 — Mega Update (CAB+RAM symmetric)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions('cab')} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -2000,7 +2157,7 @@ async def export_report():
     
     return JSONResponse({
         "report_generated_at": now_tr(),
-        "version": "v6.8 Live-Ready Hibrit (CAB v14.3 + RAM v15.3)",
+        "version": "v6.8 Patch 5 — Mega Update (CAB v14.4 + RAM v15.4)",
         "config": {
             "cab_max_positions": get_max_positions("cab"),
             "ram_max_positions": get_max_positions("ram"),
@@ -2365,7 +2522,7 @@ async def api_set_max_pos(req: Request):
 
 # ═══════════════ v6.7: YENİ ENDPOINT'LER ═══════════════
 # ============ VERSION ============
-APP_VERSION = "v6.8 Patch 2 — Async Webhook (CAB v14.3 + RAM v15.3)"
+APP_VERSION = "v6.8 Patch 5 — Mega Update (CAB v14.4 + RAM v15.4)"
 
 @app.get("/api/version")
 async def get_version():
@@ -3032,7 +3189,7 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
         "original_stop": parsed.get("stop", 0),
         "current_stop": parsed.get("stop", 0),
         "tp1": parsed.get("tp1", 0), "tp2": parsed.get("tp2", 0),
-        "kapat_oran": parsed.get("kapat_oran", 60),
+        "kapat_oran": parsed.get("kapat_oran", 50),  # v6.8 Patch 3: default 50 (Pine min volScore <1.0)
         "atr_skor": parsed.get("atr_skor", 100),
         "tp1_hit": False, "tp2_hit": False,
         "tp1_kar": 0, "tp2_kar": 0,
@@ -3107,13 +3264,16 @@ def shadow_handle_tp2(msg, system_tag, system_code=None):
 
     pos = positions[ticker]
     tp2_px = parsed.get("tp2") or pos["tp2"]
-    # TP2 hep %25 kapat
-    tp2_kar = shadow_calc_kar(pos["marj"], pos["lev"], pos["giris"], tp2_px, 25)
+    # v6.8 Patch 4: TP2 yüzdesi dinamik (Pine'dan gelir)
+    # Öncelik: parsed (TP2 mesajından) > pos (GIRIS'ten) > default 25
+    kapat_tp2 = parsed.get("kapat_oran_tp2") or pos.get("kapat_oran_tp2", 25)
+    tp2_kar = shadow_calc_kar(pos["marj"], pos["lev"], pos["giris"], tp2_px, kapat_tp2)
     pos["tp2_hit"] = True
     pos["tp2_kar"] = tp2_kar
+    pos["kapat_oran_tp2"] = kapat_tp2  # ileride trail için sakla
     pos["current_stop"] = pos["tp1"]  # TP1 seviyesine çek
     save_data(data)
-    print(f"[SHADOW:{system_code.upper()}:{system_tag}] TP2 {ticker} | +{tp2_kar}$")
+    print(f"[SHADOW:{system_code.upper()}:{system_tag}] TP2 {ticker} | %{kapat_tp2} kapat | +{tp2_kar}$")
     return {"status": "shadow_tp2", "shadow": True, "kar": tp2_kar}
 
 
@@ -3144,14 +3304,19 @@ def shadow_handle_stop_or_trail(msg, system_tag, kind="STOP", system_code=None):
     # TP1 önceden oldu mu?
     tp1_kar = pos.get("tp1_kar", 0)
     tp2_kar = pos.get("tp2_kar", 0)
-    kapat_oran = pos.get("kapat_oran", 60)
+    kapat_oran = pos.get("kapat_oran", 50)  # v6.8 Patch 3: default 50 (Pine min volScore <1.0)
 
     # Exit fiyat (stop veya trail)
-    exit_px = parsed.get("stop") or parsed.get("trail") or pos.get("current_stop", pos["giris"])
+    # v6.8 Patch 3 BUG FIX: parse_trail "trail_px" döner, "trail" değil!
+    # Eskiden: parsed.get("trail") → None → exit_px = giris (BE) → trail_kar -$0.75
+    # Şimdi:   parsed.get("trail_px") → gerçek trail fiyatı → doğru kar
+    exit_px = parsed.get("stop") or parsed.get("trail_px") or pos.get("current_stop", pos["giris"])
 
     # Kalan oranı kapat
     if pos.get("tp2_hit"):
-        kalan = 100 - kapat_oran - 25  # TP1 + TP2 düşülür
+        # v6.8 Patch 4: kapat_oran_tp2 dinamik (eskiden statik 25)
+        kapat_tp2 = pos.get("kapat_oran_tp2", 25)
+        kalan = 100 - kapat_oran - kapat_tp2  # TP1 + TP2 düşülür
     elif pos.get("tp1_hit"):
         kalan = 100 - kapat_oran  # sadece TP1 düşülür
     else:
@@ -3218,14 +3383,57 @@ def shadow_handle_stop_or_trail(msg, system_tag, kind="STOP", system_code=None):
 @app.post("/webhook")
 async def webhook(req: Request, background_tasks: BackgroundTasks):
     """v6.8 Patch 2: ASYNC BACKGROUND TASK
+    v6.8 Patch 5 (Adım 2): WEBHOOK CACHE + THROTTLE — duplicate alarm engelle
     
     SORUN: Webhook handler 4-7 saniye sürüyordu (Binance API call'lar, PnL fetch).
            TradingView 5sn'de timeout yapıyor → %47 alarm fail.
     
     ÇÖZÜM: Webhook hemen "queued" döner, asıl iş arka planda yapılır.
     Sonuç: TradingView memnun (instant 200 OK), bot işine devam.
+    
+    PATCH 5 EK: Aynı mesaj 30 saniye içinde tekrar gelirse "duplicate" diye geç.
+                Aynı ticker'a 5 saniye throttle (anti-storm).
     """
     msg = (await req.body()).decode()
+    
+    # v6.8 Patch 5 (Adım 2): CACHE — aynı mesaj tekrar geldiyse ignore
+    import time as _t
+    now_ts = _t.time()
+    msg_hash = hash(msg.strip())
+    
+    # Cache check
+    last_seen = _webhook_cache.get(msg_hash)
+    if last_seen and (now_ts - last_seen) < WEBHOOK_CACHE_TTL_SEC:
+        print(f"[ALERT-DUP] {msg[:80]} (son {int(now_ts - last_seen)}s)")
+        return {"status": "duplicate", "age_sec": int(now_ts - last_seen)}
+    
+    # Throttle check (aynı ticker'a hızlı arka arkaya alarm)
+    try:
+        # Ticker tahmini: parts[1]
+        _parts = msg.split("|")
+        if len(_parts) > 1:
+            _ticker = _parts[1].strip()
+            _last_ticker_ts = _ticker_throttle.get(_ticker)
+            if _last_ticker_ts and (now_ts - _last_ticker_ts) < WEBHOOK_THROTTLE_SEC:
+                print(f"[ALERT-THROTTLE] {_ticker} ({int(now_ts - _last_ticker_ts)}s önce alarm)")
+                return {"status": "throttled", "ticker": _ticker}
+            _ticker_throttle[_ticker] = now_ts
+    except Exception:
+        pass  # throttle başarısız olursa zarar yok
+    
+    # Cache'e ekle
+    _webhook_cache[msg_hash] = now_ts
+    
+    # Cache temizliği (her 100 mesajda bir, eski olanları sil)
+    if len(_webhook_cache) > 200:
+        cutoff = now_ts - WEBHOOK_CACHE_TTL_SEC
+        for k in list(_webhook_cache.keys()):
+            if _webhook_cache[k] < cutoff:
+                del _webhook_cache[k]
+        for k in list(_ticker_throttle.keys()):
+            if _ticker_throttle[k] < cutoff:
+                del _ticker_throttle[k]
+    
     print(f"[ALERT-RECV] {msg[:120]}")
     background_tasks.add_task(process_webhook_sync, msg)
     return {"status": "queued"}
@@ -3236,33 +3444,16 @@ def process_webhook_sync(msg: str):
     mode_tag = "[CANLI]" if not TEST_MODE else "[TEST]"
 
     # ═══════════════ v6.7: MODE-AWARE ROUTING ═══════════════
-    # Prefix'ten hangi sistem olduğunu anla:
-    #   CAB v13, CAB v14  → cab
-    #   RAM v14, RAM v15  → ram
-    # Sonra data[f"{system}_mode"]'a göre canlı/shadow karar ver.
+    # v6.8 Patch 5 (Adım 3): classify_msg fonksiyonu — tag-based sınıflandırma
+    # Eski: 30+ satırlık if/elif zinciri
+    # Yeni: tek fonksiyon çağrısı
     
-    system_code = None
-    system_tag = None
-    msg_kind = None  # "giris" | "tp1" | "tp2" | "stop" | "trail"
-    
-    # Prefix tespit (v6.7.1: alt versiyonları da algılar — CAB v14.1, RAM v15.1 vs)
-    # Tag listesi: ana versiyonlar + alt versiyonlar (uzun tag'ler önce eşleşsin diye sıralı)
-    for tag, code_sys in [("CAB v14.3", "cab"), ("CAB v14.2", "cab"), ("CAB v14.1", "cab"), ("CAB v14", "cab"), ("CAB v13", "cab"),
-                          ("RAM v15.3", "ram"), ("RAM v15.2", "ram"), ("RAM v15.1", "ram"), ("RAM v15", "ram"), ("RAM v14", "ram")]:
-        if msg.startswith(f"{tag} TP1 |"):
-            system_tag, system_code, msg_kind = tag, code_sys, "tp1"; break
-        if msg.startswith(f"{tag} TP2 |"):
-            system_tag, system_code, msg_kind = tag, code_sys, "tp2"; break
-        if msg.startswith(f"{tag} STOP |"):
-            system_tag, system_code, msg_kind = tag, code_sys, "stop"; break
-        if msg.startswith(f"{tag} TRAIL |"):
-            system_tag, system_code, msg_kind = tag, code_sys, "trail"; break
-        if msg.startswith(f"{tag} |"):
-            system_tag, system_code, msg_kind = tag, code_sys, "giris"; break
+    system_tag, system_code, msg_kind = classify_msg(msg)
 
     if system_code is None:
         # Setup/Hazır mesajları
-        if msg.startswith("CAB SETUP") or msg.startswith("CAB HAZIR") or            msg.startswith("RAM SETUP") or msg.startswith("RAM HAZIR"):
+        if msg.startswith("CAB SETUP") or msg.startswith("CAB HAZIR") or \
+           msg.startswith("RAM SETUP") or msg.startswith("RAM HAZIR"):
             return {"status": "info_ignored"}
         print(f"[UNKNOWN] {msg[:80]}")
         return {"status": "unknown"}
@@ -3591,7 +3782,9 @@ def process_webhook_sync(msg: str):
         kapat_oran = pos.get("kapat_oran", 60)
 
         if pos.get("tp2_hit"):
-            kalan = 100 - kapat_oran - 25
+            # v6.8 Patch 4: kapat_oran_tp2 dinamik
+            kapat_tp2 = pos.get("kapat_oran_tp2", 25)
+            kalan = 100 - kapat_oran - kapat_tp2
             stop_kar = pos_size * (kalan / 100.0) * ((stop_px - giris) / giris)
             sonuc = "↓ TP2+Stop"
         elif pos.get("tp1_hit"):
@@ -4048,11 +4241,50 @@ async def update_position_highs_lows():
 async def startup():
     asyncio.create_task(check_timeouts())
     asyncio.create_task(update_position_highs_lows())
-    print(f"[BOOT] CAB Bot v6.8 Patch 1 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions('cab')} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON")
+    
+    # v6.8 Patch 5 (Adım 4): MAX_POS düzeltmesi — auto-reduce sonrası 3'te takılı kalmasın
+    # Boot'ta her iki sistem için kontrol et: eğer current < 7 ise default'a dön
+    for _system in ["cab", "ram"]:
+        _key = _sys_key(_system, "max_pos_state")
+        if _key in data:
+            _cur = data[_key].get("current", MAX_POSITIONS_DEFAULT)
+            if _cur < MAX_POSITIONS_DEFAULT:
+                _old = _cur
+                data[_key]["current"] = MAX_POSITIONS_DEFAULT
+                data[_key]["auto_reduced"] = False
+                hist = data[_key].get("change_history", [])
+                hist.append({"ts": now_tr(), "from": _old, "to": MAX_POSITIONS_DEFAULT, "reason": "boot_reset_to_default_v6.8p5"})
+                data[_key]["change_history"] = hist[-50:]
+                print(f"[BOOT-RESET] {_system.upper()} MAX_POS {_old} → {MAX_POSITIONS_DEFAULT} (auto-reduce sıfırlandı)")
+    save_data(data)
+    
+    # v6.8 Patch 5 (Adım 6): DİNAMİK MAX_POS — cüzdan büyüklüğüne göre ayar
+    if DYNAMIC_MAX_POS_ENABLED:
+        try:
+            wallet_size = get_wallet_balance_safe()
+            if wallet_size and wallet_size > 0:
+                dynamic_max = int(wallet_size / DYNAMIC_MAX_POS_DIVISOR)
+                dynamic_max = max(DYNAMIC_MAX_POS_FLOOR, min(DYNAMIC_MAX_POS_CEIL, dynamic_max))
+                for _system in ["cab", "ram"]:
+                    _key = _sys_key(_system, "max_pos_state")
+                    if _key in data:
+                        _cur = data[_key].get("current", MAX_POSITIONS_DEFAULT)
+                        if _cur != dynamic_max:
+                            data[_key]["current"] = dynamic_max
+                            hist = data[_key].get("change_history", [])
+                            hist.append({"ts": now_tr(), "from": _cur, "to": dynamic_max, "reason": f"dynamic_wallet_{wallet_size:.0f}"})
+                            data[_key]["change_history"] = hist[-50:]
+                            print(f"[DYNAMIC-MAX] {_system.upper()} {_cur} → {dynamic_max} (cüzdan ${wallet_size:.0f})")
+                save_data(data)
+        except Exception as e:
+            print(f"[DYNAMIC-MAX-ERR] {e}")
+    
+    print(f"[BOOT] CAB Bot v6.8 Patch 5 | Mode:{'CANLI' if not TEST_MODE else 'TEST'} | MaxPos:{get_max_positions('cab')} | Timeout:{TIMEOUT_HOURS}s (mutlak:{TIMEOUT_ABSOLUTE_HOURS}s, eşik:{TIMEOUT_PRESSURE_THRESHOLD}) | HL:{HIGH_LOW_CHECK_INTERVAL_SEC}s | RAM Shadow:ON | Dynamic:{DYNAMIC_MAX_POS_ENABLED}")
     asyncio.create_task(recovery_loop())  # v6.7: auto-recovery
     asyncio.create_task(virtual_skipped_loop())  # v6.7: skipped sanal takip
     asyncio.create_task(emergency_stop_check_loop())  # v6.7.2: Pine alarm yedeği
     asyncio.create_task(stop_watchdog_loop())  # v6.7.4: LIVE — Binance stop emri kontrolü
+    asyncio.create_task(dynamic_max_pos_loop())  # v6.8 Patch 5 (Adım 6): periyodik dinamik MAX_POS
 
 
 # ============ DASHBOARD v6.1 PRO ============
@@ -4070,7 +4302,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.8 — Dual System Dashboard</title>
+<title>CAB Bot v6.8 Patch 5 — Mega Update Dashboard</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:10px}
@@ -4258,7 +4490,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.8 — Dual System</h1>
+<h1>🤖 CAB Bot v6.8 Patch 5 — Mega Update</h1>
 <div class="muted">⟳ <span id="lastUpdate">—</span> | Veri 10sn'de yenilenir</div>
 
 <!-- Üst Fiyat Çubuğu (Coin fiyatları) -->
