@@ -4655,7 +4655,13 @@ async def dashboard():
 <style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:10px}
-h1{font-size:18px;margin:0 0 4px}
+h1{font-size:18px;margin:0 0 4px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.saatGoster{display:flex;align-items:center;gap:8px;padding:6px 14px;border-radius:8px;font-size:14px;font-weight:700;border:2px solid #475569;background:#1e293b;color:#e5e7eb;font-family:"SF Mono",Monaco,Consolas,monospace;letter-spacing:1px;transition:all 0.3s}
+.saatGoster.gevsek{background:linear-gradient(135deg,#15803d,#16a34a);border-color:#86efac;color:#fff;box-shadow:0 0 12px rgba(22,163,74,0.4)}
+.saatGoster.normal{background:linear-gradient(135deg,#0e7490,#0891b2);border-color:#67e8f9;color:#fff;box-shadow:0 0 12px rgba(8,145,178,0.4)}
+.saatGoster.siki{background:linear-gradient(135deg,#991b1b,#dc2626);border-color:#fca5a5;color:#fff;box-shadow:0 0 12px rgba(220,38,38,0.4)}
+.saatGoster .ico{font-size:16px}
+.saatGoster .kademe{font-size:11px;opacity:0.85;letter-spacing:0.5px}
 .muted{color:#94a3b8;font-size:11px}
 .bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0 10px}
 .btn{background:#1e40af;color:#fff;border:none;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600}
@@ -4839,7 +4845,14 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 </head>
 <body>
 
-<h1>🤖 CAB Bot v6.8 Patch 6 — Piyasa Skoru + Saat Veriye Dayalı</h1>
+<h1>
+  <span>🤖 CAB Bot v6.8 Patch 6 — Piyasa Skoru + Saat Veriye Dayalı</span>
+  <span class="saatGoster" id="saatGoster" title="Şu anki TR saati ve hibrit kademesi">
+    <span class="ico" id="saatIco">🕐</span>
+    <span id="saatVal">--</span>
+    <span class="kademe" id="saatKademe">—</span>
+  </span>
+</h1>
 <div class="muted">⟳ <span id="lastUpdate">—</span> | Veri 10sn'de yenilenir</div>
 
 <!-- Üst Fiyat Çubuğu (Coin fiyatları) -->
@@ -6862,7 +6875,38 @@ async function init(){
   setInterval(()=>{
     if(!window._migrateActive) updateDominance();
   }, 60000);
+  // v6.8 Patch 6: Saat göstergesi — anlık TR saat + kademe rengi
+  updateSaatGoster();
+  setInterval(updateSaatGoster, 60000);  // 1 dk'da bir
 }
+
+// v6.8 Patch 6: TR saatini hesapla + Pine'le AYNI kademe (saat array'leri sync)
+const GEVSEK_SAATLER = [0, 4, 7, 8, 11, 14];
+const SIKI_SAATLER = [5, 6, 10, 12, 13, 15, 16, 22, 23];
+
+function updateSaatGoster() {
+  // TR saati = UTC + 3
+  const now = new Date();
+  const trHour = (now.getUTCHours() + 3) % 24;
+  const saatStr = String(trHour).padStart(2, '0') + ':00';
+  
+  let kademe, ico, css;
+  if (GEVSEK_SAATLER.includes(trHour)) {
+    kademe = 'GEVŞEK'; ico = '💎'; css = 'gevsek';
+  } else if (SIKI_SAATLER.includes(trHour)) {
+    kademe = 'SIKI'; ico = '🔥'; css = 'siki';
+  } else {
+    kademe = 'NORMAL'; ico = '🟡'; css = 'normal';
+  }
+  
+  const el = document.getElementById('saatGoster');
+  if (!el) return;
+  el.className = 'saatGoster ' + css;
+  document.getElementById('saatIco').textContent = ico;
+  document.getElementById('saatVal').textContent = saatStr;
+  document.getElementById('saatKademe').textContent = kademe;
+}
+
 init();
 </script>
 </body></html>"""
