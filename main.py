@@ -10,8 +10,8 @@ app = FastAPI()
 
 # ============ KONFIGÜRASYON ============
 TEST_MODE = False  # 🟢 CANLI MOD
-MAX_POSITIONS_DEFAULT = 7  # v6.1: 5 → 7 (akıllı slot ile pratikte daha fazla açık olabilir)
-MAX_POSITIONS_MIN = 3      # v6.6 Lite Patch 8: Hard limit
+MAX_POSITIONS_DEFAULT = 10 # v6.8 Patch 7: 7 → 10 (user kararı, her iki sistem için)
+MAX_POSITIONS_MIN = 6      # v6.8 Patch 7: 3 → 6 (user kararı, her iki sistem için)
 MAX_POSITIONS_MAX = 14     # v6.7 Patch: 12 → 14 (daha fazla manevra alanı)
 DATA_FILE = os.environ.get("DATA_FILE", "/tmp/cab_data.json")
 TIMEOUT_HOURS = 12  # pozisyon timeout süresi (asgari)
@@ -28,8 +28,8 @@ _ticker_throttle = {}            # {ticker: timestamp}
 # v6.8 Patch 5 (Adım 6): DİNAMİK MAX_POS
 DYNAMIC_MAX_POS_ENABLED = True   # Cüzdan büyüklüğüne göre MAX_POS otomatik ayar
 DYNAMIC_MAX_POS_DIVISOR = 200    # max_pos = wallet_size / 200
-DYNAMIC_MAX_POS_FLOOR = 3        # Minimum (cüzdan çok küçükse)
-DYNAMIC_MAX_POS_CEIL = 10        # Maksimum (cüzdan çok büyükse)
+DYNAMIC_MAX_POS_FLOOR = 6        # v6.8 Patch 7: 3 → 6 (user kararı)
+DYNAMIC_MAX_POS_CEIL = 14        # v6.8 Patch 7: 10 → 14 (user kararı)
 
 # v6.6 Lite Patch 5: KILL SWITCH / PAUSE MODE ayarları
 KILL_SWITCH_ENABLED = True       # Otomatik durdurma açık mı?
@@ -534,6 +534,11 @@ async def emergency_stop_check_loop():
                                 "binance_pnl": None, "binance_fee": None,
                                 "shadow": True,
                                 "emergency_stop": True,  # ⚠️ İşaretle
+                                # v6.8 Patch 7: BB/GMT bug iz takibi - timeout_be bilgisi
+                                "timeout_be": pos.get("timeout_be", False),
+                                "timeout_zaman": pos.get("timeout_zaman"),
+                                "durum": pos.get("durum", ""),
+                                "original_stop": pos.get("original_stop"),
                             }
 
                             if closed_key not in data:
@@ -882,19 +887,28 @@ async def dynamic_max_pos_loop():
                     if _key not in data:
                         continue
                     
-                    # Manuel override kontrol — son 30 dakikada manuel değişiklik varsa pas geç
+                    # Manuel override + AUTO STREAK kontrolü
+                    # v6.8 Patch 7: dynamic_wallet artık auto_stop_streak/auto_daily_Nstops'u DA ezmez
+                    # Bunlar koruma amaçlı, wallet loop tarafından geri alınmamalı
                     last_change = data[_key].get("last_change_at")
                     history = data[_key].get("change_history", [])
                     if history:
                         last_reason = history[-1].get("reason", "")
-                        if last_reason == "manual" or last_reason.startswith("dashboard"):
+                        # Manuel veya streak koruması varsa, son 2 saat dokunma
+                        koruma_sebepleri = (last_reason == "manual" 
+                                            or last_reason.startswith("dashboard")
+                                            or last_reason.startswith("auto_stop_streak")
+                                            or last_reason.startswith("auto_daily_"))
+                        if koruma_sebepleri:
                             try:
                                 last_ts_str = history[-1].get("ts", "")
                                 if last_ts_str:
                                     last_dt = datetime.strptime(last_ts_str[:16], "%Y-%m-%d %H:%M")
                                     age_min = (now_tr_dt() - last_dt).total_seconds() / 60
-                                    if age_min < 30:
-                                        continue  # manuel set, override yapma
+                                    # Manuel: 30 dk, Streak/daily: 120 dk (2 saat) koru
+                                    koruma_suresi = 30 if (last_reason == "manual" or last_reason.startswith("dashboard")) else 120
+                                    if age_min < koruma_suresi:
+                                        continue  # koruma süresi içinde, override yapma
                             except Exception:
                                 pass
                     
@@ -1850,7 +1864,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.8 Patch 6 — Piyasa Skoru + Saat Veriye Dayalı (CAB v14.5 + RAM v15.5)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions('cab')} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.8 Patch 7 — RAM DİNAMİK TP + MAX_POS Stabilize (CAB v14.5 + RAM v15.5)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions('cab')} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -2171,7 +2185,7 @@ async def export_report():
     
     return JSONResponse({
         "report_generated_at": now_tr(),
-        "version": "v6.8 Patch 6 — Piyasa Skoru + Saat Veriye Dayalı (CAB v14.5 + RAM v15.5)",
+        "version": "v6.8 Patch 7 — RAM DİNAMİK TP + MAX_POS Stabilize (CAB v14.5 + RAM v15.5)",
         "config": {
             "cab_max_positions": get_max_positions("cab"),
             "ram_max_positions": get_max_positions("ram"),
@@ -2536,7 +2550,7 @@ async def api_set_max_pos(req: Request):
 
 # ═══════════════ v6.7: YENİ ENDPOINT'LER ═══════════════
 # ============ VERSION ============
-APP_VERSION = "v6.8 Patch 6 — Piyasa Skoru + Saat Veriye Dayalı (CAB v14.5 + RAM v15.5)"
+APP_VERSION = "v6.8 Patch 7 — RAM DİNAMİK TP + MAX_POS Stabilize (CAB v14.5 + RAM v15.5)"
 
 # ═══════════════════════════════════════════════════════════════════════
 # v6.8 Patch 6: Açık pozları "doğru saat × doğru piyasa × doğru RR" 
@@ -4651,7 +4665,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.8 Patch 6 — Piyasa Skoru Dashboard</title>
+<title>CAB Bot v6.8 Patch 7 — RAM Dinamik TP Dashboard</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:10px}
@@ -4846,7 +4860,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 <body>
 
 <h1>
-  <span>🤖 CAB Bot v6.8 Patch 6 — Piyasa Skoru + Saat Veriye Dayalı</span>
+  <span>🤖 CAB Bot v6.8 Patch 7 — RAM Dinamik TP + MAX_POS Stabilize</span>
   <span class="saatGoster" id="saatGoster" title="Şu anki TR saati ve hibrit kademesi">
     <span class="ico" id="saatIco">🕐</span>
     <span id="saatVal">--</span>
