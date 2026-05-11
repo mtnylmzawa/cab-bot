@@ -2569,7 +2569,14 @@ def _kademe_for_saat(saat):
 
 def _validate_pos(pos, ticker):
     """Bir pozun açıldığı durum doğru mu kontrol et"""
-    saat = pos.get("saat_tr")
+    raw_saat = pos.get("saat_tr")
+    # v6.8 Patch 7 fix: saat float gelirse int'e çevir (örn. 5.0 → 5)
+    saat = None
+    if raw_saat is not None:
+        try:
+            saat = int(float(raw_saat))
+        except (TypeError, ValueError):
+            saat = None
     kademe = pos.get("hibrit_kademe", "?")
     skor = pos.get("piyasa_skor")
     rr_saat = pos.get("rr_saat")
@@ -2586,22 +2593,23 @@ def _validate_pos(pos, ticker):
     # Skor durumu
     if skor is None:
         skor_durum = "?"
-    elif skor >= 1.5:
-        skor_durum = "EN_IYI"  # USDTD UP + BTCD DOWN
-    elif skor >= 0.5:
-        skor_durum = "IYI"
-    elif skor >= -0.5:
-        skor_durum = "ORTA"
-    elif skor >= -1.2:
-        skor_durum = "KOTU"
     else:
-        skor_durum = "EN_KOTU"  # USDTD DOWN + BTCD UP
+        try:
+            skor_f = float(skor)
+            if skor_f >= 1.5: skor_durum = "EN_IYI"
+            elif skor_f >= 0.5: skor_durum = "IYI"
+            elif skor_f >= -0.5: skor_durum = "ORTA"
+            elif skor_f >= -1.2: skor_durum = "KOTU"
+            else: skor_durum = "EN_KOTU"
+        except (TypeError, ValueError):
+            skor_durum = "?"
     
-    # Genel doğrulama
+    # Genel doğrulama (saat'i int olarak biliyoruz artık)
+    saat_str = f"{saat:02d}h" if saat is not None else "?"
     if kademe_uyumlu is False:
         durum = "MISMATCH"  # Pine ile uyumsuz
         renk = "red"
-        mesaj = f"⚠️ Saat {saat:02d}h için Pine'da {kademe} ama olması gereken {beklenen_kademe}"
+        mesaj = f"⚠️ Saat {saat_str} için Pine'da {kademe} ama olması gereken {beklenen_kademe}"
     elif skor_durum in ["EN_KOTU", "KOTU"] and rr_final is not None and rr_final < 1.5:
         durum = "RISKY"  # Kötü piyasada düşük RR
         renk = "orange"
@@ -2614,10 +2622,16 @@ def _validate_pos(pos, ticker):
         durum = "OK"
         renk = "blue"
         mesaj = f"✅ Normal kombo"
-    else:
-        durum = "OLD"  # Eski sistem
+    elif rr_final is None and saat is None:
+        # Patch 6 öncesi açılmış — yeni alanlar yok
+        durum = "OLD"
         renk = "gray"
-        mesaj = "Patch 6 öncesi açıldı (yeni alan yok)"
+        mesaj = "📦 Patch 6 öncesi açıldı (yeni alan yok)"
+    else:
+        # Veri kısmen var ama tam değil
+        durum = "OK"
+        renk = "blue"
+        mesaj = f"✅ Kombo (kısmen veri)"
     
     return {
         "ticker": ticker,
@@ -4580,7 +4594,14 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5
 .metric-value.bad{color:#fca5a5}
 .metric-value.warn{color:#fbbf24}
 .mesaj{margin-top:8px;padding:6px 10px;background:#0a0e1a;border-radius:4px;font-size:11.5px;font-style:italic}
-.refresh{position:fixed;bottom:20px;right:20px;background:#7c3aed;color:#fff;border:none;padding:10px 16px;border-radius:50%;cursor:pointer;font-size:18px;width:48px;height:48px;box-shadow:0 4px 12px rgba(0,0,0,0.4)}
+.refresh{position:fixed;bottom:20px;right:20px;background:#7c3aed;color:#fff;border:none;padding:10px 16px;border-radius:50%;cursor:pointer;font-size:18px;width:48px;height:48px;box-shadow:0 4px 12px rgba(0,0,0,0.4);transition:transform 0.3s}
+.refresh:hover{transform:scale(1.1)}
+.refresh.spin{animation:rotate 0.8s linear infinite}
+@keyframes rotate{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.geri-btn{position:fixed;bottom:20px;left:20px;background:#0891b2;color:#fff;border:none;padding:10px 16px;border-radius:50%;cursor:pointer;font-size:18px;width:48px;height:48px;box-shadow:0 4px 12px rgba(0,0,0,0.4);transition:transform 0.3s;text-decoration:none;display:flex;align-items:center;justify-content:center}
+.geri-btn:hover{transform:scale(1.1)}
+.header-back{background:rgba(255,255,255,0.15);color:#fff;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;text-decoration:none;display:inline-flex;align-items:center;gap:6px;margin-right:10px;transition:all 0.2s}
+.header-back:hover{background:rgba(255,255,255,0.25);transform:translateX(-2px)}
 .empty{text-align:center;color:#6b7280;padding:30px;font-style:italic}
 .err-box{background:#7f1d1d;border:2px solid #dc2626;padding:14px;border-radius:6px;color:#fca5a5;font-family:Monaco,monospace;font-size:11px;margin:10px 0;white-space:pre-wrap;word-break:break-all}
 .saat-grid{display:grid;grid-template-columns:repeat(12, 1fr);gap:4px;margin-top:10px}
@@ -4596,7 +4617,10 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5
 </style></head><body>
 
 <div class="header">
-  <h1 class="title">🎯 Pozisyon Doğrulama Paneli</h1>
+  <h1 class="title">
+    <a href="/dashboard" class="header-back" title="Dashboard'a geri dön">← Dashboard</a>
+    🎯 Pozisyon Doğrulama Paneli
+  </h1>
   <div class="subtitle"><span id="ver">yükleniyor...</span> · son güncelleme: <span id="now">-</span></div>
 </div>
 
@@ -4637,7 +4661,8 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5
 
 </div>
 
-<button class="refresh" onclick="load()" title="Yenile">🔄</button>
+<button class="refresh" id="refreshBtn" onclick="manuelYenile()" title="Yenile">🔄</button>
+<a href="/dashboard" class="geri-btn" title="Dashboard'a geri dön">←</a>
 
 <script>
 function gosterHata(msg) {
@@ -4775,6 +4800,15 @@ function renderList(elId, list) {
 
 load();
 setInterval(load, 30000);
+
+// v6.8 Patch 7: Yenile butonu - spin animasyonu + async güvenli
+function manuelYenile() {
+  const btn = document.getElementById('refreshBtn');
+  btn.classList.add('spin');
+  load().finally(() => {
+    setTimeout(() => btn.classList.remove('spin'), 400);
+  });
+}
 </script>
 
 </body></html>"""
