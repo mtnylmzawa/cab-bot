@@ -2644,35 +2644,64 @@ def _validate_pos(pos, ticker):
 
 @app.get("/api/pos_validation")
 async def pos_validation_endpoint():
-    """v6.8 Patch 6: Açık pozları kademe/skor/RR doğrulamasıyla göster"""
-    sonuc = {"cab": [], "ram": []}
-    for sistem in ["cab", "ram"]:
-        open_key = _sys_key(sistem, "open_positions")
-        for ticker, pos in data.get(open_key, {}).items():
-            sonuc[sistem].append(_validate_pos(pos, ticker))
-    
-    # Özet sayılar
-    ozet = {"perfect": 0, "ok": 0, "risky": 0, "mismatch": 0, "old": 0}
-    for liste in sonuc.values():
-        for v in liste:
-            d = v["durum"].lower()
-            if d == "perfect": ozet["perfect"] += 1
-            elif d == "ok": ozet["ok"] += 1
-            elif d == "risky": ozet["risky"] += 1
-            elif d == "mismatch": ozet["mismatch"] += 1
-            elif d == "old": ozet["old"] += 1
-    
-    return JSONResponse({
-        "version": APP_VERSION,
-        "now": now_tr(),
-        "ozet": ozet,
-        "cab": sonuc["cab"],
-        "ram": sonuc["ram"],
-        "config": {
-            "gevsek_saatler": GEVSEK_SAATLER,
-            "siki_saatler": SIKI_SAATLER,
-        }
-    })
+    """v6.8 Patch 7: Açık pozları kademe/skor/RR doğrulamasıyla göster
+    GUVENLİ: Tüm hatalar yakalanır, 500 yerine 200+hata mesajı döner"""
+    try:
+        sonuc = {"cab": [], "ram": []}
+        for sistem in ["cab", "ram"]:
+            try:
+                open_key = _sys_key(sistem, "open_positions")
+                pozlar = data.get(open_key, {})
+                if not isinstance(pozlar, dict):
+                    continue
+                for ticker, pos in pozlar.items():
+                    try:
+                        sonuc[sistem].append(_validate_pos(pos, ticker))
+                    except Exception as pos_e:
+                        # Tek bir poz hata verirse atla, diğerlerine devam et
+                        sonuc[sistem].append({
+                            "ticker": ticker, "durum": "ERROR", "renk": "red",
+                            "mesaj": f"⚠️ Validate hatası: {type(pos_e).__name__}: {pos_e}",
+                            "kademe": "?", "saat_tr": None, "piyasa_skor": None,
+                            "rr_saat": None, "rr_piyasa_ek": 0, "rr_vol_ek": 0,
+                            "rr_final": None, "btc_vol_4h": None, "market_detail": {},
+                        })
+            except Exception as sys_e:
+                print(f"[pos_validation:{sistem}] sistem hatası: {sys_e}")
+        
+        # Özet sayılar
+        ozet = {"perfect": 0, "ok": 0, "risky": 0, "mismatch": 0, "old": 0, "error": 0}
+        for liste in sonuc.values():
+            for v in liste:
+                d = (v.get("durum") or "").lower()
+                if d in ozet:
+                    ozet[d] += 1
+        
+        return JSONResponse({
+            "version": APP_VERSION,
+            "now": now_tr(),
+            "ozet": ozet,
+            "cab": sonuc["cab"],
+            "ram": sonuc["ram"],
+            "config": {
+                "gevsek_saatler": GEVSEK_SAATLER,
+                "siki_saatler": SIKI_SAATLER,
+            }
+        })
+    except Exception as global_e:
+        # En son güvenlik ağı — yine de geçerli JSON dön
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[pos_validation GLOBAL ERR] {tb}")
+        return JSONResponse({
+            "version": APP_VERSION if 'APP_VERSION' in globals() else "?",
+            "now": now_tr() if 'now_tr' in globals() else "?",
+            "ozet": {"perfect": 0, "ok": 0, "risky": 0, "mismatch": 0, "old": 0, "error": 0},
+            "cab": [], "ram": [],
+            "config": {"gevsek_saatler": [], "siki_saatler": []},
+            "_error": f"{type(global_e).__name__}: {str(global_e)}",
+            "_traceback": tb[-1000:],  # son 1000 karakter
+        }, status_code=200)
 
 @app.get("/api/version")
 async def get_version():
@@ -4645,6 +4674,12 @@ async function load() {
   }
   
   if (!d) { gosterHata('Veri yok'); return; }
+  
+  // Sunucu tarafında yakalanmış hata var mı?
+  if (d._error) {
+    gosterHata(`Sunucu hatası: ${d._error}\\n\\n${d._traceback || ''}`);
+    // Yine de saat tablosunu göster - kullanıcı görebilsin
+  }
   
   try {
     document.getElementById('ver').textContent = d.version || '?';
