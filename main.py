@@ -4503,7 +4503,11 @@ async def startup():
 # ============ DASHBOARD v6.1 PRO ============
 @app.get("/validation", response_class=HTMLResponse)
 async def validation_page():
-    """v6.8 Patch 6: Açık pozları kademe + skor + RR doğrulamasıyla göster"""
+    """v6.8 Patch 7: Açık pozları kademe + skor + RR doğrulamasıyla göster
+    - Görünür hata mesajları
+    - Saat tablosu görsel
+    - NORMAL saatler de listeleniyor
+    """
     return """<!DOCTYPE html>
 <html lang="tr"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -4535,10 +4539,10 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5
 .pos-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px}
 .ticker{font-weight:700;font-size:14px;color:#fbbf24}
 .badge{padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase}
-.badge.GEVSEK{background:#16a34a;color:#fff}
-.badge.NORMAL{background:#0891b2;color:#fff}
-.badge.SIKI{background:#dc2626;color:#fff}
-.badge.\\?{background:#6b7280;color:#fff}
+.badge-GEVSEK{background:#16a34a;color:#fff}
+.badge-NORMAL{background:#0891b2;color:#fff}
+.badge-SIKI{background:#dc2626;color:#fff}
+.badge-bilinmeyen{background:#6b7280;color:#fff}
 .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:6px;font-size:11px;margin-top:6px}
 .metric{background:#1e293b;padding:6px 8px;border-radius:4px}
 .metric-label{color:#94a3b8;font-size:10px;display:block}
@@ -4549,6 +4553,17 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5
 .mesaj{margin-top:8px;padding:6px 10px;background:#0a0e1a;border-radius:4px;font-size:11.5px;font-style:italic}
 .refresh{position:fixed;bottom:20px;right:20px;background:#7c3aed;color:#fff;border:none;padding:10px 16px;border-radius:50%;cursor:pointer;font-size:18px;width:48px;height:48px;box-shadow:0 4px 12px rgba(0,0,0,0.4)}
 .empty{text-align:center;color:#6b7280;padding:30px;font-style:italic}
+.err-box{background:#7f1d1d;border:2px solid #dc2626;padding:14px;border-radius:6px;color:#fca5a5;font-family:Monaco,monospace;font-size:11px;margin:10px 0;white-space:pre-wrap;word-break:break-all}
+.saat-grid{display:grid;grid-template-columns:repeat(12, 1fr);gap:4px;margin-top:10px}
+.saat-hucre{padding:6px 4px;text-align:center;border-radius:4px;font-weight:700;font-size:11px;font-family:Monaco,monospace}
+.saat-hucre.GEVSEK{background:linear-gradient(135deg,#15803d,#16a34a);color:#fff;box-shadow:0 0 4px rgba(22,163,74,0.3)}
+.saat-hucre.NORMAL{background:linear-gradient(135deg,#0e7490,#0891b2);color:#fff}
+.saat-hucre.SIKI{background:linear-gradient(135deg,#991b1b,#dc2626);color:#fff;box-shadow:0 0 4px rgba(220,38,38,0.3)}
+.saat-hucre.simdi{outline:3px solid #fbbf24;outline-offset:1px;transform:scale(1.1)}
+.saat-legend{display:flex;gap:14px;font-size:12px;margin-top:10px;flex-wrap:wrap}
+.saat-legend span{display:flex;align-items:center;gap:6px}
+.saat-kutu{display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:middle}
+@media (max-width:600px){.saat-grid{grid-template-columns:repeat(6,1fr)}}
 </style></head><body>
 
 <div class="header">
@@ -4557,6 +4572,8 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5
 </div>
 
 <div class="content">
+
+<div id="err" style="display:none"></div>
 
 <div class="ozet" id="ozet"></div>
 
@@ -4571,45 +4588,112 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5
 </div>
 
 <div class="section">
-  <h2 style="color:#fbbf24">📋 Pine v14.5/v15.5 Saat Tanımları</h2>
-  <div style="font-size:12px;line-height:1.8">
-    💎 <b style="color:#86efac">GEVŞEK saatler:</b> <span id="gevsek-saatler">-</span> (RR=1.0)<br>
-    🔥 <b style="color:#fca5a5">SIKI saatler:</b> <span id="siki-saatler">-</span> (RR=1.2)<br>
-    🟡 <b style="color:#7dd3fc">NORMAL saatler:</b> diğer tüm saatler (RR=1.1)
+  <h2 style="color:#fbbf24">🕐 Pine v14.5/v15.5 Saat Tanımları (TR)</h2>
+  <p style="font-size:12px;color:#94a3b8;margin:4px 0 6px">Şu anki saat sarı çerçeveyle işaretli. Bot ve Pine ortak tanım kullanır.</p>
+  
+  <div class="saat-grid" id="saatGrid"></div>
+  
+  <div class="saat-legend">
+    <span><span class="saat-kutu" style="background:linear-gradient(135deg,#15803d,#16a34a)"></span> 💎 <b>GEVŞEK</b> (RR=1.0)</span>
+    <span><span class="saat-kutu" style="background:linear-gradient(135deg,#0e7490,#0891b2)"></span> 🟡 <b>NORMAL</b> (RR=1.1)</span>
+    <span><span class="saat-kutu" style="background:linear-gradient(135deg,#991b1b,#dc2626)"></span> 🔥 <b>SIKI</b> (RR=1.2)</span>
+  </div>
+  
+  <div style="font-size:11.5px;line-height:1.8;margin-top:12px;color:#cbd5e1">
+    💎 <b style="color:#86efac">GEVŞEK saatler:</b> <span id="gevsek-saatler">-</span><br>
+    🟡 <b style="color:#7dd3fc">NORMAL saatler:</b> <span id="normal-saatler">-</span><br>
+    🔥 <b style="color:#fca5a5">SIKI saatler:</b> <span id="siki-saatler">-</span>
   </div>
 </div>
 
 </div>
 
-<button class="refresh" onclick="load()">🔄</button>
+<button class="refresh" onclick="load()" title="Yenile">🔄</button>
 
 <script>
+function gosterHata(msg) {
+  const e = document.getElementById('err');
+  e.style.display = 'block';
+  e.className = 'err-box';
+  e.textContent = "HATA: " + msg;
+  // Listelerdeki "yükleniyor"u temizle
+  document.getElementById('cab-list').innerHTML = '<div class="empty">Hata oluştu — yukarı bak</div>';
+  document.getElementById('ram-list').innerHTML = '<div class="empty">Hata oluştu — yukarı bak</div>';
+}
+
 async function load() {
+  // Hata kutusu temizle
+  document.getElementById('err').style.display = 'none';
+  
+  let d;
   try {
-    const r = await fetch('/api/pos_validation');
-    const d = await r.json();
-    
+    const r = await fetch('/api/pos_validation', {cache: 'no-store'});
+    if (!r.ok) {
+      gosterHata(`HTTP ${r.status} ${r.statusText}`);
+      return;
+    }
+    const text = await r.text();
+    try {
+      d = JSON.parse(text);
+    } catch (parseErr) {
+      gosterHata(`JSON parse hatası: ${parseErr.message}\\nGelen: ${text.substring(0,200)}`);
+      return;
+    }
+  } catch (fetchErr) {
+    gosterHata(`Fetch hatası: ${fetchErr.message}`);
+    return;
+  }
+  
+  if (!d) { gosterHata('Veri yok'); return; }
+  
+  try {
     document.getElementById('ver').textContent = d.version || '?';
     document.getElementById('now').textContent = d.now || '-';
     
     // Özet
+    const oz = d.ozet || {};
     const ozetEl = document.getElementById('ozet');
     ozetEl.innerHTML = `
-      <div class="ozet-card perfect"><div class="ozet-label">💎 Perfect</div><div class="ozet-value">${d.ozet.perfect}</div></div>
-      <div class="ozet-card ok"><div class="ozet-label">✅ OK</div><div class="ozet-value">${d.ozet.ok}</div></div>
-      <div class="ozet-card risky"><div class="ozet-label">⚠️ Risky</div><div class="ozet-value">${d.ozet.risky}</div></div>
-      <div class="ozet-card mismatch"><div class="ozet-label">❌ Mismatch</div><div class="ozet-value">${d.ozet.mismatch}</div></div>
-      <div class="ozet-card old"><div class="ozet-label">📦 Old</div><div class="ozet-value">${d.ozet.old}</div></div>
+      <div class="ozet-card perfect"><div class="ozet-label">💎 Perfect</div><div class="ozet-value">${oz.perfect||0}</div></div>
+      <div class="ozet-card ok"><div class="ozet-label">✅ OK</div><div class="ozet-value">${oz.ok||0}</div></div>
+      <div class="ozet-card risky"><div class="ozet-label">⚠️ Risky</div><div class="ozet-value">${oz.risky||0}</div></div>
+      <div class="ozet-card mismatch"><div class="ozet-label">❌ Mismatch</div><div class="ozet-value">${oz.mismatch||0}</div></div>
+      <div class="ozet-card old"><div class="ozet-label">📦 Old</div><div class="ozet-value">${oz.old||0}</div></div>
     `;
     
-    // Saat listeleri
-    document.getElementById('gevsek-saatler').textContent = (d.config?.gevsek_saatler || []).map(h=>String(h).padStart(2,'0')+'h').join(', ');
-    document.getElementById('siki-saatler').textContent = (d.config?.siki_saatler || []).map(h=>String(h).padStart(2,'0')+'h').join(', ');
+    // Saat config
+    const gevsek = d.config?.gevsek_saatler || [];
+    const siki = d.config?.siki_saatler || [];
+    const normal = [];
+    for (let h=0; h<24; h++) {
+      if (!gevsek.includes(h) && !siki.includes(h)) normal.push(h);
+    }
     
-    renderList('cab-list', d.cab);
-    renderList('ram-list', d.ram);
-  } catch (e) {
-    console.error(e);
+    // TR saati hesapla (mevcut UTC+3)
+    const trHour = (new Date().getUTCHours() + 3) % 24;
+    
+    // Saat grid - 24 hücre
+    const grid = document.getElementById('saatGrid');
+    let gridHtml = '';
+    for (let h=0; h<24; h++) {
+      let kdm = 'NORMAL';
+      if (gevsek.includes(h)) kdm = 'GEVSEK';
+      else if (siki.includes(h)) kdm = 'SIKI';
+      const aktif = (h === trHour) ? ' simdi' : '';
+      gridHtml += `<div class="saat-hucre ${kdm}${aktif}" title="${h}:00 - ${kdm}">${String(h).padStart(2,'0')}h</div>`;
+    }
+    grid.innerHTML = gridHtml;
+    
+    // Saat listeleri (yazılı)
+    const formatSaat = arr => arr.map(h => String(h).padStart(2,'0')+'h').join(', ');
+    document.getElementById('gevsek-saatler').textContent = formatSaat(gevsek) || '(yok)';
+    document.getElementById('normal-saatler').textContent = formatSaat(normal);
+    document.getElementById('siki-saatler').textContent = formatSaat(siki);
+    
+    renderList('cab-list', d.cab || []);
+    renderList('ram-list', d.ram || []);
+  } catch (renderErr) {
+    gosterHata(`Render hatası: ${renderErr.message}\\nStack: ${renderErr.stack}`);
   }
 }
 
@@ -4619,33 +4703,43 @@ function renderList(elId, list) {
     el.innerHTML = '<div class="empty">Açık poz yok</div>';
     return;
   }
-  el.innerHTML = list.map(p => {
-    const md = p.market_detail || {};
-    const skorRenk = p.piyasa_skor === null ? 'gray' : (p.piyasa_skor >= 1.5 ? 'good' : (p.piyasa_skor >= 0 ? 'warn' : 'bad'));
-    const rrRenk = p.rr_final === null ? 'gray' : (p.rr_final <= 1.2 ? 'good' : (p.rr_final <= 1.7 ? 'warn' : 'bad'));
-    
-    return `<div class="pos-card ${p.renk}">
-      <div class="pos-header">
-        <span class="ticker">${p.ticker}</span>
-        <span class="badge ${p.kademe}">${p.kademe} (${p.saat_tr !== null ? String(p.saat_tr).padStart(2,'0')+'h' : '?'})</span>
-      </div>
-      <div class="metrics">
-        <div class="metric"><span class="metric-label">Piyasa Skor</span><span class="metric-value ${skorRenk}">${p.piyasa_skor ?? '?'}</span></div>
-        <div class="metric"><span class="metric-label">USDT.D</span><span class="metric-value">${md.usdtd || '?'}</span></div>
-        <div class="metric"><span class="metric-label">BTC.D</span><span class="metric-value">${md.btcd || '?'}</span></div>
-        <div class="metric"><span class="metric-label">RR Saat</span><span class="metric-value">${p.rr_saat ?? '?'}</span></div>
-        <div class="metric"><span class="metric-label">+ Piyasa</span><span class="metric-value warn">+${p.rr_piyasa_ek ?? 0}</span></div>
-        <div class="metric"><span class="metric-label">+ BTC Vol</span><span class="metric-value warn">+${p.rr_vol_ek ?? 0}</span></div>
-        <div class="metric"><span class="metric-label">RR FINAL</span><span class="metric-value ${rrRenk}">${p.rr_final ?? '?'}</span></div>
-        <div class="metric"><span class="metric-label">BTC Vol 4h</span><span class="metric-value">${p.btc_vol_4h ?? '?'}%</span></div>
-      </div>
-      <div class="mesaj">${p.mesaj}</div>
-    </div>`;
-  }).join('');
+  try {
+    el.innerHTML = list.map(p => {
+      const md = p.market_detail || {};
+      const skor = p.piyasa_skor;
+      const skorRenk = (skor === null || skor === undefined) ? 'gray' : (skor >= 1.5 ? 'good' : (skor >= 0 ? 'warn' : 'bad'));
+      const rrRenk = (p.rr_final === null || p.rr_final === undefined) ? 'gray' : (p.rr_final <= 1.2 ? 'good' : (p.rr_final <= 1.7 ? 'warn' : 'bad'));
+      
+      // Badge class güvenli
+      const kdm = (p.kademe === 'GEVSEK' || p.kademe === 'NORMAL' || p.kademe === 'SIKI') ? p.kademe : 'bilinmeyen';
+      const kdmText = p.kademe || '?';
+      const saatText = (p.saat_tr !== null && p.saat_tr !== undefined) ? String(p.saat_tr).padStart(2,'0')+'h' : '?';
+      
+      return `<div class="pos-card ${p.renk || 'gray'}">
+        <div class="pos-header">
+          <span class="ticker">${p.ticker || '?'}</span>
+          <span class="badge badge-${kdm}">${kdmText} (${saatText})</span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><span class="metric-label">Piyasa Skor</span><span class="metric-value ${skorRenk}">${skor ?? '?'}</span></div>
+          <div class="metric"><span class="metric-label">USDT.D</span><span class="metric-value">${md.usdtd || '?'}</span></div>
+          <div class="metric"><span class="metric-label">BTC.D</span><span class="metric-value">${md.btcd || '?'}</span></div>
+          <div class="metric"><span class="metric-label">RR Saat</span><span class="metric-value">${p.rr_saat ?? '?'}</span></div>
+          <div class="metric"><span class="metric-label">+ Piyasa</span><span class="metric-value warn">+${p.rr_piyasa_ek ?? 0}</span></div>
+          <div class="metric"><span class="metric-label">+ BTC Vol</span><span class="metric-value warn">+${p.rr_vol_ek ?? 0}</span></div>
+          <div class="metric"><span class="metric-label">RR FINAL</span><span class="metric-value ${rrRenk}">${p.rr_final ?? '?'}</span></div>
+          <div class="metric"><span class="metric-label">BTC Vol 4h</span><span class="metric-value">${p.btc_vol_4h ?? '?'}%</span></div>
+        </div>
+        <div class="mesaj">${p.mesaj || ''}</div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    el.innerHTML = `<div class="err-box">renderList hatası: ${e.message}</div>`;
+  }
 }
 
 load();
-setInterval(load, 30000);  // 30sn'de bir yenile
+setInterval(load, 30000);
 </script>
 
 </body></html>"""
