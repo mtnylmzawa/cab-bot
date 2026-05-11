@@ -4670,7 +4670,8 @@ async def dashboard():
 *{box-sizing:border-box}
 body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:10px}
 h1{font-size:18px;margin:0 0 4px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
-.saatGoster{display:flex;align-items:center;gap:8px;padding:6px 14px;border-radius:8px;font-size:14px;font-weight:700;border:2px solid #475569;background:#1e293b;color:#e5e7eb;font-family:"SF Mono",Monaco,Consolas,monospace;letter-spacing:1px;transition:all 0.3s}
+.saatGoster{display:flex;align-items:center;gap:8px;padding:6px 14px;border-radius:8px;font-size:14px;font-weight:700;border:2px solid #475569;background:#1e293b;color:#e5e7eb;font-family:"SF Mono",Monaco,Consolas,monospace;letter-spacing:1px;transition:all 0.3s;cursor:pointer;text-decoration:none}
+.saatGoster:hover{transform:scale(1.05);filter:brightness(1.15)}
 .saatGoster.gevsek{background:linear-gradient(135deg,#15803d,#16a34a);border-color:#86efac;color:#fff;box-shadow:0 0 12px rgba(22,163,74,0.4)}
 .saatGoster.normal{background:linear-gradient(135deg,#0e7490,#0891b2);border-color:#67e8f9;color:#fff;box-shadow:0 0 12px rgba(8,145,178,0.4)}
 .saatGoster.siki{background:linear-gradient(135deg,#991b1b,#dc2626);border-color:#fca5a5;color:#fff;box-shadow:0 0 12px rgba(220,38,38,0.4)}
@@ -4861,11 +4862,11 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 
 <h1>
   <span>🤖 CAB Bot v6.8 Patch 7 — RAM Dinamik TP + MAX_POS Stabilize</span>
-  <span class="saatGoster" id="saatGoster" title="Şu anki TR saati ve hibrit kademesi">
+  <a href="/validation" class="saatGoster" id="saatGoster" title="Şu anki TR saati ve hibrit kademesi — Doğrulama paneline git">
     <span class="ico" id="saatIco">🕐</span>
     <span id="saatVal">--</span>
     <span class="kademe" id="saatKademe">—</span>
-  </span>
+  </a>
 </h1>
 <div class="muted">⟳ <span id="lastUpdate">—</span> | Veri 10sn'de yenilenir</div>
 
