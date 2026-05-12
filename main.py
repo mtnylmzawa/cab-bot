@@ -10,9 +10,9 @@ app = FastAPI()
 
 # ============ KONFIGÜRASYON ============
 TEST_MODE = False  # 🟢 CANLI MOD
-MAX_POSITIONS_DEFAULT = 10 # v6.8 Patch 7: 7 → 10 (user kararı, her iki sistem için)
-MAX_POSITIONS_MIN = 6      # v6.8 Patch 7: 3 → 6 (user kararı, her iki sistem için)
-MAX_POSITIONS_MAX = 14     # v6.7 Patch: 12 → 14 (daha fazla manevra alanı)
+MAX_POSITIONS_DEFAULT = 10 # v6.8 Patch 7++: TOPLAM (CAB+RAM birleşik) default
+MAX_POSITIONS_MIN = 4      # v6.8 Patch 7++: Kötü gidişte minimum (eski:6)
+MAX_POSITIONS_MAX = 16     # v6.8 Patch 7++: Manuel maksimum (eski:14)
 DATA_FILE = os.environ.get("DATA_FILE", "/tmp/cab_data.json")
 TIMEOUT_HOURS = 12  # pozisyon timeout süresi (asgari)
 TIMEOUT_ABSOLUTE_HOURS = 24  # v6.4: mutlak limit — slot baskısı olmasa bile zorla kapat
@@ -28,8 +28,8 @@ _ticker_throttle = {}            # {ticker: timestamp}
 # v6.8 Patch 5 (Adım 6): DİNAMİK MAX_POS
 DYNAMIC_MAX_POS_ENABLED = True   # Cüzdan büyüklüğüne göre MAX_POS otomatik ayar
 DYNAMIC_MAX_POS_DIVISOR = 200    # max_pos = wallet_size / 200
-DYNAMIC_MAX_POS_FLOOR = 6        # v6.8 Patch 7: 3 → 6 (user kararı)
-DYNAMIC_MAX_POS_CEIL = 14        # v6.8 Patch 7: 10 → 14 (user kararı)
+DYNAMIC_MAX_POS_FLOOR = 4        # v6.8 Patch 7++: TOPLAM min (eski:6)
+DYNAMIC_MAX_POS_CEIL = 16        # v6.8 Patch 7++: TOPLAM max (eski:14)
 
 # v6.6 Lite Patch 5: KILL SWITCH / PAUSE MODE ayarları
 KILL_SWITCH_ENABLED = True       # Otomatik durdurma açık mı?
@@ -991,22 +991,66 @@ def now_tr_dt():
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
 
 # ============ AKILLI SLOT SAYIMI ============
+def detect_desync(ticker, parsed, existing_pos):
+    """v6.8 Patch 7+++: JCT BUG ÇÖZÜMÜ — Pine ile bot senkron kontrolü
+    
+    Pine yeni GIRIS alarmı verdi ama bot'ta aynı ticker zaten açık görünüyor.
+    Pine'da yeni sinyal = eski poz kapanmış demek (Pine "open" varken yeni signal vermez).
+    
+    Kontrol: Yeni alarm'ın giriş+stop'u, eski pozdan FARKLI mı?
+    - %0.5'ten az fark = gerçek duplicate (Pine tekrar göndermiş, reddet)
+    - %0.5'ten fazla fark = DESYNC (eski kapatılmalı, yeni kabul edilmeli)
+    
+    Bonus: Eski poz timeout-BE veya tp1_hit ise desync çok olası
+    """
+    try:
+        yeni_giris = float(parsed.get("giris", 0))
+        eski_giris = float(existing_pos.get("giris", 0))
+        yeni_stop = float(parsed.get("stop", 0))
+        eski_stop = float(existing_pos.get("stop", 0))
+        
+        if yeni_giris <= 0 or eski_giris <= 0:
+            return False, "geçersiz fiyat"
+        
+        # Yüzde fark
+        giris_fark = abs(yeni_giris - eski_giris) / eski_giris
+        stop_fark = abs(yeni_stop - eski_stop) / max(eski_stop, 0.0001)
+        
+        # %0.5'ten az fark = duplicate (Pine retry vs)
+        if giris_fark < 0.005 and stop_fark < 0.005:
+            return False, f"duplicate (giris fark: {giris_fark*100:.2f}%, stop fark: {stop_fark*100:.2f}%)"
+        
+        # %0.5'ten büyük fark = DESYNC
+        return True, f"DESYNC ({eski_giris:.6f} → {yeni_giris:.6f}, fark: {giris_fark*100:.2f}%)"
+    except Exception as e:
+        return False, f"hata: {e}"
+
+
 def count_active_risk(system="cab"):
-    """v6.1: Aktif risk taşıyan pozisyonları say (TP1 vurmuş VE timeout-BE'liler exempt)
-    v6.7: Sistem-aware (cab veya ram için ayrı sayım)
+    """v6.8 Patch 7++: TOPLAM aktif risk sayar (CAB + RAM birleşik)
+    
+    KRİTİK GÜVENLİK: Cüzdan tek, her iki sistem aynı kasayı kullanır.
+    Eskiden her sistem ayrı MAX (örn 7+7=14 poz) mümkündü → cüzdanı aşar!
+    Şimdi: CAB ve RAM toplam MAX'i paylaşır → cüzdan güvenli.
+    
+    TP1 vurmuş VE timeout-BE'liler exempt (en kötü 0$ çıkacak).
+    'system' parametresi artık etkisiz, geri uyumluluk için kalıyor.
     """
     aktif = 0
     garantili_tp1 = 0
     garantili_timeout = 0
-    open_key = _sys_key(system, "open_positions") if system != "cab" else "open_positions"
-    open_pos = data.get(open_key, {})
-    for p in open_pos.values():
-        if p.get("tp1_hit"):
-            garantili_tp1 += 1
-        elif p.get("timeout_be"):
-            garantili_timeout += 1
-        else:
-            aktif += 1
+    
+    # HER İKİ sistemin pozlarını topla
+    for sys in ["cab", "ram"]:
+        open_key = _sys_key(sys, "open_positions") if sys != "cab" else "open_positions"
+        open_pos = data.get(open_key, {})
+        for p in open_pos.values():
+            if p.get("tp1_hit"):
+                garantili_tp1 += 1
+            elif p.get("timeout_be"):
+                garantili_timeout += 1
+            else:
+                aktif += 1
     return aktif, garantili_tp1, garantili_timeout
 
 # ============ BINANCE HELPERS ============
@@ -1870,7 +1914,7 @@ def parse_stop(msg):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     mode = "🟡 TEST MODU" if TEST_MODE else "🟢 CANLI MOD"
-    return f"<h3>🤖 CAB Bot v6.8 Patch 7 — RAM DİNAMİK TP + MAX_POS Stabilize (CAB v14.5 + RAM v15.5)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions('cab')} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
+    return f"<h3>🤖 CAB Bot v6.8 Patch 7+++ — JCT Desync + Manuel Close + Timeout-BE Limit (2gün) + Birleşik MAX (CAB v14.5 + RAM v15.5)</h3><p>{mode}</p><p>MAX_POSITIONS: {get_max_positions('cab')} | TIMEOUT: {TIMEOUT_HOURS}s | HL_TRACKER: {HIGH_LOW_CHECK_INTERVAL_SEC}s</p><p><a href='/dashboard'>Dashboard</a> | <a href='/test_binance'>Binance Test</a> | <a href='/api/timeout_check'>Manuel Timeout Check</a></p>"
 
 @app.get("/ip")
 async def get_ip():
@@ -2191,7 +2235,7 @@ async def export_report():
     
     return JSONResponse({
         "report_generated_at": now_tr(),
-        "version": "v6.8 Patch 7 — RAM DİNAMİK TP + MAX_POS Stabilize (CAB v14.5 + RAM v15.5)",
+        "version": "v6.8 Patch 7+++ — JCT Desync + Manuel Close + Timeout-BE Limit (2gün) + Birleşik MAX (CAB v14.5 + RAM v15.5)",
         "config": {
             "cab_max_positions": get_max_positions("cab"),
             "ram_max_positions": get_max_positions("ram"),
@@ -2464,6 +2508,93 @@ async def get_pause_status(system: str = "cab"):
     })
 
 
+@app.post("/api/manual_close_pos")
+async def manual_close_pos(req: Request):
+    """v6.8 Patch 7+++: Dashboard'dan manuel poz kapatma
+    Body: {"ticker": "JCTUSDT", "system": "cab"|"ram", "sebep": "manuel|desync"}
+    
+    SHADOW modda: bot kaydını closed listesine taşır
+    LIVE modda: önce Binance'tan kapat, sonra kayıt
+    """
+    body = {}
+    try:
+        body = await req.json()
+    except Exception:
+        pass
+    
+    ticker = body.get("ticker", "").upper().strip()
+    system = body.get("system", "cab")
+    sebep = body.get("sebep", "manuel_close")
+    
+    if not ticker:
+        return JSONResponse({"success": False, "error": "ticker eksik"}, status_code=400)
+    if system not in ("cab", "ram"):
+        system = "cab"
+    
+    open_key = _sys_key(system, "open_positions") if system != "cab" else "open_positions"
+    closed_key = _sys_key(system, "closed_positions") if system != "cab" else "closed_positions"
+    
+    if open_key not in data or ticker not in data[open_key]:
+        return JSONResponse({"success": False, "error": f"{ticker} {system.upper()}'da açık değil"}, status_code=404)
+    
+    existing = data[open_key][ticker]
+    sys_mode = get_system_mode(system)
+    
+    # LIVE modda Binance'tan da kapat
+    binance_close_result = None
+    if sys_mode == "live" and not existing.get("shadow") and not TEST_MODE:
+        try:
+            binance_close_result = execute_full_close(ticker, f"MANUEL_{sebep.upper()}")
+            print(f"[MANUEL CLOSE LIVE] {ticker}: {binance_close_result}")
+        except Exception as e:
+            print(f"[MANUEL CLOSE LIVE ERR] {ticker}: {e}")
+            return JSONResponse({"success": False, "error": f"Binance kapatma hatası: {e}"}, status_code=500)
+    
+    # Kaydı kapanan listeye ekle
+    if closed_key not in data:
+        data[closed_key] = []
+    
+    existing_copy = dict(existing)
+    
+    # Mevcut fiyatı al (varsa)
+    exit_px = existing.get("current_stop") or existing.get("stop", 0)
+    if binance_close_result and binance_close_result.get("exit_price"):
+        exit_px = binance_close_result["exit_price"]
+    
+    # Tahmini kar hesabı (sadece bilgi amaçlı)
+    giris = existing.get("giris", 0)
+    marj = existing.get("marj", 100)
+    lev = existing.get("lev", 10)
+    kar_tahmini = 0.0
+    if giris > 0 and exit_px > 0:
+        kar_tahmini = marj * (exit_px - giris) / giris * lev
+    
+    existing_copy.update({
+        "ticker": ticker,
+        "kapanis": now_tr(),
+        "exit_px": exit_px,
+        "sonuc": f"🔧 Manuel ({sebep})",
+        "kar": kar_tahmini,
+        "manuel_close": True,
+        "manuel_sebep": sebep,
+        "binance_close": binance_close_result,
+    })
+    data[closed_key].append(existing_copy)
+    del data[open_key][ticker]
+    save_data(data)
+    
+    print(f"[MANUEL CLOSE] {ticker} {system.upper()} kapatıldı, sebep: {sebep}, kar_tahmini: {kar_tahmini:+.2f}$")
+    
+    return JSONResponse({
+        "success": True,
+        "ticker": ticker,
+        "system": system,
+        "exit_px": exit_px,
+        "kar_tahmini": kar_tahmini,
+        "binance_close": binance_close_result,
+    })
+
+
 @app.post("/api/toggle_pause")
 async def toggle_pause(req: Request):
     """v6.7: Sistem-aware manuel pause toggle.
@@ -2556,7 +2687,7 @@ async def api_set_max_pos(req: Request):
 
 # ═══════════════ v6.7: YENİ ENDPOINT'LER ═══════════════
 # ============ VERSION ============
-APP_VERSION = "v6.8 Patch 7 — RAM DİNAMİK TP + MAX_POS Stabilize (CAB v14.5 + RAM v15.5)"
+APP_VERSION = "v6.8 Patch 7+++ — JCT Desync + Manuel Close + Timeout-BE Limit (2gün) + Birleşik MAX (CAB v14.5 + RAM v15.5)"
 
 # ═══════════════════════════════════════════════════════════════════════
 # v6.8 Patch 6: Açık pozları "doğru saat × doğru piyasa × doğru RR" 
@@ -3391,9 +3522,36 @@ def shadow_handle_giris(msg, system_tag, system_code=None):
         save_data(data)
         return {"status": "shadow_max_full", "system_tag": system_tag}
 
-    # Zaten açık mı kontrolü
+    # v6.8 Patch 7+++: Desync-aware duplicate kontrolü (JCT bug fix)
     if ticker in data[open_key]:
-        return {"status": "shadow_already_open", "ticker": ticker}
+        existing = data[open_key][ticker]
+        is_desync, sebep = detect_desync(ticker, parsed, existing)
+        if is_desync:
+            # Eski pozu shadow_closed olarak kapat
+            print(f"[DESYNC] {ticker} {system_code.upper()} — {sebep}")
+            print(f"[DESYNC] Eski poz kapatılıyor, yeni poz açılacak")
+            closed_key = _sys_key(system_code, "closed_positions") if system_code != "cab" else "closed_positions"
+            if closed_key not in data:
+                data[closed_key] = []
+            
+            # Eski pozu kapanan listeye ekle
+            existing_copy = dict(existing)
+            existing_copy.update({
+                "ticker": ticker,
+                "kapanis": now_tr(),
+                "exit_px": existing.get("current_stop") or existing.get("stop", 0),
+                "sonuc": "🔄 Desync (Pine yeni poz)",
+                "kar": 0.0,  # Bilinmiyor, 0 say
+                "shadow": True,
+                "desync_replaced": True,
+                "desync_sebep": sebep,
+            })
+            data[closed_key].append(existing_copy)
+            del data[open_key][ticker]
+            save_data(data)
+            # Yeni pozu açmaya DEVAM ET (return etme)
+        else:
+            return {"status": "shadow_already_open", "ticker": ticker, "sebep": sebep}
 
     pos = {
         "ticker": ticker, "giris": parsed.get("giris", 0),
@@ -3779,9 +3937,44 @@ def process_webhook_sync(msg: str):
             save_data(data)
             print(f"[LIMIT] Aktif risk {aktif_risk}/{get_max_positions(system_code)} (+{gar_tp1} TP1 +{gar_to} TO-BE) — {ticker} atlandı (kaydedildi)")
             return {"status": "limit"}
+        # v6.8 Patch 7+++: Desync-aware duplicate kontrolü (JCT bug fix)
         if ticker in data[open_key]:
-            print(f"[DUP] {ticker} zaten {system_code.upper()}'da açık")
-            return {"status": "duplicate"}
+            existing = data[open_key][ticker]
+            is_desync, sebep = detect_desync(ticker, parsed, existing)
+            sys_mode = get_system_mode(system_code)
+            
+            if is_desync:
+                # Sadece SHADOW'da otomatik desync handling
+                # LIVE'da gerçek Binance pozu var olabilir, manuel müdahale gerek
+                if sys_mode == "shadow" or existing.get("shadow"):
+                    print(f"[DESYNC SHADOW] {ticker} {system_code.upper()} — {sebep}")
+                    print(f"[DESYNC SHADOW] Eski shadow poz kapatılıyor, yeni poz açılacak")
+                    closed_key = _sys_key(system_code, "closed_positions") if system_code != "cab" else "closed_positions"
+                    if closed_key not in data:
+                        data[closed_key] = []
+                    existing_copy = dict(existing)
+                    existing_copy.update({
+                        "ticker": ticker,
+                        "kapanis": now_tr(),
+                        "exit_px": existing.get("current_stop") or existing.get("stop", 0),
+                        "sonuc": "🔄 Desync (Pine yeni poz)",
+                        "kar": 0.0,
+                        "shadow": True,
+                        "desync_replaced": True,
+                        "desync_sebep": sebep,
+                    })
+                    data[closed_key].append(existing_copy)
+                    del data[open_key][ticker]
+                    save_data(data)
+                    # Yeni pozu açmaya devam et
+                else:
+                    # LIVE modda: dikkat! gerçek Binance pozu var olabilir
+                    print(f"[DESYNC LIVE ALARM] {ticker} {system_code.upper()} — {sebep}")
+                    print(f"[DESYNC LIVE] LIVE modda otomatik kapatma yapılmaz, manuel kontrol gerek!")
+                    return {"status": "desync_live_warning", "ticker": ticker, "sebep": sebep}
+            else:
+                print(f"[DUP] {ticker} zaten {system_code.upper()}'da açık ({sebep})")
+                return {"status": "duplicate"}
 
         # v6.8: Çapraz sistem kontrolü — diğer sistem aynı sembolü live'da tutuyorsa uyarı
         other_sys = "ram" if system_code == "cab" else "cab"
@@ -4111,6 +4304,7 @@ def process_webhook_sync(msg: str):
 # ============ TIMEOUT BACKGROUND TASK (v6.1: FIX EDİLDİ) ============
 # v6.7.3: TP1 vurmuş pozlar için MUTLAK uzun süre limiti (Pine state kayıp olursa diye)
 TP1_ABSOLUTE_HOURS = 168  # 7 gün — TP1+'lı poz bile bu kadar açıksa zorla kapat
+TIMEOUT_BE_ABSOLUTE_HOURS = 48  # v6.8 Patch 7+++: 2 gün — TP1'siz timeout-BE poz (Pine senkron riski yüksek)
 
 async def timeout_scan_once():
     """v6.1: Tek seferlik timeout taraması — manuel ve background task tarafından çağrılır
@@ -4144,10 +4338,21 @@ async def timeout_scan_once():
                     continue
 
                 # v6.7.3: TP1 vurmuş ya da timeout-BE pozları
-                # Eskiden tamamen muaftı, şimdi 7 gün mutlak limit var (Pine state kayıp diye)
-                if pos.get("tp1_hit") or pos.get("timeout_be"):
-                    if age_hours >= TP1_ABSOLUTE_HOURS:
-                        print(f"[TIMEOUT-FORCE] {system}:{ticker} {age_hours:.1f}s açık (TP1'li, MUTLAK 7gün limit) — zorla kapat")
+                # v6.8 Patch 7+++: TP1 hit = 7 gün, sadece timeout_be (TP1 yok) = 2 gün
+                #                   Sebep: timeout_be'de Pine senkron bozulma riski yüksek
+                tp1_hit = pos.get("tp1_hit", False)
+                timeout_be = pos.get("timeout_be", False)
+                if tp1_hit or timeout_be:
+                    # Mutlak limit seç: TP1 varsa uzun, sadece BE'de ise kısa
+                    if tp1_hit:
+                        abs_limit = TP1_ABSOLUTE_HOURS  # 168s = 7 gün
+                        limit_label = "TP1'li, MUTLAK 7gün"
+                    else:
+                        abs_limit = TIMEOUT_BE_ABSOLUTE_HOURS  # 48s = 2 gün
+                        limit_label = "timeout-BE (TP1 yok), MUTLAK 2gün"
+                    
+                    if age_hours >= abs_limit:
+                        print(f"[TIMEOUT-FORCE] {system}:{ticker} {age_hours:.1f}s açık ({limit_label}) — zorla kapat")
                         # Forced close — emergency_stop_check_loop benzer mantık
                         try:
                             cur_px = binance_get_mark_price(ticker)
@@ -4834,7 +5039,7 @@ async def dashboard():
 <html lang="tr"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CAB Bot v6.8 Patch 7 — RAM Dinamik TP Dashboard</title>
+<title>CAB Bot v6.8 Patch 7+++ — JCT Desync Fix + Manuel Close</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,system-ui,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:10px}
@@ -4856,6 +5061,8 @@ h1{font-size:18px;margin:0 0 4px;display:flex;align-items:center;justify-content
 .btn-orange{background:#ea580c}.btn-orange:hover{background:#f97316}
 .btn-purple{background:#7c3aed}.btn-purple:hover{background:#8b5cf6}
 .btn-grey{background:#475569}.btn-grey:hover{background:#64748b}
+.btn-close-pos{background:#7f1d1d;color:#fff;border:1px solid #b91c1c;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:700;transition:all 0.15s}
+.btn-close-pos:hover{background:#dc2626;transform:scale(1.1)}
 
 /* SİSTEM SEKMELERİ */
 #systemTabs{display:flex;gap:4px;margin:14px 0 0;border-bottom:2px solid #334155}
@@ -5030,7 +5237,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
 <body>
 
 <h1>
-  <span>🤖 CAB Bot v6.8 Patch 7 — RAM Dinamik TP + MAX_POS Stabilize</span>
+  <span>🤖 CAB Bot v6.8 Patch 7+++ — JCT Desync Fix + Manuel Close</span>
   <a href="/validation" class="saatGoster" id="saatGoster" title="Şu anki TR saati ve hibrit kademesi — Doğrulama paneline git">
     <span class="ico" id="saatIco">🕐</span>
     <span id="saatVal">--</span>
@@ -5216,8 +5423,9 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
           <th data-sort="cab_open:hh_pct" onclick="setSort('cab_open','hh_pct')">HH%</th>
           <th data-sort="cab_open:market_regime" onclick="setSort('cab_open','market_regime')">Rejim</th>
           <th data-sort="cab_open:zaman" onclick="setSort('cab_open','zaman')">Zaman</th>
+          <th style="width:50px">İşlem</th>
         </tr></thead>
-        <tbody id="cabOpenBody"><tr><td colspan="15" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
+        <tbody id="cabOpenBody"><tr><td colspan="16" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -5374,8 +5582,9 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
           <th data-sort="ram_open:hh_pct" onclick="setSort('ram_open','hh_pct')">HH%</th>
           <th data-sort="ram_open:market_regime" onclick="setSort('ram_open','market_regime')">Rejim</th>
           <th data-sort="ram_open:zaman" onclick="setSort('ram_open','zaman')">Zaman</th>
+          <th style="width:50px">İşlem</th>
         </tr></thead>
-        <tbody id="ramOpenBody"><tr><td colspan="15" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
+        <tbody id="ramOpenBody"><tr><td colspan="16" style="text-align:center;color:#94a3b8;padding:14px">Açık poz yok</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -6465,11 +6674,42 @@ function renderOpenTable(sys, open_pos){
       <td>${(p.hh_pct||0).toFixed(1)}%</td>
       <td>${regimeChip(p.market_regime)}</td>
       <td>${(p.zaman||'').slice(11,16)}</td>
+      <td><button class="btn-close-pos" onclick="manualClosePos('${p.ticker}','${sys}')" title="Manuel kapat (desync veya elle müdahale)">✕</button></td>
     </tr>
     `;
   }).join('');
   document.getElementById(sys+'OpenCt').textContent = arr.length;
   updateSortArrows(sys+'OpenTable', sys+'_open');
+}
+
+function manualClosePos(ticker, system) {
+  const sebepInput = prompt(
+    `${ticker} pozunu manuel kapatmak istediğinden emin misin?\n\n` +
+    `SHADOW modda sadece bot kaydı kapanır.\n` +
+    `LIVE modda Binance'tan da kapatılır.\n\n` +
+    `Kapatma sebebini gir (kısa):`,
+    'desync'
+  );
+  if (sebepInput === null) return;  // iptal
+  const sebep = sebepInput.trim() || 'manuel_close';
+  
+  fetch('/api/manual_close_pos', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ticker, system, sebep})
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (d.success) {
+      alert(`✅ ${ticker} kapatıldı\nÇıkış: ${d.exit_px}\nTahmini kâr: ${d.kar_tahmini.toFixed(2)}$`);
+      // Sayfa yenile (veri tazelensin)
+      if (typeof loadData === 'function') loadData();
+      else location.reload();
+    } else {
+      alert(`❌ Hata: ${d.error || 'bilinmeyen'}`);
+    }
+  })
+  .catch(e => alert(`❌ İstek hatası: ${e.message}`));
 }
 
 function renderClosedTable(sys, closed){
