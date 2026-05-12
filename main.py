@@ -898,15 +898,21 @@ async def dynamic_max_pos_loop():
                         koruma_sebepleri = (last_reason == "manual" 
                                             or last_reason.startswith("dashboard")
                                             or last_reason.startswith("auto_stop_streak")
-                                            or last_reason.startswith("auto_daily_"))
+                                            or last_reason.startswith("auto_daily_")
+                                            or last_reason == "auto_recovery_increase")  # v6.8 Patch 7+: recovery'i de koru
                         if koruma_sebepleri:
                             try:
                                 last_ts_str = history[-1].get("ts", "")
                                 if last_ts_str:
                                     last_dt = datetime.strptime(last_ts_str[:16], "%Y-%m-%d %H:%M")
                                     age_min = (now_tr_dt() - last_dt).total_seconds() / 60
-                                    # Manuel: 30 dk, Streak/daily: 120 dk (2 saat) koru
-                                    koruma_suresi = 30 if (last_reason == "manual" or last_reason.startswith("dashboard")) else 120
+                                    # v6.8 Patch 7+: Sebep bazlı koruma süreleri
+                                    if last_reason == "manual" or last_reason.startswith("dashboard"):
+                                        koruma_suresi = 30   # Manuel: 30 dk
+                                    elif last_reason == "auto_recovery_increase":
+                                        koruma_suresi = 45   # Recovery: 45 dk (sonraki recovery'e kadar)
+                                    else:
+                                        koruma_suresi = 120  # Streak/daily: 2 saat
                                     if age_min < koruma_suresi:
                                         continue  # koruma süresi içinde, override yapma
                             except Exception:
