@@ -2556,18 +2556,47 @@ async def manual_close_pos(req: Request):
     
     existing_copy = dict(existing)
     
-    # Mevcut fiyatı al (varsa)
-    exit_px = existing.get("current_stop") or existing.get("stop", 0)
+    # v6.8 Patch 7+++: Gerçek mark price kullan, fallback olarak current_stop
+    # ESKİ BUG: exit_px = current_stop (timeout-BE'de=giriş, kar=0 bug)
+    exit_px = 0
+    
+    # SHADOW modda piyasa fiyatını çek
+    if not (sys_mode == "live" and not existing.get("shadow")):
+        try:
+            mark_px = binance_get_mark_price(ticker)
+            if mark_px and mark_px > 0:
+                exit_px = mark_px
+        except Exception as e:
+            print(f"[MANUEL CLOSE] {ticker} mark price hatası: {e}")
+    
+    # LIVE Binance kapatma sonucu varsa onu kullan
     if binance_close_result and binance_close_result.get("exit_price"):
         exit_px = binance_close_result["exit_price"]
     
-    # Tahmini kar hesabı (sadece bilgi amaçlı)
+    # En son fallback: current_stop veya stop
+    if exit_px <= 0:
+        exit_px = existing.get("current_stop") or existing.get("stop", 0)
+    
+    # Tahmini kar hesabı
     giris = existing.get("giris", 0)
     marj = existing.get("marj", 100)
     lev = existing.get("lev", 10)
+    kapat_oran = existing.get("kapat_oran", 60) / 100.0
+    
+    # TP1 hit ise sadece kalan pozisyon hareket eder
+    kalan_oran = 1.0
+    if existing.get("tp1_hit"):
+        kalan_oran = 1.0 - kapat_oran
+    if existing.get("tp2_hit"):
+        kalan_oran -= 0.25  # RAM v15'te TP2 hep %25
+    
     kar_tahmini = 0.0
     if giris > 0 and exit_px > 0:
-        kar_tahmini = marj * (exit_px - giris) / giris * lev
+        # Kalan pozisyondan hareket karı
+        unrealized = marj * (exit_px - giris) / giris * lev * kalan_oran
+        # Önceden realize edilmiş TP1/TP2 kârı
+        realized = (existing.get("tp1_kar", 0) or 0) + (existing.get("tp2_kar", 0) or 0)
+        kar_tahmini = unrealized + realized
     
     existing_copy.update({
         "ticker": ticker,
@@ -2592,6 +2621,158 @@ async def manual_close_pos(req: Request):
         "exit_px": exit_px,
         "kar_tahmini": kar_tahmini,
         "binance_close": binance_close_result,
+    })
+
+
+@app.post("/api/fix_kar")
+async def fix_kar(req: Request):
+    """v6.8 Patch 7+++: Kapanan poz kar değerini düzelt
+    
+    İki mod:
+    1) OTOMATIK: yeni_kar verme → bot mark price çekip otomatik hesaplar
+       Sadece preview döner, kullanıcı onaylarsa apply=true ile tekrar çağırır
+    2) MANUEL: yeni_kar ver → direkt o değeri uygular
+    
+    Body: {
+      "ticker": "JCTUSDT",
+      "system": "cab"|"ram",
+      "kapanis": "2026-05-12 23:10" (opsiyonel, en yenisi),
+      "yeni_kar": 230.5 (opsiyonel — yoksa otomatik hesap),
+      "apply": true (false ise sadece preview)
+    }
+    """
+    body = {}
+    try:
+        body = await req.json()
+    except Exception:
+        pass
+    
+    ticker = body.get("ticker", "").upper().strip()
+    system = body.get("system", "cab")
+    kapanis_filter = body.get("kapanis", "")
+    yeni_kar = body.get("yeni_kar")
+    apply_change = body.get("apply", False)
+    
+    if not ticker:
+        return JSONResponse({"success": False, "error": "ticker eksik"}, status_code=400)
+    if system not in ("cab", "ram"):
+        system = "cab"
+    
+    closed_key = _sys_key(system, "closed_positions") if system != "cab" else "closed_positions"
+    
+    if closed_key not in data or not data[closed_key]:
+        return JSONResponse({"success": False, "error": f"{system.upper()} kapanan poz yok"}, status_code=404)
+    
+    # Ticker'la eşleşen pozları bul
+    eslesen = [(i, p) for i, p in enumerate(data[closed_key]) if p.get("ticker") == ticker]
+    if not eslesen:
+        return JSONResponse({"success": False, "error": f"{ticker} kapanan listede yok"}, status_code=404)
+    
+    if kapanis_filter:
+        eslesen_filt = [(i, p) for i, p in eslesen if (p.get("kapanis", "")[:16] == kapanis_filter[:16])]
+        if eslesen_filt:
+            eslesen = eslesen_filt
+    
+    eslesen.sort(key=lambda x: x[1].get("kapanis", ""), reverse=True)
+    idx, target_pos = eslesen[0]
+    
+    eski_kar = target_pos.get("kar", 0)
+    eski_exit = target_pos.get("exit_px", 0)
+    
+    # OTOMATIK HESAP MODU
+    hesap_detay = None
+    if yeni_kar is None:
+        # Mark price çek
+        try:
+            mark_px = binance_get_mark_price(ticker)
+            if not mark_px or mark_px <= 0:
+                return JSONResponse({"success": False, "error": f"{ticker} mark price alınamadı"}, status_code=500)
+        except Exception as e:
+            return JSONResponse({"success": False, "error": f"Mark price hatası: {e}"}, status_code=500)
+        
+        # Hesap parametreleri (kayıttan al)
+        giris = target_pos.get("giris", 0)
+        marj = target_pos.get("marj", 100)
+        lev = target_pos.get("lev", 10)
+        kapat_oran = target_pos.get("kapat_oran", 60) / 100.0
+        
+        if giris <= 0:
+            return JSONResponse({"success": False, "error": "Giriş fiyatı geçersiz"}, status_code=500)
+        
+        # Kalan oran (TP1/TP2 hit varsa)
+        kalan_oran = 1.0
+        tp1_hit = target_pos.get("tp1_hit", False)
+        tp2_hit = target_pos.get("tp2_hit", False)
+        if tp1_hit:
+            kalan_oran = 1.0 - kapat_oran
+        if tp2_hit:
+            kalan_oran -= 0.25
+        
+        # Hareket karı (kalan pozisyondan)
+        pct = (mark_px - giris) / giris
+        unrealized = marj * pct * lev * kalan_oran
+        
+        # Önceden alınmış TP1/TP2 karı
+        realized = (target_pos.get("tp1_kar", 0) or 0) + (target_pos.get("tp2_kar", 0) or 0)
+        
+        # Toplam tahmini kar
+        yeni_kar = unrealized + realized
+        
+        hesap_detay = {
+            "giris": giris,
+            "mark_px": mark_px,
+            "pct": round(pct * 100, 2),
+            "marj": marj,
+            "lev": lev,
+            "kalan_oran": round(kalan_oran * 100, 1),
+            "tp1_hit": tp1_hit,
+            "tp2_hit": tp2_hit,
+            "unrealized": round(unrealized, 2),
+            "realized": round(realized, 2),
+            "yeni_kar": round(yeni_kar, 2),
+        }
+    
+    try:
+        yeni_kar = float(yeni_kar)
+    except (TypeError, ValueError):
+        return JSONResponse({"success": False, "error": "yeni_kar sayı olmalı"}, status_code=400)
+    
+    # Apply değilse sadece preview döner
+    if not apply_change:
+        return JSONResponse({
+            "success": True,
+            "preview": True,
+            "ticker": ticker,
+            "system": system,
+            "kapanis": target_pos.get("kapanis"),
+            "eski_kar": eski_kar,
+            "yeni_kar": yeni_kar,
+            "hesap_detay": hesap_detay,
+        })
+    
+    # Uygula
+    data[closed_key][idx]["kar"] = yeni_kar
+    if hesap_detay and hesap_detay.get("mark_px"):
+        data[closed_key][idx]["exit_px"] = hesap_detay["mark_px"]
+    data[closed_key][idx]["kar_fixed"] = True
+    data[closed_key][idx]["kar_fixed_at"] = now_tr()
+    data[closed_key][idx]["kar_original"] = eski_kar
+    if hesap_detay:
+        data[closed_key][idx]["kar_fix_detay"] = hesap_detay
+    
+    save_data(data)
+    
+    print(f"[FIX KAR] {ticker} {system.upper()} | kar: {eski_kar:.2f}$ → {yeni_kar:.2f}$ | kapanis: {target_pos.get('kapanis')}")
+    
+    return JSONResponse({
+        "success": True,
+        "applied": True,
+        "ticker": ticker,
+        "system": system,
+        "kapanis": target_pos.get("kapanis"),
+        "eski_kar": eski_kar,
+        "yeni_kar": yeni_kar,
+        "hesap_detay": hesap_detay,
     })
 
 
@@ -5063,6 +5244,8 @@ h1{font-size:18px;margin:0 0 4px;display:flex;align-items:center;justify-content
 .btn-grey{background:#475569}.btn-grey:hover{background:#64748b}
 .btn-close-pos{background:#7f1d1d;color:#fff;border:1px solid #b91c1c;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:700;transition:all 0.15s}
 .btn-close-pos:hover{background:#dc2626;transform:scale(1.1)}
+.btn-fix-kar{background:#1e40af;color:#fff;border:1px solid #3b82f6;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:700;transition:all 0.15s}
+.btn-fix-kar:hover{background:#2563eb;transform:scale(1.1)}
 
 /* SİSTEM SEKMELERİ */
 #systemTabs{display:flex;gap:4px;margin:14px 0 0;border-bottom:2px solid #334155}
@@ -5384,9 +5567,9 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
   <div class="maxBox">
     <span style="font-size:12px">📊 MAX Pozisyon:</span>
     <button class="btn btn-grey btn-sm" onclick="setMaxPos('cab',-1)">−</button>
-    <span class="maxNum" id="cabMaxNum">7</span>
+    <span class="maxNum" id="cabMaxNum">10</span>
     <button class="btn btn-grey btn-sm" onclick="setMaxPos('cab',+1)">+</button>
-    <span class="muted" style="margin-left:auto" id="cabMaxInfo">min:3 max:14</span>
+    <span class="muted" style="margin-left:auto" id="cabMaxInfo">min:4 max:16</span>
   </div>
 
   <!-- Stats -->
@@ -5463,6 +5646,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
           <th data-sort="cab_closed:market_regime" onclick="setSort('cab_closed','market_regime')">Rejim</th>
           <th data-sort="cab_closed:sure_dk" onclick="setSort('cab_closed','sure_dk')">Süre</th>
           <th data-sort="cab_closed:kapanis" onclick="setSort('cab_closed','kapanis')">Kapanış</th>
+          <th style="width:50px">İşlem</th>
         </tr></thead>
         <tbody id="cabClosedBody"></tbody>
       </table>
@@ -5543,9 +5727,9 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
   <div class="maxBox">
     <span style="font-size:12px">📊 MAX Pozisyon:</span>
     <button class="btn btn-grey btn-sm" onclick="setMaxPos('ram',-1)">−</button>
-    <span class="maxNum" id="ramMaxNum">7</span>
+    <span class="maxNum" id="ramMaxNum">10</span>
     <button class="btn btn-grey btn-sm" onclick="setMaxPos('ram',+1)">+</button>
-    <span class="muted" style="margin-left:auto" id="ramMaxInfo">min:3 max:14</span>
+    <span class="muted" style="margin-left:auto" id="ramMaxInfo">min:4 max:16</span>
   </div>
 
   <!-- Stats -->
@@ -5622,6 +5806,7 @@ th.sorted-desc::after{content:" ▼";color:#4ade80;font-size:10px}
           <th data-sort="ram_closed:market_regime" onclick="setSort('ram_closed','market_regime')">Rejim</th>
           <th data-sort="ram_closed:sure_dk" onclick="setSort('ram_closed','sure_dk')">Süre</th>
           <th data-sort="ram_closed:kapanis" onclick="setSort('ram_closed','kapanis')">Kapanış</th>
+          <th style="width:50px">İşlem</th>
         </tr></thead>
         <tbody id="ramClosedBody"></tbody>
       </table>
@@ -6093,8 +6278,10 @@ function updateSlotInfo(sys){
     changePart = ` | <span style="color:#94a3b8">bugün ${todayChanges} değişim${maxState.auto_reduced?' (oto-azalmış)':''}</span>`;
   }
 
-  // Genel info
-  const baseInfo = `<span style="color:#64748b">min:3 max:14</span>`;
+  // Genel info — v6.8 Patch 7+++: dinamik (sabit değil!)
+  const mnVal = maxState.min || 4;
+  const mxVal = maxState.max || 16;
+  const baseInfo = `<span style="color:#64748b">min:${mnVal} max:${mxVal}</span>`;
 
   if(slotPart){
     infoEl.innerHTML = `${slotPart} ${baseInfo}${changePart}`;
@@ -6761,10 +6948,70 @@ function renderClosedTable(sys, closed){
       <td>${regimeChip(c.market_regime)}</td>
       <td>${c.sure_dk ? (c.sure_dk<60 ? c.sure_dk+'dk' : Math.floor(c.sure_dk/60)+'s '+(c.sure_dk%60)+'dk') : '—'}</td>
       <td style="font-size:10px">${(c.kapanis||'').slice(5,16)}</td>
+      <td><button class="btn-fix-kar" onclick="fixKar('${c.ticker}','${sys}','${(c.kapanis||'').replace(/'/g,'')}', ${c.kar||0})" title="Kar değerini düzelt (manuel)">✏️</button></td>
     </tr>
   `;
   }).join('');
   updateSortArrows(sys+'ClosedTable', sys+'_closed');
+}
+
+function fixKar(ticker, system, kapanis, eskiKar) {
+  // Önce preview iste (apply: false)
+  fetch('/api/fix_kar', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ticker, system, kapanis, apply: false})
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (!d.success) {
+      alert(`❌ Hata: ${d.error || 'bilinmeyen'}`);
+      return;
+    }
+    
+    const h = d.hesap_detay;
+    let mesaj = `${ticker} kar değerini düzelt\n\n`;
+    mesaj += `📊 Kayıtlı kar: ${d.eski_kar.toFixed(2)}$\n`;
+    mesaj += `─────────────────────\n`;
+    mesaj += `🔄 Otomatik hesap:\n`;
+    if (h) {
+      mesaj += `   Giriş: ${h.giris} → Mark: ${h.mark_px} (${h.pct>=0?'+':''}${h.pct}%)\n`;
+      mesaj += `   Marj: ${h.marj}$ × ${h.lev}x = ${h.marj*h.lev}$\n`;
+      mesaj += `   Kalan oran: %${h.kalan_oran}${h.tp1_hit?' (TP1 vurmuş)':''}\n`;
+      mesaj += `   Hareket karı: ${h.unrealized>=0?'+':''}${h.unrealized}$\n`;
+      if (h.realized) mesaj += `   Önceki realized: ${h.realized>=0?'+':''}${h.realized}$\n`;
+      mesaj += `─────────────────────\n`;
+    }
+    mesaj += `💰 YENİ KAR: ${d.yeni_kar>=0?'+':''}${d.yeni_kar.toFixed(2)}$\n\n`;
+    mesaj += `Bu değeri uygulamak istiyor musun?\n(İptal etmek için Tamam'a basma)\n\n`;
+    mesaj += `Manuel değer girmek istersen: aşağıya farklı sayı yaz, yoksa boş bırak/Tamam:`;
+    
+    const onay = prompt(mesaj, d.yeni_kar.toFixed(2));
+    if (onay === null) return;  // iptal
+    
+    // Kullanıcı farklı sayı yazdıysa onu kullan
+    let finalKar = parseFloat(onay);
+    if (isNaN(finalKar)) finalKar = d.yeni_kar;
+    
+    // Apply et
+    fetch('/api/fix_kar', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ticker, system, kapanis, yeni_kar: finalKar, apply: true})
+    })
+    .then(r => r.json())
+    .then(d2 => {
+      if (d2.success) {
+        alert(`✅ ${ticker} kar güncellendi\nEski: ${d2.eski_kar.toFixed(2)}$\nYeni: ${d2.yeni_kar.toFixed(2)}$`);
+        if (typeof loadData === 'function') loadData();
+        else location.reload();
+      } else {
+        alert(`❌ Hata: ${d2.error || 'bilinmeyen'}`);
+      }
+    })
+    .catch(e => alert(`❌ İstek hatası: ${e.message}`));
+  })
+  .catch(e => alert(`❌ Önizleme hatası: ${e.message}`));
 }
 
 function renderSkipTable(sys, skipped){
