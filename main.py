@@ -1391,6 +1391,49 @@ def binance_get_klines(symbol, interval="1m", limit=60):
             print(f"[KLINES ERR] {symbol} {interval}: {e}")
         return None
 
+def binance_get_price_at_time(symbol, target_dt_tr):
+    """v6.8 Patch 7+++: Belli bir TR zamanındaki Binance fiyatını çek.
+    Binance 1-dakikalık kline'lar UTC. TR'den 3 saat çıkar.
+    target_dt_tr: datetime objesi (Türkiye saati)
+    Dönen: close fiyatı (float) veya None
+    """
+    if symbol in invalid_symbols_cache:
+        return None
+    try:
+        # TR → UTC dönüşüm
+        from datetime import timedelta
+        target_dt_utc = target_dt_tr - timedelta(hours=3)
+        target_ms = int(target_dt_utc.timestamp() * 1000)
+        
+        # O dakikadan başlayan 1-dakikalık bar'ı çek
+        # startTime'a göre 1 bar lazım, ama 2 alalım güvenli
+        klines = client.klines(
+            symbol=symbol,
+            interval="1m",
+            startTime=target_ms,
+            limit=2
+        )
+        
+        if not klines or len(klines) == 0:
+            print(f"[PRICE_AT_TIME] {symbol} {target_dt_tr} için kline bulunamadı")
+            return None
+        
+        # İlk kline'ın CLOSE fiyatı (idx 4)
+        close_price = float(klines[0][4])
+        bar_time_utc_ms = int(klines[0][0])
+        from datetime import datetime
+        bar_time_utc = datetime.utcfromtimestamp(bar_time_utc_ms / 1000)
+        bar_time_tr = bar_time_utc + timedelta(hours=3)
+        
+        print(f"[PRICE_AT_TIME] {symbol} target_TR:{target_dt_tr} → bar_TR:{bar_time_tr} close:{close_price}")
+        return close_price
+    except Exception as e:
+        err_str = str(e)
+        if "Invalid symbol" in err_str or "-1121" in err_str:
+            invalid_symbols_cache.add(symbol)
+        print(f"[PRICE_AT_TIME ERR] {symbol} {target_dt_tr}: {e}")
+        return None
+
 def capture_market_snapshot():
     """v6.7.7: Anlık BTC, ETH, ETH/BTC fiyatlarını Binance'ten çek.
     Pozisyon açılış/kapanış anında çağrılır, sayısal kayıt amaçlı."""
@@ -2682,22 +2725,35 @@ async def fix_kar(req: Request):
     # OTOMATIK HESAP MODU
     hesap_detay = None
     if yeni_kar is None:
-        # Mark price çek
-        try:
-            mark_px = binance_get_mark_price(ticker)
-            if not mark_px or mark_px <= 0:
-                return JSONResponse({"success": False, "error": f"{ticker} mark price alınamadı"}, status_code=500)
-        except Exception as e:
-            return JSONResponse({"success": False, "error": f"Mark price hatası: {e}"}, status_code=500)
+        # v6.8 Patch 7+++: Pozun KAPANIŞ ZAMANINDAKİ Binance fiyatını çek
+        # (anlık mark price yanlış olur, max_seen tam doğru değil)
+        kapanis_str = target_pos.get("kapanis", "")
+        if not kapanis_str:
+            return JSONResponse({"success": False, "error": "Kapanış zamanı kayıtta yok"}, status_code=500)
         
-        # Hesap parametreleri (kayıttan al)
+        # TR datetime parse
+        try:
+            from datetime import datetime
+            kapanis_dt_tr = datetime.strptime(kapanis_str[:16], "%Y-%m-%d %H:%M")
+        except Exception as e:
+            return JSONResponse({"success": False, "error": f"Kapanış zamanı parse edilemedi: {e}"}, status_code=500)
+        
+        # Binance'tan o zamanki fiyatı çek
+        try:
+            kapanis_fiyati = binance_get_price_at_time(ticker, kapanis_dt_tr)
+            if not kapanis_fiyati or kapanis_fiyati <= 0:
+                return JSONResponse({"success": False, "error": f"{ticker} için {kapanis_str} kapanış fiyatı çekilemedi"}, status_code=500)
+        except Exception as e:
+            return JSONResponse({"success": False, "error": f"Fiyat çekme hatası: {e}"}, status_code=500)
+        
         giris = target_pos.get("giris", 0)
+        if giris <= 0:
+            return JSONResponse({"success": False, "error": "Giriş fiyatı geçersiz"}, status_code=500)
+        
+        # Hesap parametreleri
         marj = target_pos.get("marj", 100)
         lev = target_pos.get("lev", 10)
         kapat_oran = target_pos.get("kapat_oran", 60) / 100.0
-        
-        if giris <= 0:
-            return JSONResponse({"success": False, "error": "Giriş fiyatı geçersiz"}, status_code=500)
         
         # Kalan oran (TP1/TP2 hit varsa)
         kalan_oran = 1.0
@@ -2708,19 +2764,20 @@ async def fix_kar(req: Request):
         if tp2_hit:
             kalan_oran -= 0.25
         
-        # Hareket karı (kalan pozisyondan)
-        pct = (mark_px - giris) / giris
+        # Hareket karı
+        pct = (kapanis_fiyati - giris) / giris
         unrealized = marj * pct * lev * kalan_oran
         
         # Önceden alınmış TP1/TP2 karı
         realized = (target_pos.get("tp1_kar", 0) or 0) + (target_pos.get("tp2_kar", 0) or 0)
         
-        # Toplam tahmini kar
         yeni_kar = unrealized + realized
         
         hesap_detay = {
             "giris": giris,
-            "mark_px": mark_px,
+            "kapanis_zamani": kapanis_str,
+            "kapanis_fiyati_binance": kapanis_fiyati,
+            "fiyat_kaynak": "Binance kline 1m (kapanış zamanı)",
             "pct": round(pct * 100, 2),
             "marj": marj,
             "lev": lev,
@@ -2752,8 +2809,8 @@ async def fix_kar(req: Request):
     
     # Uygula
     data[closed_key][idx]["kar"] = yeni_kar
-    if hesap_detay and hesap_detay.get("mark_px"):
-        data[closed_key][idx]["exit_px"] = hesap_detay["mark_px"]
+    if hesap_detay and hesap_detay.get("kapanis_fiyati_binance"):
+        data[closed_key][idx]["exit_px"] = hesap_detay["kapanis_fiyati_binance"]
     data[closed_key][idx]["kar_fixed"] = True
     data[closed_key][idx]["kar_fixed_at"] = now_tr()
     data[closed_key][idx]["kar_original"] = eski_kar
@@ -6975,7 +7032,9 @@ function fixKar(ticker, system, kapanis, eskiKar) {
     mesaj += `─────────────────────\n`;
     mesaj += `🔄 Otomatik hesap:\n`;
     if (h) {
-      mesaj += `   Giriş: ${h.giris} → Mark: ${h.mark_px} (${h.pct>=0?'+':''}${h.pct}%)\n`;
+      mesaj += `   ⏰ Kapanış: ${h.kapanis_zamani}\n`;
+      mesaj += `   📡 Binance'tan o tarihteki fiyat çekildi\n`;
+      mesaj += `   Giriş: ${h.giris} → Kapanış: ${h.kapanis_fiyati_binance} (${h.pct>=0?'+':''}${h.pct}%)\n`;
       mesaj += `   Marj: ${h.marj}$ × ${h.lev}x = ${h.marj*h.lev}$\n`;
       mesaj += `   Kalan oran: %${h.kalan_oran}${h.tp1_hit?' (TP1 vurmuş)':''}\n`;
       mesaj += `   Hareket karı: ${h.unrealized>=0?'+':''}${h.unrealized}$\n`;
